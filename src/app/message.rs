@@ -59,6 +59,32 @@ pub struct ImportResult {
     pub skipped_count: usize,
 }
 
+/// Everything a completed develop render hands back to the UI thread.
+#[derive(Debug, Clone)]
+pub struct RenderOutput {
+    /// Image the render was made from. A render still in flight when the
+    /// user navigates must not land on the next image's viewport.
+    pub image_id: i64,
+    /// The on-screen window's pixels (RGBA), `dims` in size.
+    pub display: std::sync::Arc<[u8]>,
+    pub dims: (u32, u32),
+    /// The window `display` covers. Travels with the pixels so the viewport
+    /// never draws a buffer against a window it wasn't rendered for.
+    pub view_rect: [f32; 4],
+    /// Small whole-image render (RGBA), `overview_dims` in size: histogram
+    /// source and edited-proxy candidate.
+    pub overview: std::sync::Arc<[u8]>,
+    pub overview_dims: (u32, u32),
+    pub histogram: crate::core::histogram::HistogramData,
+    /// The params rendered, when they are the user's real edit — `None` for
+    /// the before/after peek and the crop tool's full-sensor visualisation,
+    /// neither of which may stand in for the edited image.
+    pub edit: Option<crate::core::types::EditParams>,
+    pub upload_ms: f32,
+    pub render_ms: f32,
+    pub update_ms: f32,
+}
+
 /// Application messages (events)
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
@@ -351,25 +377,13 @@ pub enum Message {
     /// The develop viewport's logical size changed: (width, height).
     ViewportResized(f32, f32),
 
-    /// Render task failed (GPU error / shader panic) — releases the throttle lock
-    RenderFailed,
-    /// A develop render completed: display window bytes, their dimensions, the
-    /// whole-image histogram, and timings. Both GPU passes land together, so
-    /// this is the only render-completion message.
-    RenderFinished(
-        /// Image the render was made from. A render still in flight when the
-        /// user navigates must not land on the next image's viewport.
-        i64,
-        std::sync::Arc<[u8]>,
-        (u32, u32),
-        /// The window these bytes cover. Travels with them so the viewport
-        /// never draws a buffer against a window it wasn't rendered for.
-        [f32; 4],
-        crate::core::histogram::HistogramData,
-        f32,
-        f32,
-        f32,
-    ),
+    /// A develop render completed. Boxed: the histogram alone is 3 KB.
+    RenderFinished(Box<RenderOutput>),
+    /// An edited proxy finished saving to disk: (image, proxy generation,
+    /// path or error). See `handlers::proxy`.
+    EditedProxySaved(i64, u64, Result<String, String>),
+    /// A saved edited proxy was read back into memory: (image, pixels).
+    EditedProxyLoaded(i64, Result<(u32, u32, std::sync::Arc<[u8]>), String>),
     /// Phase 104: Toggle Profiler Overlay
     ToggleProfiler,
 

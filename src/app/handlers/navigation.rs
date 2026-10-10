@@ -11,6 +11,13 @@ pub fn handle_image_selected(editor: &mut RawEditor, image_id: i64) -> Task<Mess
     // current_edit_params against the currently-selected id, so flushing after
     // the switch would write this image's edits onto the next one.
     editor.flush_edits();
+    // Leaving an image: bring its edited thumbnail on disk up to date. Also
+    // before the selection moves — it checks against the outgoing edits.
+    let persist = if editor.selected_image_id != Some(image_id) {
+        crate::app::handlers::proxy::persist(editor)
+    } else {
+        Task::none()
+    };
     // The peek belongs to the outgoing image; carrying it across would show
     // the new image unedited with no way to notice why.
     editor.before_peek = false;
@@ -54,6 +61,12 @@ pub fn handle_image_selected(editor: &mut RawEditor, image_id: i64) -> Task<Mess
         // never carry the flag) must pick it up before anything renders them.
         editor.sync_tool_flags();
         editor.history_map.entry(image_id).or_insert_with(|| (vec![editor.current_edit_params], 0));
+        // A proxy read from disk matches the saved edits just loaded — record
+        // which edit it shows, so leaving can tell if it has fallen behind.
+        let key = crate::app::handlers::proxy::edit_key(&editor.current_edit_params);
+        if let Some(proxy) = editor.edited_proxies.peek_mut(&image_id) {
+            proxy.params.get_or_insert(key);
+        }
     }
 
     let reveal = reveal_selection(editor);
@@ -65,10 +78,10 @@ pub fn handle_image_selected(editor: &mut RawEditor, image_id: i64) -> Task<Mess
         };
 
         if needs_load {
-            return Task::batch([trigger_image_load(editor, image_id), reveal]);
+            return Task::batch([persist, trigger_image_load(editor, image_id), reveal]);
         }
     }
-    reveal
+    Task::batch([persist, reveal])
 }
 
 /// Scroll the current tab's grid or filmstrip so the selection is visible.
@@ -125,6 +138,12 @@ pub fn reveal_selection(editor: &mut RawEditor) -> Task<Message> {
 pub fn handle_tab_changed(editor: &mut RawEditor, tab: AppTab) -> Task<Message> {
     // Leaving Develop mid-gesture must not strand unsaved slider edits.
     editor.flush_edits();
+    // Leaving Develop is leaving the image, as far as its thumbnail goes.
+    let persist = if editor.current_tab == AppTab::Develop && tab != AppTab::Develop {
+        crate::app::handlers::proxy::persist(editor)
+    } else {
+        Task::none()
+    };
     // Space only peeks in Develop; leaving with it held would strand the flag.
     editor.before_peek = false;
     if editor.current_tab != tab {
@@ -140,7 +159,7 @@ pub fn handle_tab_changed(editor: &mut RawEditor, tab: AppTab) -> Task<Message> 
     }
     editor.current_tab = tab;
     let reveal = reveal_selection(editor);
-    Task::batch([reveal, load_for_tab(editor, tab)])
+    Task::batch([persist, reveal, load_for_tab(editor, tab)])
 }
 
 /// The load (if any) that switching to `tab` calls for.
@@ -766,23 +785,40 @@ fn trigger_image_load(editor: &mut RawEditor, image_id: i64) -> Task<Message> {
         editor.current_metadata = None;
         editor.bump_preview_generation();
     }
-    if let Some((working_cache_path, raw_path)) = editor
+    if let Some((working_cache_path, raw_path, saved_proxy)) = editor
         .images
         .iter()
         .find(|i| i.id == image_id)
-        .map(|img| (img.cache_path_working.clone(), img.path.clone()))
+        .map(|img| (img.cache_path_working.clone(), img.path.clone(), img.cache_path_edited.clone()))
     {
+        // Develop shows the image's edited proxy while the RAW loads, not the
+        // camera JPEG: that ignores the edit, so the image visibly jumped (in
+        // exposure, colour, crop) when the real render landed. A proxy in
+        // memory goes up at once; a saved one is a ~1 ms decode away.
+        let proxy = develop
+            .then(|| editor.edited_proxies.get(&image_id).map(|p| p.preview.clone()))
+            .flatten();
+        let saved_proxy = saved_proxy.filter(|_| develop && proxy.is_none());
+        let camera_preview_shown = proxy.is_none() && saved_proxy.is_none();
+        if let Some(preview) = &proxy {
+            crate::app::handlers::proxy::show_as_placeholder(editor, preview);
+        }
+
         // Phase 73: Check RAM cache first. A hit is the whole point of the
         // preloader — it supplies the decoded pixels directly, so the disk
         // read + JPEG decode below is skipped entirely.
         let cached_preview = editor.preview_cache.get(&image_id).cloned();
         if let Some(cached) = &cached_preview {
             editor.working_preview = Some(cached.to_handle());
-            editor.working_preview_bytes = Some(cached.bytes.clone());
-            editor.working_preview_dims = (cached.width, cached.height);
-            editor.bump_preview_generation();
+            if camera_preview_shown {
+                editor.working_preview_bytes = Some(cached.bytes.clone());
+                editor.working_preview_dims = (cached.width, cached.height);
+                editor.bump_preview_generation();
+            }
         } else {
-            editor.working_preview_bytes = None;
+            if proxy.is_none() {
+                editor.working_preview_bytes = None;
+            }
             if let Some(path) = &working_cache_path {
                 editor.working_preview = Some(Handle::from_path(path.clone()));
             }
@@ -796,7 +832,12 @@ fn trigger_image_load(editor: &mut RawEditor, image_id: i64) -> Task<Message> {
             editor.editor_readiness = EditorReadiness::Loading(image_id);
         }
         let mut tasks = Vec::new();
-        if cached_preview.is_none() {
+        if let Some(path) = saved_proxy {
+            tasks.push(crate::app::handlers::proxy::load(image_id, path));
+        }
+        // Cull displays the camera JPEG (and wants it cached either way);
+        // Develop only needs it when there is no proxy to show instead.
+        if cached_preview.is_none() && (!develop || camera_preview_shown) {
             if let Some(path) = &working_cache_path {
                 tasks.push(Task::perform(
                     load_image_handle(image_id, path.clone()),
@@ -833,6 +874,7 @@ fn trigger_image_load(editor: &mut RawEditor, image_id: i64) -> Task<Message> {
         tasks.push(schedule_preloads(editor));
         if develop {
             tasks.push(schedule_raw_preloads(editor));
+            schedule_proxy_preloads(editor);
         }
         
         return Task::batch(tasks);
@@ -874,6 +916,23 @@ fn schedule_raw_preloads(editor: &mut RawEditor) -> Task<Message> {
         crate::app::loader::MAX_CONCURRENT_RAW_LOADS,
     );
     Task::none()
+}
+
+/// Read Develop's upcoming neighbours' saved proxies into memory, so the
+/// placeholder for the next image is already decoded when the user gets there.
+fn schedule_proxy_preloads(editor: &mut RawEditor) {
+    let ids: Vec<i64> =
+        neighbours(editor, editor.preview_preload_behind, editor.preview_preload_ahead)
+            .iter()
+            .map(|img| img.id)
+            .collect();
+    let wanted = crate::app::handlers::proxy::wanted_preloads(editor, &ids);
+    requeue(
+        &mut editor.queued_proxy_loads,
+        &mut editor.pending_proxy_loads,
+        wanted,
+        crate::app::loader::MAX_CONCURRENT_PREVIEW_LOADS,
+    );
 }
 
 /// The images around the selection, in the order the user will reach them.
@@ -972,6 +1031,7 @@ mod tests {
             cache_path_thumb: None,
             cache_path_instant: None,
             cache_path_working: None,
+            cache_path_edited: None,
             file_status: "exists".to_string(),
             rating: 0,
             flag: 0,

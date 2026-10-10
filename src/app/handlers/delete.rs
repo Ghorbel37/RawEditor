@@ -32,6 +32,7 @@ struct DeleteTarget {
     cache_thumb: Option<String>,
     cache_instant: Option<String>,
     cache_working: Option<String>,
+    cache_edited: Option<String>,
 }
 
 /// Dispatcher for Message::DeleteImage: instant-unmark when every target is
@@ -113,6 +114,7 @@ pub fn handle_delete_from_disk_confirmed(editor: &mut RawEditor) -> Task<Message
                 cache_thumb: img.cache_path_thumb.clone(),
                 cache_instant: img.cache_path_instant.clone(),
                 cache_working: img.cache_path_working.clone(),
+                cache_edited: img.cache_path_edited.clone(),
             })
         })
         .collect();
@@ -164,6 +166,7 @@ pub fn handle_hard_delete_complete(editor: &mut RawEditor, outcome: HardDeleteOu
 
     for id in &outcome.deleted_ids {
         editor.preview_cache.pop(id);
+        editor.edited_proxies.pop(id);
         editor.remove_from_raw_cache(*id);
         editor.history_map.remove(id);
         editor.pending_loads.remove(id);
@@ -228,7 +231,7 @@ async fn hard_delete_async(targets: Vec<DeleteTarget>, db_path: PathBuf) -> Hard
         for t in targets {
             // Cache tiers are regenerable — a failure here is non-fatal and
             // doesn't block the DB row delete.
-            for cache in [&t.cache_thumb, &t.cache_instant, &t.cache_working]
+            for cache in [&t.cache_thumb, &t.cache_instant, &t.cache_working, &t.cache_edited]
                 .into_iter()
                 .flatten()
             {

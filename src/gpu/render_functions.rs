@@ -180,7 +180,7 @@ pub async fn render_to_vec(
     }
 }
 
-/// Test-only now: the app renders through `render_display_and_histogram`
+/// Test-only now: the app renders through `render_display_and_overview`
 /// (display) and `render_to_vec` (export).
 #[cfg(test)]
 pub async fn render_to_bytes(
@@ -222,31 +222,40 @@ pub async fn render_to_bytes(
     }
 }
 
-/// Render the display window AND a small whole-image pass for the histogram,
-/// under a single `poll(Wait)`.
+/// Everything one develop render produces.
+pub struct DisplayRender {
+    /// The on-screen window: `width`×`height` tightly packed RGBA.
+    pub display: std::sync::Arc<[u8]>,
+    /// The whole image, small (`overview_dims` RGBA). Feeds the histogram, and
+    /// doubles as the image's edited proxy — the filmstrip thumbnail and the
+    /// placeholder shown while the image reloads.
+    pub overview: std::sync::Arc<[u8]>,
+    pub histogram: crate::core::histogram::HistogramData,
+    pub encode_ms: f32,
+    pub gpu_ms: f32,
+}
+
+/// Render the display window AND a small whole-image "overview" pass, under
+/// a single `poll(Wait)`.
 ///
-/// The histogram must stay whole-image: the display pass only covers what is
-/// on screen, so deriving the histogram from it would make it drift as the
-/// user pans and zooms. A dedicated ~128px pass keeps the semantics and makes
-/// the CPU scan trivial — it used to walk the entire display buffer, which at
-/// 100% zoom meant ~24M pixels single-threaded per render.
+/// The overview must stay whole-image: the display pass only covers what is
+/// on screen, so a histogram derived from it would drift as the user pans and
+/// zooms. A dedicated small pass keeps those semantics and makes the CPU scan
+/// trivial — it used to walk the entire display buffer, which at 100% zoom
+/// meant ~24M pixels single-threaded per render. Being a faithful small render
+/// of the current edit, its pixels are kept too (see `DisplayRender::overview`)
+/// rather than generating edited thumbnails with a pass of their own.
 ///
 /// Both passes read the same uniform buffer, so their differing `view_rect`
 /// values are sequenced by `queue.write_buffer`'s ordering against submits.
-pub async fn render_display_and_histogram(
+pub async fn render_display_and_overview(
     context: &SharedContext,
     resources: &ImageResources,
     width: u32,
     height: u32,
     view_rect: [f32; 4],
-    hist_width: u32,
-    hist_height: u32,
-) -> (
-    std::sync::Arc<[u8]>,
-    crate::core::histogram::HistogramData,
-    f32,
-    f32,
-) {
+    overview_dims: (u32, u32),
+) -> DisplayRender {
     // Timing is split so the profiler's buckets mean what they say:
     //   `encode_ms` — CPU-side resource creation and command recording
     //   `gpu_ms`    — every submit plus the readback wait
@@ -255,28 +264,28 @@ pub async fn render_display_and_histogram(
     // the encode window — the elapsed time is accumulated instead.
     let t_encode = std::time::Instant::now();
     write_view_rect(context, resources, super::params::FULL_VIEW_RECT);
-    let (hist_cb, hist_rb) = encode_color_pass(context, resources, hist_width, hist_height);
+    let (overview_cb, overview_rb) =
+        encode_color_pass(context, resources, overview_dims.0, overview_dims.1);
     let mut encode_ms = t_encode.elapsed().as_secs_f32() * 1000.0;
 
     // Counted as GPU time: `submit` can block on queue backpressure, and
     // attributing that stall to "upload" made the HUD read as though texture
     // allocation had suddenly become expensive after a zoom-in.
     let t_submit_a = std::time::Instant::now();
-    context.queue.submit(Some(hist_cb));
+    context.queue.submit(Some(overview_cb));
     write_view_rect(context, resources, view_rect);
     let mut gpu_ms = t_submit_a.elapsed().as_secs_f32() * 1000.0;
 
     let t_encode_b = std::time::Instant::now();
     let (main_cb, main_rb) = encode_color_pass(context, resources, width, height);
     encode_ms += t_encode_b.elapsed().as_secs_f32() * 1000.0;
-    let upload_ms = encode_ms;
 
     let t_render_start = std::time::Instant::now();
     context.queue.submit(Some(main_cb));
 
-    let (htx, hrx) = tokio::sync::oneshot::channel();
-    hist_rb.buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
-        let _ = htx.send(r);
+    let (otx, orx) = tokio::sync::oneshot::channel();
+    overview_rb.buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+        let _ = otx.send(r);
     });
     let (mtx, mrx) = tokio::sync::oneshot::channel();
     main_rb.buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
@@ -288,19 +297,22 @@ pub async fn render_display_and_histogram(
         context.device.poll(wgpu::Maintain::Wait);
     });
 
-    let histogram = if let Ok(Ok(())) = hrx.await {
-        crate::core::histogram::calculate(&hist_rb.unpad())
+    let (overview, histogram) = if let Ok(Ok(())) = orx.await {
+        let pixels = overview_rb.unpad();
+        let histogram = crate::core::histogram::calculate(&pixels);
+        (std::sync::Arc::from(pixels), histogram)
     } else {
-        [[0u32; 256]; 3]
+        (std::sync::Arc::from(Vec::new()), [[0u32; 256]; 3])
     };
 
-    if let Ok(Ok(())) = mrx.await {
-        let result = main_rb.unpad();
-        gpu_ms += t_render_start.elapsed().as_secs_f32() * 1000.0;
-        (std::sync::Arc::from(result), histogram, upload_ms, gpu_ms)
+    let display = if let Ok(Ok(())) = mrx.await {
+        std::sync::Arc::from(main_rb.unpad())
     } else {
-        (std::sync::Arc::from(Vec::new()), histogram, upload_ms, gpu_ms)
-    }
+        std::sync::Arc::from(Vec::new())
+    };
+    gpu_ms += t_render_start.elapsed().as_secs_f32() * 1000.0;
+
+    DisplayRender { display, overview, histogram, encode_ms, gpu_ms }
 }
 
 /// Render to opaque RGB `u16` samples, for 16-bit TIFF export. Mirrors
@@ -868,6 +880,77 @@ mod tests {
             }
             eprintln!("EQUIV max per-channel delta = {max_delta}  ({n_diff} of {} channels differ)", old.len());
             assert!(max_delta <= 1, "matrix fold changed the render by {max_delta} LSB — likely a transposition");
+        });
+    }
+
+    /// The develop render's overview is the edited proxy: it must come back
+    /// at the requested (crop-aware) size, agree with the display pass, and
+    /// follow the edit — the whole point of showing it instead of the camera
+    /// JPEG while an image reloads.
+    ///
+    /// Run with `cargo test --release overview_follows -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn overview_follows_the_edit_and_matches_the_display() {
+        let test_raw = test_raw_path();
+        if !std::path::Path::new(&test_raw).exists() {
+            eprintln!("test RAW missing, skipping");
+            return;
+        }
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .build()
+            .expect("runtime");
+
+        rt.block_on(async {
+            let ctx = SharedContext::new().await.expect("gpu context");
+            let raw = crate::raw::loader::load_raw_data(test_raw.clone())
+                .await
+                .expect("decode raw");
+            let base = EditParams::default();
+            let as_shot = crate::color::as_shot_kelvin_tint(&raw);
+            let (kelvin, _t, _wb) =
+                crate::color::solve_wb(&base, as_shot, raw.dcp_profile.as_deref(), raw.color_matrix);
+            let dcp = raw.dcp_profile.as_ref().map(|d| {
+                crate::raw::dcp::interpolate_at_temperature(
+                    d,
+                    kelvin,
+                    crate::core::tonemap::ToneSettings::from_params(&base),
+                )
+            });
+            let forward_matrix = dcp.as_ref().map(|i| i.camera_to_prophoto).unwrap_or_else(|| {
+                crate::color::calculate_cam_to_srgb(raw.color_matrix, raw.wb_multipliers, raw.color_matrix_is_d65)
+            });
+            let res = ImageResources::new(
+                &ctx, 1, &raw.data, raw.width, raw.height, &base,
+                raw.wb_multipliers, forward_matrix, raw.cfa_pattern,
+                raw.black_levels, raw.white_level, dcp.as_ref(),
+                Some(1280), raw.orientation,
+            )
+            .expect("image resources");
+
+            let mean = |rgba: &[u8]| {
+                let n = (rgba.len() / 4).max(1) as f64;
+                rgba.as_chunks::<4>().0.iter()
+                    .map(|p| 0.2126 * p[0] as f64 + 0.7152 * p[1] as f64 + 0.0722 * p[2] as f64)
+                    .sum::<f64>() / n
+            };
+
+            let (w, h) = res.oriented_dims();
+            let dims = crate::core::viewport::overview_dims(w, h);
+            let mut means = Vec::new();
+            for exposure in [0.0, -2.0] {
+                let params = EditParams { exposure, ..base };
+                res.update_uniforms(&ctx, &params, dcp.as_ref(), None);
+                let out = render_display_and_overview(&ctx, &res, w, h, FULL_VIEW_RECT, dims).await;
+                assert_eq!(out.overview.len(), (dims.0 * dims.1 * 4) as usize, "overview size");
+                let (display, overview) = (mean(&out.display), mean(&out.overview));
+                eprintln!("exposure {exposure:+}: display mean {display:.1}, overview mean {overview:.1} ({}x{})", dims.0, dims.1);
+                // Same image, same edit: the two passes must agree in tone.
+                assert!((display - overview).abs() < 6.0, "overview diverges from display");
+                means.push(overview);
+            }
+            assert!(means[1] < means[0] - 20.0, "overview did not follow a -2 EV edit: {means:?}");
         });
     }
 }

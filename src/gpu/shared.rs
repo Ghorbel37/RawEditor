@@ -393,8 +393,6 @@ pub struct ImageResources {
     pub height: u32,
     pub original_width: u32,
     pub original_height: u32,
-    pub histogram_width: u32,
-    pub histogram_height: u32,
     pub image_id: i64,
     // Metadata
     /// As-shot WB multipliers (from the raw file — never changes).
@@ -648,25 +646,7 @@ impl ImageResources {
             ));
         }
 
-        // Dedicated whole-image pass for the histogram. Sized from the
-        // DISPLAY aspect, not the sensor aspect: a portrait shot has its
-        // width/height swapped by EXIF orientation, and using `aspect_ratio`
-        // here gave it a landscape histogram target.
-        const HISTOGRAM_WIDTH: u32 = 128;
-        let display_aspect = match orientation {
-            6 | 8 => height as f32 / width.max(1) as f32,
-            _ => width as f32 / height.max(1) as f32,
-        };
-        let histogram_width = HISTOGRAM_WIDTH;
-        let histogram_height = ((histogram_width as f32 / display_aspect) as u32).max(1);
-
-        tracing::debug!(
-            "Texture {}x{}, Histogram {}x{}",
-            width,
-            height,
-            histogram_width,
-            histogram_height
-        );
+        tracing::debug!("Texture {}x{}", width, height);
 
         // Create texture for RAW data
         let texture_size = wgpu::Extent3d {
@@ -872,8 +852,6 @@ impl ImageResources {
             height,
             original_width,
             original_height,
-            histogram_width,
-            histogram_height,
             image_id,
             wb_multipliers,
             wb_current: std::sync::RwLock::new(wb_multipliers),
@@ -934,12 +912,6 @@ impl ImageResources {
 
     /// Display-space dimensions of the working (possibly subsampled) texture:
     /// swapped for 90°/270° EXIF orientations.
-    /// Target size for the small whole-image histogram pass. Display-oriented,
-    /// so portrait shots get a portrait target.
-    pub fn histogram_dims(&self) -> (u32, u32) {
-        (self.histogram_width.max(1), self.histogram_height.max(1))
-    }
-
     pub fn oriented_dims(&self) -> (u32, u32) {
         match self.orientation {
             6 | 8 => (self.height, self.width),

@@ -41,7 +41,8 @@ const TIER_THUMB: u32 = 256;
 const TIER_INSTANT: u32 = 384;
 const TIER_WORKING: u32 = 1280;
 
-fn get_cache_dir(tier_name: &str) -> Result<PathBuf, String> {
+/// `~/.cache/raw-editor/<tier>`, created if missing.
+pub fn cache_dir(tier_name: &str) -> Result<PathBuf, String> {
     let mut path = dirs::cache_dir()
         .or_else(dirs::home_dir)
         .ok_or_else(|| "Could not determine cache directory".to_string())?;
@@ -127,8 +128,7 @@ fn resize_to_width(img: &image::DynamicImage, target_width: u32, filter: FilterT
 }
 
 fn save_tier(img: &image::DynamicImage, tier_name: &str, image_id: i64) -> Result<String, String> {
-    let cache_dir = get_cache_dir(tier_name)?;
-    let file_path = cache_dir.join(format!("{}.jpg", image_id));
+    let file_path = cache_dir(tier_name)?.join(format!("{}.jpg", image_id));
     img.save(&file_path)
         .map_err(|e| format!("Failed to save {} tier: {}", tier_name, e))?;
     tracing::debug!("   → {}px tier: {}", img.width(), file_path.display());
@@ -184,8 +184,8 @@ mod tests {
 
     #[test]
     fn test_get_cache_dir_succeeds() {
-        let result = super::get_cache_dir("test_tier_functional");
-        assert!(result.is_ok(), "get_cache_dir should succeed: {:?}", result);
+        let result = super::cache_dir("test_tier_functional");
+        assert!(result.is_ok(), "cache_dir should succeed: {:?}", result);
         if let Ok(path) = result {
             let _ = std::fs::remove_dir_all(&path);
         }

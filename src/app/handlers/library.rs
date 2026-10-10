@@ -287,6 +287,7 @@ pub fn handle_remove_folder_confirmed(editor: &mut RawEditor) -> Task<Message> {
                 img.cache_path_thumb.clone(),
                 img.cache_path_instant.clone(),
                 img.cache_path_working.clone(),
+                img.cache_path_edited.clone(),
             ]
         })
         .flatten()
@@ -325,6 +326,7 @@ pub fn handle_remove_folder_confirmed(editor: &mut RawEditor) -> Task<Message> {
     editor.queued_raw_loads.retain(|(id, _)| !gone.contains(id));
     for id in &ids {
         editor.preview_cache.pop(id);
+        editor.edited_proxies.pop(id);
         editor.remove_from_raw_cache(*id);
     }
     if editor.selection_anchor.is_some_and(|a| gone.contains(&a)) {
@@ -505,6 +507,7 @@ mod tests {
             cache_path_thumb: None,
             cache_path_instant: None,
             cache_path_working: None,
+            cache_path_edited: None,
             file_status: "exists".to_string(),
             rating: 0,
             flag: 0,
@@ -550,6 +553,7 @@ mod tests {
             cache_path_thumb: None,
             cache_path_instant: None,
             cache_path_working: None,
+            cache_path_edited: None,
             file_status: "exists".to_string(),
             rating: 0,
             flag: 0,

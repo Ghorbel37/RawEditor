@@ -4,7 +4,6 @@ use iced::widget::{
 };
 use iced::{Alignment, Background, Border, Color, Element, Length, Theme};
 use std::collections::HashMap;
-use std::path::PathBuf;
 
 use crate::app::message::Message;
 use crate::app::state::RawEditor;
@@ -420,16 +419,23 @@ fn view_thumbnail_size_presets<'a>(editor: &'a RawEditor) -> Element<'a, Message
     .into()
 }
 
-fn view_image_card<'a>(img: &'a ImageData, is_selected: bool, size: f32) -> Element<'a, Message> {
+/// `thumbnail` is `RawEditor::thumbnail_handle` — the edited proxy for an
+/// edited image, the camera's embedded preview otherwise.
+fn view_image_card<'a>(
+    img: &'a ImageData,
+    thumbnail: Option<Handle>,
+    is_selected: bool,
+    size: f32,
+) -> Element<'a, Message> {
     let thumb_width = size;
     let thumb_height = size * 0.75;
     let thumb_state = thumbnail_state(img);
     let has_loaded_thumb = thumb_state == ThumbnailState::Ready;
 
     let image_content: Element<'a, Message> = if has_loaded_thumb {
-        if let Some(thumb_path) = img.cache_path_thumb.as_ref() {
+        if let Some(thumbnail) = thumbnail {
             container(
-                Image::new(Handle::from_path(PathBuf::from(thumb_path)))
+                Image::new(thumbnail)
                     .content_fit(iced::ContentFit::Cover)
                     .width(Length::Fixed(thumb_width))
                     .height(Length::Fixed(thumb_height)),
@@ -628,7 +634,12 @@ fn view_grid<'a>(editor: &'a RawEditor, images: &[&'a ImageData]) -> Element<'a,
     let mut rows = column![Space::with_height(Length::Fixed(first as f32 * geom.row_height))];
     for chunk in images[geom.image_range(first, last, images.len())].chunks(geom.columns) {
         let cards = chunk.iter().fold(row![].spacing(GRID_SPACING), |cards, img| {
-            cards.push(view_image_card(img, is_image_selected(editor, img.id), editor.thumbnail_size))
+            cards.push(view_image_card(
+                img,
+                editor.thumbnail_handle(img),
+                is_image_selected(editor, img.id),
+                editor.thumbnail_size,
+            ))
         });
         rows = rows.push(container(cards).height(Length::Fixed(geom.row_height)));
     }

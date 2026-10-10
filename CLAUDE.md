@@ -51,7 +51,7 @@ Dual-pass rendering to avoid wasting GPU cycles:
 - `SharedContext` holds two Pass-2 pipelines: `pipeline` (→ `Rgba8Unorm`, display) and `pipeline_16` (→ `Rgba16Float`, 16-bit TIFF export only). A wgpu `RenderPipeline`'s output format is baked in at creation, so the export path needs its own rather than swapping the target's format.
 - **Windowed rendering:** Pass 2 renders only `GpuEditParams.view_rect` — the `(u0, v0, du, dv)` slice of the displayed image that is actually on screen (see §D). The vertex shader maps the target across it, so `(0,0,1,1)` is the identity and covers the whole image.
 - **Device limits come from the adapter** (texture dimension, buffer size), not `Limits::default()`, whose 8192px / 256 MB floor fails full-res work on ≥45 MP sensors. Size-check before allocating (`SharedContext::check_texture_size` / `check_buffer_size`) and return an error; the device's uncaptured-error handler only logs, so an unchecked oversize no longer panics — it renders wrong instead.
-- **Histogram:** a dedicated ~128px whole-image pass (`ImageResources::histogram_dims`) rendered in the *same frame* as the display window and sharing one `poll(Wait)` — see `render_display_and_histogram`. It must stay whole-image, or it would drift as the user pans/zooms. The two passes read one uniform buffer; their differing `view_rect` values are sequenced by `write_view_rect`'s targeted 16-byte `queue.write_buffer` between submits.
+- **Overview pass (histogram + edited proxy):** a small whole-image pass (`core::viewport::overview_dims`, 384px long edge, crop-aware) rendered in the *same frame* as the display window and sharing one `poll(Wait)` — see `render_display_and_overview`. It feeds the histogram and is kept as the image's edited proxy (§F). It must stay whole-image, or it would drift as the user pans/zooms. The two passes read one uniform buffer; their differing `view_rect` values are sequenced by `write_view_rect`'s targeted 16-byte `queue.write_buffer` between submits.
 
 ### B. Adobe DCP Color Science (`src/raw/dcp.rs`)
 Uses the real Adobe DNG Color Pipeline instead of naive 3x3 sRGB matrices:
@@ -131,6 +131,13 @@ iced rebuilds the whole view after **every** message, so per-message cost must n
 - Never add a subscription that emits per mouse move (the old global `CursorMoved` tracking rebuilt every thumbnail on each move). Prefer widget-scoped events — the grid's wheel boost uses its `mouse_area` enter/exit.
 - Never build image handles with `Handle::from_bytes` inside `view`: each call mints a new id, and iced re-decodes the image every rebuild. Build once (`LazyLock`), or use `from_path`.
 - **UV is not isotropic.** Mask geometry lives in full-image UV, but what's displayed is the crop sub-rect stretched over a full-image-aspect target, so the two axes carry different pixels-per-unit. Anything angular (rotated radial masks) must un-distort by `core::viewport::mask_uv_aspect`, rotate, then redistort — rotating in raw UV shears. Rotation angles are cyclic: use `wrap_degrees`, never a clamp, or a drag sticks at ±180°.
+
+### F. Edited Proxies (`app/handlers/proxy.rs`)
+Each image's overview (§A) is kept as a small render of it *as edited*: the filmstrip and library grid show it instead of the camera JPEG (`RawEditor::thumbnail_handle`), and Develop shows it while an image reloads instead of the camera JPEG, which ignores the edit and made the image jump in tone when the real render landed.
+- Captured in memory on every render of the **real** edit — never the before/after peek or crop mode (`RenderOutput::edit` is `None` for those). Costs no extra pass.
+- Written to `~/.cache/raw-editor/edited/` (column `cache_path_edited`) when the user *leaves* the image, never per frame. Unique filename per save, because iced caches decoded images by path; superseded files are swept at startup.
+- **Invariant: a saved proxy always matches the saved edits.** Anything that changes an image's saved edits without rendering it must call `RawEditor::invalidate_proxies` — paste onto a selection does, and `flush_edits` does whenever the selected image isn't the one being rendered (undo/reset in Library). New write paths to `edits` must too.
+- Before GPU resources exist, `image_display_dims` returns the placeholder's own shape: a proxy is already cropped, the camera JPEG never is.
 
 ## Strict Engineering Constraints (must follow)
 

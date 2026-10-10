@@ -80,6 +80,9 @@ pub fn handle_close_window(editor: &mut RawEditor) -> Task<Message> {
     // Last chance to persist: a slider moved but never released still has its
     // edits only in memory.
     editor.flush_edits();
+    // And the open image's edited thumbnail, synchronously: a spawned save
+    // would never get to run.
+    crate::app::handlers::proxy::persist_now(editor);
     window::get_latest().and_then(window::close)
 }
 

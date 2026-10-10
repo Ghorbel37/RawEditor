@@ -140,6 +140,8 @@ impl Library {
             "ALTER TABLE images ADD COLUMN cache_path_working TEXT", // 1280px
             [],
         );
+        // Edited proxy: a 384px render of the image as edited.
+        let _ = self.conn.execute("ALTER TABLE images ADD COLUMN cache_path_edited TEXT", []);
 
         // Phase 56: Ratings & Culling
         // Add rating column for 0-5 star ratings
@@ -208,7 +210,7 @@ impl Library {
             // shares its timestamp, and without a tiebreak SQLite returned
             // them in whatever order the filesystem happened to list them.
             // DESC keeps the newest-first order the grid has always shown.
-            "SELECT id, filename, path, cache_path_thumb, cache_path_instant, cache_path_working, COALESCE(file_status, 'exists'), COALESCE(rating, 0), COALESCE(flag, 0)
+            "SELECT id, filename, path, cache_path_thumb, cache_path_instant, cache_path_working, COALESCE(file_status, 'exists'), COALESCE(rating, 0), COALESCE(flag, 0), cache_path_edited
              FROM images
              ORDER BY imported_at DESC, path DESC"
         )?;
@@ -224,6 +226,7 @@ impl Library {
                 file_status: row.get(6)?,
                 rating: row.get(7)?,           // Phase 56
                 flag: row.get(8).unwrap_or(0), // Phase 83
+                cache_path_edited: row.get(9)?,
             })
         })?;
 
@@ -482,6 +485,63 @@ impl Library {
         tx.commit()
     }
 
+    /// Record (or with `None`, forget) an image's saved edited proxy.
+    pub fn set_edited_proxy_path(&self, image_id: i64, path: Option<&str>) -> SqlResult<()> {
+        self.conn.execute(
+            "UPDATE images SET cache_path_edited = ?1 WHERE id = ?2",
+            rusqlite::params![path, image_id],
+        )?;
+        Ok(())
+    }
+
+    /// Forget the saved edited proxies of `ids`, in one transaction.
+    pub fn clear_edited_proxies(&self, ids: &[i64]) -> SqlResult<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare("UPDATE images SET cache_path_edited = NULL WHERE id = ?1")?;
+            for id in ids {
+                stmt.execute([id])?;
+            }
+        }
+        tx.commit()
+    }
+
+    /// Delete edited-proxy files the catalogue no longer points at, and
+    /// forget recorded ones that have gone missing. A proxy is re-saved under
+    /// a new name each time (iced caches decoded images by path), so the
+    /// superseded files are cleared here, at startup, rather than mid-session
+    /// where a racing save could still be using one. Returns files deleted.
+    pub fn sweep_edited_proxies(&self, dir: &std::path::Path) -> SqlResult<usize> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, cache_path_edited FROM images WHERE cache_path_edited IS NOT NULL")?;
+        let recorded: Vec<(i64, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let missing: Vec<i64> = recorded
+            .iter()
+            .filter(|(_, path)| !std::path::Path::new(path).exists())
+            .map(|(id, _)| *id)
+            .collect();
+        if !missing.is_empty() {
+            self.clear_edited_proxies(&missing)?;
+        }
+
+        let keep: std::collections::HashSet<std::path::PathBuf> =
+            recorded.into_iter().map(|(_, path)| path.into()).collect();
+        let mut deleted = 0;
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for path in entries.flatten().map(|e| e.path()) {
+                if !keep.contains(&path) && std::fs::remove_file(&path).is_ok() {
+                    deleted += 1;
+                }
+            }
+        }
+        Ok(deleted)
+    }
+
     /// Save edit params for several images in one transaction (paste onto a
     /// selection). Returns how many were written.
     pub fn save_edit_params_many(&self, edits: &[(i64, EditParams)]) -> SqlResult<usize> {
@@ -596,6 +656,13 @@ fn load_database_blocking() -> Result<Vec<super::models::Image>, String> {
     }
     if let Err(e) = lib.verify_files() {
         tracing::warn!("Could not verify RAW files: {e}");
+    }
+    if let Ok(dir) = crate::raw::processor::cache_dir("edited") {
+        match lib.sweep_edited_proxies(&dir) {
+            Ok(n) if n > 0 => tracing::info!("Removed {n} superseded edited thumbnail(s)"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!("Could not sweep edited thumbnails: {e}"),
+        }
     }
     lib.get_all_images()
         .map_err(|e| format!("Failed to load images: {e}"))
@@ -991,5 +1058,52 @@ mod tests {
         }
         let paths: Vec<String> = lib.get_all_images().unwrap().into_iter().map(|i| i.path).collect();
         assert_eq!(paths, vec!["/c.nef", "/b.nef", "/a.nef"]);
+    }
+
+    // ── edited proxies ────────────────────────────────────────────────────────
+
+    #[test]
+    fn edited_proxy_paths_round_trip_and_clear() {
+        let lib = in_memory_library();
+        let a = lib.import_image("/a.nef", "a.nef").unwrap();
+        let b = lib.import_image("/b.nef", "b.nef").unwrap();
+        lib.set_edited_proxy_path(a, Some("/e/a.jpg")).unwrap();
+        lib.set_edited_proxy_path(b, Some("/e/b.jpg")).unwrap();
+
+        let path_of = |id: i64| {
+            lib.get_all_images().unwrap().into_iter().find(|i| i.id == id).unwrap().cache_path_edited
+        };
+        assert_eq!(path_of(a).as_deref(), Some("/e/a.jpg"));
+
+        lib.clear_edited_proxies(&[a]).unwrap();
+        assert_eq!(path_of(a), None);
+        assert_eq!(path_of(b).as_deref(), Some("/e/b.jpg"));
+    }
+
+    /// Superseded files go; the recorded one stays; a recorded file that has
+    /// vanished is forgotten.
+    #[test]
+    fn sweep_keeps_only_the_recorded_proxies() {
+        let dir = std::env::temp_dir().join(format!("raw-editor-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let current = dir.join("1-3-100.jpg");
+        let superseded = dir.join("1-2-50.jpg");
+        std::fs::write(&current, b"x").unwrap();
+        std::fs::write(&superseded, b"x").unwrap();
+
+        let lib = in_memory_library();
+        let a = lib.import_image("/a.nef", "a.nef").unwrap();
+        let b = lib.import_image("/b.nef", "b.nef").unwrap();
+        lib.set_edited_proxy_path(a, Some(current.to_str().unwrap())).unwrap();
+        lib.set_edited_proxy_path(b, Some(dir.join("gone.jpg").to_str().unwrap())).unwrap();
+
+        assert_eq!(lib.sweep_edited_proxies(&dir).unwrap(), 1);
+        assert!(current.exists());
+        assert!(!superseded.exists());
+        let images = lib.get_all_images().unwrap();
+        assert!(images.iter().find(|i| i.id == a).unwrap().cache_path_edited.is_some());
+        assert!(images.iter().find(|i| i.id == b).unwrap().cache_path_edited.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

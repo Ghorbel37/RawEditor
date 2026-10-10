@@ -155,6 +155,31 @@ impl CachedPreview {
     }
 }
 
+/// A small render of an image as edited — see `handlers::proxy`.
+#[derive(Debug, Clone)]
+pub struct EditedProxy {
+    pub preview: CachedPreview,
+    /// Built once per capture: `Handle::from_rgba` mints a new id per call,
+    /// and iced re-uploads per id, so a handle built in `view` would upload
+    /// on every frame.
+    pub handle: Handle,
+    /// The render had edits applied. Only edited proxies replace the
+    /// camera's thumbnail — but an unedited one is still the best placeholder
+    /// while the image reloads, being exactly what Develop is about to show.
+    pub edited: bool,
+    /// The edit rendered (`proxy::edit_key`), to tell when it has fallen
+    /// behind. `None` for a proxy read from disk until its image is selected.
+    pub params: Option<crate::core::types::EditParams>,
+    /// Orders captures, so a save that completes after a newer render cannot
+    /// mark that newer render as saved.
+    pub generation: u64,
+    /// The file on disk holds this capture.
+    pub persisted: bool,
+}
+
+/// Edited proxies kept in memory. ~400 KB each (384px RGBA).
+pub const EDITED_PROXY_CAPACITY: usize = 128;
+
 /// Main application state
 #[derive(Debug)]
 pub struct RawEditor {
@@ -199,6 +224,18 @@ pub struct RawEditor {
     pub selected_image_id: Option<i64>,
     /// Phase 73: RAM cache for 1280px previews (Look-Ahead)
     pub preview_cache: LruCache<i64, CachedPreview>,
+    /// Small renders of images as edited, newest per image.
+    pub edited_proxies: LruCache<i64, EditedProxy>,
+    /// Last `EditedProxy::generation` handed out.
+    pub proxy_generation: u64,
+    /// Images the user left while the render of their final edit was still in
+    /// flight, with that edit: `proxy::resolve_awaiting` saves the proxy when
+    /// the render lands.
+    pub proxy_awaiting: HashMap<i64, crate::core::types::EditParams>,
+    /// Saved proxies being read back for Develop's neighbours — same queue
+    /// discipline as `queued_loads`.
+    pub pending_proxy_loads: HashSet<i64>,
+    pub queued_proxy_loads: Vec<(i64, String)>,
     /// RAW preload RAM budget in MB (0 = disabled)
     pub raw_preload_budget_mb: u32,
     /// Physical RAM to keep free during batch export, in MB (0 = disabled).
@@ -443,6 +480,15 @@ impl InfoOverlayState {
     }
 }
 
+/// Pixel size of the `crop` sub-rect (normalised `[x, y, w, h]`) of a `w`×`h`
+/// image, never collapsing to zero — `fitted_size` divides by it.
+pub fn crop_dims(w: u32, h: u32, crop: [f32; 4]) -> (u32, u32) {
+    (
+        ((w as f32 * crop[2]).round() as u32).max(1),
+        ((h as f32 * crop[3]).round() as u32).max(1),
+    )
+}
+
 /// True when `path` lies inside `folder` or any of its subfolders.
 ///
 /// Component-wise, not a string prefix: `/photos/2024` must not match
@@ -495,6 +541,13 @@ impl RawEditor {
                 pending_cache_count: 0,
                 selected_image_id: None,
                 preview_cache: LruCache::new(NonZeroUsize::new(cache_capacity).unwrap()),
+                edited_proxies: LruCache::new(
+                    NonZeroUsize::new(EDITED_PROXY_CAPACITY).unwrap_or(NonZeroUsize::MIN),
+                ),
+                proxy_generation: 0,
+                proxy_awaiting: HashMap::new(),
+                pending_proxy_loads: HashSet::new(),
+                queued_proxy_loads: Vec::new(),
                 raw_preload_budget_mb,
                 min_free_ram_mb: settings.min_free_ram_mb.min(MIN_FREE_RAM_MB_MAX),
                 export_paused_for_memory: false,
@@ -777,6 +830,58 @@ impl RawEditor {
         }
     }
 
+    /// The thumbnail to show for `img`: its edited proxy when it has edits,
+    /// the camera's embedded preview otherwise.
+    ///
+    /// An in-memory proxy is authoritative — it is the newest render. When it
+    /// says "unedited" (the edit was just reset) the camera thumbnail wins
+    /// even over a saved edited one that has not been cleared yet.
+    pub fn thumbnail_handle(&self, img: &ImageData) -> Option<Handle> {
+        if let Some(proxy) = self.edited_proxies.peek(&img.id) {
+            if proxy.edited {
+                return Some(proxy.handle.clone());
+            }
+            return img.cache_path_thumb.as_ref().map(Handle::from_path);
+        }
+        img.cache_path_edited
+            .as_ref()
+            .or(img.cache_path_thumb.as_ref())
+            .map(Handle::from_path)
+    }
+
+    /// Forget the edited proxies of `ids`, whose saved edits just changed
+    /// without being rendered — see `handlers::proxy`. Their thumbnails fall
+    /// back to the camera's until they are next developed. The stale files
+    /// are swept at the next launch (`Library::sweep_edited_proxies`).
+    pub fn invalidate_proxies(&mut self, ids: &[i64]) {
+        for id in ids {
+            self.edited_proxies.pop(id);
+        }
+        let had_saved: Vec<i64> = self
+            .images
+            .iter()
+            .filter(|img| img.cache_path_edited.is_some() && ids.contains(&img.id))
+            .map(|img| img.id)
+            .collect();
+        if had_saved.is_empty() {
+            return;
+        }
+        if let Some(lib) = &self.library {
+            if let Err(e) = lib.clear_edited_proxies(&had_saved) {
+                tracing::warn!("Could not clear stale edited thumbnails: {e}");
+            }
+        }
+        self.apply_to_images(&had_saved, |img| img.cache_path_edited = None);
+    }
+
+    /// True when the selected image's edits are being rendered, so its proxy
+    /// follows them on its own.
+    fn renders_selected_image(&self) -> bool {
+        self.current_tab == AppTab::Develop
+            && self.selected_image_id.is_some()
+            && self.image_resources.as_ref().map(|r| r.image_id) == self.selected_image_id
+    }
+
     /// True when this image should render as selected.
     ///
     /// The single predicate for both the library grid and the filmstrip. They
@@ -806,23 +911,25 @@ impl RawEditor {
     /// correctly-sized target.) In crop mode the shader deliberately reveals
     /// the whole sensor so the handles can be dragged over it, so the full
     /// frame genuinely is what's displayed and the crop must NOT be applied.
+    ///
+    /// **Before the GPU resources exist** (the RAW is still loading) what is on
+    /// screen is the placeholder, shown in its own shape: an edited proxy is
+    /// already cropped, and the camera JPEG never is. Applying the crop here
+    /// squeezed the full camera frame into the crop's aspect for as long as
+    /// the load took — and would crop an already-cropped proxy a second time.
     pub fn image_display_dims(&self) -> (u32, u32) {
-        let (w, h) = if let Some(res) = &self.image_resources {
-            res.oriented_dims()
-        } else if self.working_preview_bytes.is_some() {
-            self.working_preview_dims
-        } else {
-            (1280, 853)
+        let Some(res) = &self.image_resources else {
+            return if self.working_preview_bytes.is_some() {
+                self.working_preview_dims
+            } else {
+                (1280, 853)
+            };
         };
-
+        let (w, h) = res.oriented_dims();
         if self.is_cropping {
             return (w, h);
         }
-        let crop = self.current_edit_params.crop;
-        (
-            ((w as f32 * crop[2]).round() as u32).max(1),
-            ((h as f32 * crop[3]).round() as u32).max(1),
-        )
+        crop_dims(w, h, self.current_edit_params.crop)
     }
 
     /// Magnification as a photographer reads it: 100% means one full-resolution
@@ -889,6 +996,13 @@ impl RawEditor {
         // Clear first: a failed write should not spin on every later flush.
         self.edits_dirty = false;
         self.save_current_edits();
+        // Edits saved with no render behind them (undo, reset or paste in
+        // Library or Cull): the image's proxy now shows something else.
+        if !self.renders_selected_image() {
+            if let Some(id) = self.selected_image_id {
+                self.invalidate_proxies(&[id]);
+            }
+        }
     }
 
     /// Unconditional write, bypassing the dirty flag. Prefer `flush_edits`;
@@ -1176,8 +1290,11 @@ impl RawEditor {
 
         // Borrowed, not cloned: subscription() is rebuilt after every message,
         // and only the head of each queue is ever read.
-        let loader_subscription =
-            crate::app::loader::subscription(&self.queued_loads, &self.queued_raw_loads);
+        let loader_subscription = crate::app::loader::subscription(
+            &self.queued_loads,
+            &self.queued_raw_loads,
+            &self.queued_proxy_loads,
+        );
 
         let mut subs = vec![keyboard_subscription, loader_subscription];
         // Only tick while a filmstrip glide is in progress — avoids driving a
@@ -1193,55 +1310,48 @@ impl RawEditor {
 mod tests {
     use super::*;
 
-    /// No GPU or image needed: with no resources loaded `image_display_dims`
-    /// falls back to the 1280x853 placeholder, which is enough to exercise the
-    /// crop arithmetic.
     fn editor() -> RawEditor {
         RawEditor::new().0
     }
 
     #[test]
-    fn image_display_dims_uncropped_is_the_whole_frame() {
-        let e = editor();
-        assert_eq!(e.current_edit_params.crop, [0.0, 0.0, 1.0, 1.0]);
-        assert_eq!(e.image_display_dims(), (1280, 853));
+    fn crop_dims_of_the_full_frame_is_the_frame() {
+        assert_eq!(crop_dims(1280, 853, [0.0, 0.0, 1.0, 1.0]), (1280, 853));
     }
 
-    /// The bug this fixes: the viewport letterboxed using the FULL frame's
-    /// aspect while the shader drew the crop stretched to fill it, so a
-    /// half-width crop rendered horizontally stretched.
+    /// The bug crop-aware display dims fixed: the viewport letterboxed using
+    /// the FULL frame's aspect while the shader drew the crop stretched to
+    /// fill it, so a half-width crop rendered horizontally stretched.
     #[test]
-    fn image_display_dims_applies_the_crop_outside_crop_mode() {
-        let mut e = editor();
-        e.current_edit_params.crop = [0.0, 0.0, 0.5, 1.0];
-        assert_eq!(e.image_display_dims(), (640, 853));
+    fn crop_dims_follow_the_crop() {
+        assert_eq!(crop_dims(1280, 853, [0.0, 0.0, 0.5, 1.0]), (640, 853));
 
-        // A 16:9 crop of the 3:2 placeholder must report ~16:9.
-        e.current_edit_params.crop = [0.0, 0.078, 1.0, 0.84375];
-        let (w, h) = e.image_display_dims();
+        // A 16:9 crop of a 3:2 frame must report ~16:9.
+        let (w, h) = crop_dims(1280, 853, [0.0, 0.078, 1.0, 0.84375]);
         let aspect = w as f32 / h as f32;
         assert!((aspect - 16.0 / 9.0).abs() < 0.02, "aspect was {aspect}");
-    }
-
-    /// In crop mode the shader deliberately reveals the whole sensor so the
-    /// handles can be dragged over it — applying the crop here would make the
-    /// handles drift away from the cursor.
-    #[test]
-    fn image_display_dims_ignores_the_crop_while_cropping() {
-        let mut e = editor();
-        e.current_edit_params.crop = [0.0, 0.0, 0.5, 1.0];
-        e.is_cropping = true;
-        assert_eq!(e.image_display_dims(), (1280, 853));
     }
 
     /// A degenerate crop must not produce a zero-sized rect and divide by zero
     /// downstream in `fitted_size`.
     #[test]
-    fn image_display_dims_never_collapses_to_zero() {
-        let mut e = editor();
-        e.current_edit_params.crop = [0.0, 0.0, 0.0001, 0.0001];
-        let (w, h) = e.image_display_dims();
+    fn crop_dims_never_collapse_to_zero() {
+        let (w, h) = crop_dims(1280, 853, [0.0, 0.0, 0.0001, 0.0001]);
         assert!(w >= 1 && h >= 1, "got {w}x{h}");
+    }
+
+    /// While the RAW loads, the placeholder is shown in its own shape: an
+    /// edited proxy is already cropped, and must not be cropped again.
+    #[test]
+    fn a_loading_placeholder_is_not_cropped_again() {
+        let mut e = editor();
+        e.current_edit_params.crop = [0.0, 0.0, 0.5, 1.0];
+        e.working_preview_bytes = Some(std::sync::Arc::from(vec![0u8; 4]));
+        e.working_preview_dims = (384, 216);
+        assert_eq!(e.image_display_dims(), (384, 216));
+        // Nothing at all yet: the stock placeholder, also uncropped.
+        e.working_preview_bytes = None;
+        assert_eq!(e.image_display_dims(), (1280, 853));
     }
 
     // ── displayed_images / selection ─────────────────────────────────────────
@@ -1254,6 +1364,7 @@ mod tests {
             cache_path_thumb: None,
             cache_path_instant: None,
             cache_path_working: None,
+            cache_path_edited: None,
             file_status: "exists".to_string(),
             rating,
             flag: 0,
@@ -1387,5 +1498,59 @@ mod tests {
         let _ = crate::app::handlers::develop::handle_undo(&mut e);
         assert_eq!(e.current_edit_params.crop, [0.0, 0.0, 1.0, 1.0], "undo restored the old crop");
         assert_eq!(e.current_edit_params.is_cropping, 0, "but not the old tool state");
+    }
+
+    // ── edited proxies ────────────────────────────────────────────────────────
+
+    fn proxy(edited: bool) -> EditedProxy {
+        let preview = CachedPreview { width: 1, height: 1, bytes: Arc::from(vec![0u8; 4]) };
+        EditedProxy {
+            handle: preview.to_handle(),
+            preview,
+            edited,
+            params: None,
+            generation: 1,
+            persisted: false,
+        }
+    }
+
+    #[test]
+    fn thumbnails_prefer_the_edit_and_fall_back_to_the_camera() {
+        let mut e = catalog();
+        let mut image = e.images[0].clone();
+        image.cache_path_thumb = Some("/c/thumb.jpg".into());
+
+        // Never developed: the camera's own thumbnail.
+        assert_eq!(e.thumbnail_handle(&image), Some(Handle::from_path("/c/thumb.jpg")));
+
+        // A saved edited proxy from an earlier session.
+        image.cache_path_edited = Some("/c/edited.jpg".into());
+        assert_eq!(e.thumbnail_handle(&image), Some(Handle::from_path("/c/edited.jpg")));
+
+        // A live render outranks the file.
+        let live = proxy(true);
+        let live_handle = live.handle.clone();
+        e.edited_proxies.put(image.id, live);
+        assert_eq!(e.thumbnail_handle(&image), Some(live_handle));
+
+        // ...including when it says the edit was just reset to defaults.
+        e.edited_proxies.put(image.id, proxy(false));
+        assert_eq!(e.thumbnail_handle(&image), Some(Handle::from_path("/c/thumb.jpg")));
+    }
+
+    /// Undo / reset / paste in Library change an image's saved edits without
+    /// rendering it, so its proxy must go rather than keep showing the old edit.
+    #[test]
+    fn edits_saved_without_a_render_invalidate_the_proxy() {
+        let mut e = catalog();
+        e.current_tab = AppTab::Library;
+        e.selected_image_id = Some(1);
+        e.images[0].cache_path_edited = Some("/c/edited.jpg".into());
+        e.edited_proxies.put(1, proxy(true));
+
+        e.mark_edits_dirty();
+        e.flush_edits();
+        assert!(e.edited_proxies.peek(&1).is_none());
+        assert_eq!(e.images[0].cache_path_edited, None);
     }
 }

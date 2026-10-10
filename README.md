@@ -50,7 +50,8 @@ one.
 ![Alt text](./docs/screenshots/cull.png)
 
 The filmstrip scrolls with weighted momentum — flick it and it glides, scroll
-against the motion and it stops immediately.
+against the motion and it stops immediately. Edited photos show as edited,
+in the filmstrip and the library grid, updating live as you move a slider.
 
 ---
 
@@ -177,6 +178,7 @@ time; it will be rebuilt on demand.
 | `thumb/` | 256px thumbnails for the library grid |
 | `instant/` | 384px previews for fast full-screen scrolling |
 | `working/` | 1280px previews used by Develop and the histogram |
+| `edited/` | 384px renders of edited photos, for thumbnails and instant reloads |
 
 **`~/.local/share/raw-editor/`** — everything you would not want to lose.
 

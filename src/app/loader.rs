@@ -23,6 +23,7 @@ pub const MAX_CONCURRENT_RAW_LOADS: usize = 2;
 pub fn subscription(
     queued_loads: &[(i64, String)],
     queued_raw_loads: &[(i64, String)],
+    queued_proxy_loads: &[(i64, String)],
 ) -> iced::Subscription<Message> {
     let previews = queued_loads
         .iter()
@@ -44,7 +45,21 @@ pub fn subscription(
             )
         });
 
-    iced::Subscription::batch(previews.chain(raws))
+    // Edited proxies are ~30 KB JPEGs: cheap enough to share the preview limit.
+    let proxies = queued_proxy_loads
+        .iter()
+        .take(MAX_CONCURRENT_PREVIEW_LOADS)
+        .map(|(id, path)| {
+            let (id, path) = (*id, path.clone());
+            iced::Subscription::run_with_id(
+                ("proxy", id),
+                iced::futures::stream::once(async move {
+                    Message::EditedProxyLoaded(id, crate::app::handlers::proxy::read_jpeg(path).await)
+                }),
+            )
+        });
+
+    iced::Subscription::batch(previews.chain(raws).chain(proxies))
 }
 
 async fn process_load_request(id: i64, path: String) -> Message {

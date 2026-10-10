@@ -232,21 +232,12 @@ fn dispatch(editor: &mut RawEditor, message: Message) -> Task<Message> {
             editor.show_profiler = !editor.show_profiler;
             Task::none()
         }
-        Message::RenderFinished(id, bytes, dims, view_rect, d, u, r, cpu) => {
-            handlers::develop::handle_render_finished(editor, id, bytes, dims, view_rect, d, u, r, cpu)
+        Message::RenderFinished(output) => handlers::develop::handle_render_finished(editor, *output),
+        Message::EditedProxySaved(id, generation, result) => {
+            handlers::proxy::handle_saved(editor, id, generation, result);
+            Task::none()
         }
-        Message::RenderFailed => {
-            // GPU render task failed (shader error, device lost, etc.).
-            // Release the throttle lock so future slider/zoom events can trigger renders.
-            editor.is_rendering = false;
-            if editor.pending_render {
-                editor.pending_render = false;
-                editor.is_rendering = true;
-                handlers::develop::trigger_async_render(editor)
-            } else {
-                Task::none()
-            }
-        }
+        Message::EditedProxyLoaded(id, result) => handlers::proxy::handle_loaded(editor, id, result),
         Message::ViewportResized(w, h) => {
             let (old_w, old_h) = editor.viewport_size;
             editor.viewport_size = (w, h);

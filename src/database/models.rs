@@ -17,6 +17,9 @@ pub struct Image {
     pub cache_path_instant: Option<String>,
     /// Phase 28: Path to 1280px working preview tier (None if not yet generated)
     pub cache_path_working: Option<String>,
+    /// Small render of the image as edited (`handlers::proxy`). Only set while
+    /// the image has edits and the file matches them.
+    pub cache_path_edited: Option<String>,
     /// File status: 'exists' or 'deleted'
     pub file_status: String,
     /// Phase 56: Star rating (0-5)

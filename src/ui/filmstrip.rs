@@ -69,11 +69,12 @@ pub fn view<'a>(
         let img = *img;
         let is_selected = editor.is_selected(img.id);
 
-        // Images still waiting on their cache tiers get a blank slot rather
-        // than being skipped: every slot must be ITEM_WIDTH wide for the
-        // index → position arithmetic above to hold.
-        let img_widget: Element<'a, Message> = match &img.cache_path_thumb {
-            Some(path) => image(iced::widget::image::Handle::from_path(path))
+        // The edited proxy when the image has edits, so the strip shows the
+        // photos as edited. Images still waiting on their cache tiers get a
+        // blank slot rather than being skipped: every slot must be ITEM_WIDTH
+        // wide for the index → position arithmetic above to hold.
+        let img_widget: Element<'a, Message> = match editor.thumbnail_handle(img) {
+            Some(handle) => image(handle)
                 .width(Length::Fixed(THUMB_W))
                 .height(Length::Fixed(THUMB_H))
                 .into(),

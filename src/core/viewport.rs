@@ -136,6 +136,26 @@ pub fn wrap_degrees(deg: f32) -> f32 {
     (deg + 180.0).rem_euclid(360.0) - 180.0
 }
 
+/// Long edge, in pixels, of the small whole-image "overview" render.
+///
+/// One overview is rendered alongside every develop frame: it feeds the
+/// histogram, and is kept as the image's edited proxy (filmstrip thumbnail,
+/// placeholder while the image reloads). Big enough to read as the photo at
+/// thumbnail size, small enough that rendering, reading back and histogramming
+/// it each frame stays negligible next to the display pass.
+pub const OVERVIEW_LONG_EDGE: u32 = 384;
+
+/// Target size of the overview for an image displayed at `display_w`×
+/// `display_h` (EXIF-oriented and crop-aware — see
+/// `RawEditor::image_display_dims`), so the overview has the shape of what
+/// is actually on screen rather than the uncropped frame's.
+pub fn overview_dims(display_w: u32, display_h: u32) -> (u32, u32) {
+    let (w, h) = (display_w.max(1) as f32, display_h.max(1) as f32);
+    let long = OVERVIEW_LONG_EDGE as f32;
+    let (ow, oh) = if w >= h { (long, long * h / w) } else { (long * w / h, long) };
+    ((ow.round() as u32).max(1), (oh.round() as u32).max(1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,5 +372,16 @@ mod tests {
         let r1z = image_rect(1600, 1000, 800.0, 800.0, 3.0, cgmath::Vector2::new(0.5, 0.0));
         let r0z = image_rect(1600, 1000, 800.0, 800.0, 3.0, cgmath::Vector2::new(0.0, 0.0));
         assert!((r1z.x - r0z.x - 0.5 * fw).abs() < 0.01);
+    }
+
+    #[test]
+    fn overview_keeps_the_display_shape_on_its_long_edge() {
+        assert_eq!(overview_dims(6000, 4000), (384, 256));
+        assert_eq!(overview_dims(4000, 6000), (256, 384));
+        // A 16:9 crop of a 3:2 frame: the overview must be 16:9 too.
+        assert_eq!(overview_dims(6000, 3375), (384, 216));
+        // Degenerate sizes never produce a zero-sized render target.
+        assert_eq!(overview_dims(1, 100_000), (1, 384));
+        assert_eq!(overview_dims(0, 0), (384, 384));
     }
 }

@@ -414,6 +414,9 @@ pub fn handle_paste_settings(editor: &mut RawEditor) -> Task<Message> {
             Ok(n) => others = n,
             Err(e) => tracing::error!("Failed to paste onto {} image(s): {e}", merged.len()),
         }
+        // Their edits changed unrendered: their edited thumbnails are stale.
+        let pasted: Vec<i64> = merged.iter().map(|(id, _)| *id).collect();
+        editor.invalidate_proxies(&pasted);
     }
 
     editor.status = if others > 0 {
@@ -433,44 +436,52 @@ pub fn handle_paste_settings(editor: &mut RawEditor) -> Task<Message> {
 
 
 // The single landing point for a completed develop render: stores the new
-// preview, applies the histogram, and releases the render throttle.
+// preview, applies the histogram, keeps the overview as the image's edited
+// proxy, and releases the render throttle.
 //
 // This used to be split into RenderPreview (release the throttle) then
 // HistogramReady (the slow part), because the histogram scanned the entire
-// display buffer on the CPU. The dedicated 128px pass made that scan trivial,
-// so the split — and the extra message round-trip — no longer earn their keep.
-#[allow(clippy::too_many_arguments)]
+// display buffer on the CPU. The dedicated small overview pass made that scan
+// trivial, so the split — and the extra message round-trip — no longer earn
+// their keep.
 pub fn handle_render_finished(
     editor: &mut RawEditor,
-    image_id: i64,
-    bytes: std::sync::Arc<[u8]>,
-    dims: (u32, u32),
-    view_rect: [f32; 4],
-    data: crate::core::histogram::HistogramData,
-    upload_ms: f32,
-    render_ms: f32,
-    update_ms: f32,
+    out: crate::app::message::RenderOutput,
 ) -> Task<Message> {
     // A render of the image the user has since navigated away from: drop the
     // pixels, but still release the throttle below so the next render runs.
     let current = editor.image_resources.as_ref().map(|r| r.image_id);
-    if current == Some(image_id) && !bytes.is_empty() {
-        editor.rendered_preview_bytes = Some(bytes);
-        editor.rendered_preview_dims = dims;
+    if current == Some(out.image_id) && !out.display.is_empty() {
+        editor.rendered_preview_bytes = Some(out.display);
+        editor.rendered_preview_dims = out.dims;
         // Buffer and window swap in the same frame — see the note in
         // trigger_async_render about why this is not published earlier.
-        editor.rendered_view_rect = view_rect;
+        editor.rendered_view_rect = out.view_rect;
         editor.bump_preview_generation();
-        *editor.histogram_data.borrow_mut() = data;
+        *editor.histogram_data.borrow_mut() = out.histogram;
         editor.histogram_cache.clear();
         editor.canvas_cache.clear();
     }
+    // The overview is a faithful render of `out.image_id` even when the user
+    // has already moved on — which is exactly when `persist` may be waiting
+    // for it (see `proxy::resolve_awaiting`).
+    let awaited = editor.proxy_awaiting.contains_key(&out.image_id);
+    if let Some(params) = out.edit.filter(|_| current == Some(out.image_id) || awaited) {
+        crate::app::handlers::proxy::capture(
+            editor,
+            out.image_id,
+            out.overview,
+            out.overview_dims,
+            params,
+        );
+    }
+    let save = crate::app::handlers::proxy::resolve_awaiting(editor, out.image_id, out.edit);
 
     editor.profiler.push_frame(crate::core::profiler::ProfilerFrame {
-        update_ms,
-        upload_ms,
-        render_ms,
-        total_ms: update_ms + upload_ms + render_ms,
+        update_ms: out.update_ms,
+        upload_ms: out.upload_ms,
+        render_ms: out.render_ms,
+        total_ms: out.update_ms + out.upload_ms + out.render_ms,
     });
     editor.profiler_cache.clear();
 
@@ -478,9 +489,9 @@ pub fn handle_render_finished(
     if editor.pending_render {
         editor.is_rendering = true;
         editor.pending_render = false;
-        return trigger_async_render(editor);
+        return Task::batch([save, trigger_async_render(editor)]);
     }
-    Task::none()
+    save
 }
 
 pub fn trigger_async_render(editor: &mut RawEditor) -> Task<Message> {
@@ -558,40 +569,45 @@ pub fn trigger_async_render(editor: &mut RawEditor) -> Task<Message> {
         );
         let update_ms = t_update_start.elapsed().as_secs_f32() * 1000.0;
 
-        let (hist_w, hist_h) = resources.histogram_dims();
+        let overview_dims = crate::core::viewport::overview_dims(disp_w, disp_h);
         let image_id = resources.image_id;
+        // Only a render of the user's real edit may become the image's proxy:
+        // the before/after peek shows other params, and crop mode shows the
+        // whole sensor with the discarded area dimmed. The uniforms hold
+        // `current_edit_params` whenever neither is active — every change to
+        // them is pushed to the GPU as it happens.
+        let edit = (!editor.before_peek && !editor.is_cropping)
+            .then_some(editor.current_edit_params);
 
         return Task::perform(
             async move {
-                // Display window and the whole-image histogram pass share one
-                // GPU wait. The histogram is now ~11k pixels, so there is no
-                // longer any reason to report it separately from the render.
-                let (bytes, histogram, upload_ms, render_ms) =
-                    crate::gpu::render_functions::render_display_and_histogram(
-                        &ctx, &resources, target_w, target_h, view_rect, hist_w, hist_h,
-                    )
-                    .await;
-
-                // The buffer arrives already shared — nothing to copy here.
-                Some((
-                    bytes, histogram, target_w, target_h, view_rect, upload_ms, render_ms,
-                    update_ms,
-                ))
+                // Display window and the whole-image overview share one GPU
+                // wait; the overview is ~100k pixels, so there is no reason to
+                // report it separately from the render.
+                crate::gpu::render_functions::render_display_and_overview(
+                    &ctx,
+                    &resources,
+                    target_w,
+                    target_h,
+                    view_rect,
+                    overview_dims,
+                )
+                .await
             },
-            move |res| match res {
-                Some((byte_arc, histogram, tw, th, vr, upload_ms, render_ms, update_ms)) => {
-                    Message::RenderFinished(
-                        image_id,
-                        byte_arc,
-                        (tw, th),
-                        vr,
-                        histogram,
-                        upload_ms,
-                        render_ms,
-                        update_ms,
-                    )
-                }
-                None => Message::RenderFailed,
+            move |render| {
+                Message::RenderFinished(Box::new(crate::app::message::RenderOutput {
+                    image_id,
+                    display: render.display,
+                    dims: (target_w, target_h),
+                    view_rect,
+                    overview: render.overview,
+                    overview_dims,
+                    histogram: render.histogram,
+                    edit,
+                    upload_ms: render.encode_ms,
+                    render_ms: render.gpu_ms,
+                    update_ms,
+                }))
             },
         );
     }
@@ -812,6 +828,14 @@ pub(crate) fn push_uniforms_and_render(
     editor: &mut RawEditor,
     params: &crate::core::types::EditParams,
 ) -> Task<Message> {
+    // `params` belong to the SELECTED image, but the loaded GPU resources can
+    // still be another one's — Library and Cull change the selection without
+    // loading. Rendering them together (an undo or reset pressed in Library)
+    // drew the previous Develop image with this image's edits, and Develop
+    // then showed that frame when the user went back to it.
+    if editor.image_resources.as_ref().map(|r| r.image_id) != editor.selected_image_id {
+        return Task::none();
+    }
     if let (Some(ctx), Some(resources)) = (&editor.gpu_context, &editor.image_resources) {
         // Phase 140: Interpolate DCP + resolve slider WB
         let (interpolated, wb_override) = resolve_wb_and_dcp(editor, params);
