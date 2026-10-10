@@ -762,12 +762,14 @@ impl canvas::Program<Message> for CropOverlay {
         bounds: Rectangle,
         cursor: Cursor,
     ) -> (canvas::event::Status, Option<Message>) {
-        // Detect resize or DPI change
-        let scale_factor = 1.0; 
-        
-        if state.0 != bounds.width || state.1 != bounds.height || (state.2 - scale_factor).abs() > 0.001 {
-            *state = (bounds.width, bounds.height, scale_factor);
-            return (canvas::event::Status::Captured, Some(Message::ViewportResized(bounds.width, bounds.height, scale_factor)));
+        // Detect a resize. The scale factor is NOT tracked here: a canvas is
+        // never told it, and the hardcoded 1.0 that used to stand in for it
+        // overwrote the real value on every resize — so on a HiDPI display the
+        // preview always rendered at half resolution. It comes from the window
+        // instead (`Message::ScaleFactorChanged`).
+        if state.0 != bounds.width || state.1 != bounds.height {
+            *state = (bounds.width, bounds.height, 1.0);
+            return (canvas::event::Status::Captured, Some(Message::ViewportResized(bounds.width, bounds.height)));
         }
 
         if !self.is_cropping

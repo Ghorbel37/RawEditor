@@ -11,7 +11,7 @@ cargo build-fast / run-fast    # release build/run with the fast-jpeg (SIMD) dec
 cargo build-compat             # explicit alias for the default-features release build
 cargo test                     # run unit tests (see src/raw/tests.rs and inline #[cfg(test)] modules)
 cargo test <name>              # run a single test by name/substring
-cargo clippy                   # lint; cognitive-complexity-threshold = 30 (clippy.toml)
+cargo clippy --all-targets -- -D warnings   # lint; CI enforces this exactly, so keep it at zero
 ```
 
 There is no separate frontend build — this is a single native Rust binary (no web tech, no Electron/Tauri).
@@ -37,7 +37,7 @@ There is no separate frontend build — this is a single native Rust binary (no 
   `shaders.rs` (WGSL source), `shared.rs` (`SharedContext` + `ImageResources`:
   pipeline creation, textures, bind groups, uniform uploads), `params.rs`
   (uniform struct layout), `render_functions.rs` (render + readback entry points)
-- `src/raw/` — RAW decoding, DCP color profile parsing, cache-tier JPEG generation, thumbnails
+- `src/raw/` — RAW decoding (`loader`), DCP profiles (`dcp`), embedded-JPEG extraction + cache tiers (`jpeg`, `processor`), EXIF carried into exports (`exif`). `RAW_EXTENSIONS` is the importable set — Bayer formats only, since the debayer pass assumes a 2×2 CFA (the loader rejects anything else with a reason)
 - `src/database/` — SQLite schema, queries, models (the image catalog)
 - `src/core/` — cross-cutting types, histogram computation, logging/tracing setup, profiler, user settings, and `viewport.rs` (see §D)
 - `src/ui/` — reusable iced widgets (filmstrip, histogram view, icons, palette/styles, profiler graph), plus `preview_renderer.rs` + `viewport.wgsl` (the develop viewport shader widget and its crop/mask canvas overlay)
@@ -50,6 +50,7 @@ Dual-pass rendering to avoid wasting GPU cycles:
 - Shader source lives in `src/gpu/shaders.rs`; pipeline/bind-group/uniform setup in `src/gpu/shared.rs`; uniform struct layout in `src/gpu/params.rs`; the render + readback entry points in `src/gpu/render_functions.rs`.
 - `SharedContext` holds two Pass-2 pipelines: `pipeline` (→ `Rgba8Unorm`, display) and `pipeline_16` (→ `Rgba16Float`, 16-bit TIFF export only). A wgpu `RenderPipeline`'s output format is baked in at creation, so the export path needs its own rather than swapping the target's format.
 - **Windowed rendering:** Pass 2 renders only `GpuEditParams.view_rect` — the `(u0, v0, du, dv)` slice of the displayed image that is actually on screen (see §D). The vertex shader maps the target across it, so `(0,0,1,1)` is the identity and covers the whole image.
+- **Device limits come from the adapter** (texture dimension, buffer size), not `Limits::default()`, whose 8192px / 256 MB floor fails full-res work on ≥45 MP sensors. Size-check before allocating (`SharedContext::check_texture_size` / `check_buffer_size`) and return an error; the device's uncaptured-error handler only logs, so an unchecked oversize no longer panics — it renders wrong instead.
 - **Histogram:** a dedicated ~128px whole-image pass (`ImageResources::histogram_dims`) rendered in the *same frame* as the display window and sharing one `poll(Wait)` — see `render_display_and_histogram`. It must stay whole-image, or it would drift as the user pans/zooms. The two passes read one uniform buffer; their differing `view_rect` values are sequenced by `write_view_rect`'s targeted 16-byte `queue.write_buffer` between submits.
 
 ### B. Adobe DCP Color Science (`src/raw/dcp.rs`)
@@ -105,6 +106,9 @@ RAW files are never decoded on the main thread. Three async-generated JPEG tiers
 - RAM cache is bounded by a user-configurable memory budget; over budget, the LRU evicts the oldest `RawDataResult` structs.
 - On-disk cache lives under `~/.cache/raw-editor/{thumb,instant,working}`. Schema columns: `cache_path_thumb`, `cache_path_instant`, `cache_path_working` (the old single `thumbnail_path`/`preview_path` system is retired).
 - `app/loader.rs` drives the head of each queue as *separate* iced subscriptions so decodes run concurrently — bounded by `MAX_CONCURRENT_PREVIEW_LOADS` (4) and `MAX_CONCURRENT_RAW_LOADS` (2, lower because each RAW can hold ~100 MB).
+- Preloads are queued nearest-first in *display order* (`navigation::neighbours`: +1, −1, +2, …) and each navigation `requeue`s the not-yet-started tail. The first `MAX_CONCURRENT_*` queue entries are the running decodes — never reorder or drop those.
+- Cache workers mark rows `processing` while working; `Library::requeue_interrupted_cache_jobs` returns leftovers to `pending` at startup (only safe before the workers start). `verify_files` reconciles `file_status` in both directions.
+- The embedded-JPEG finder (`raw::jpeg`) walks JPEG segment structure. Sensor data contains `FF D8 FF` by chance; first-EOI measuring let such noise outrank real previews, so it is a last resort only.
 - **Every** `rusqlite::Connection` must be passed through `database::library::apply_pragmas` (WAL + `synchronous=NORMAL`) — including the ones opened inside `spawn_blocking` workers. Pragmas are per-connection; without them rusqlite defaults to an fsync per transaction.
 
 ### D. Viewport & Projection Math
@@ -118,8 +122,14 @@ compute it independently and disagreed at any zoom != 1.0.
 - `visible_view_rect` computes the window Pass 2 renders, grown by `RENDER_OVERSCAN` (1.25) so panning is free until the user drags past the margin; `view_rect_contains` answers "is a re-render due?". Panning does not re-render — the viewport shader just re-projects the existing texture.
 - State keeps `rendered_view_rect` (what the on-screen bytes actually cover, published **with** the bytes in `handle_render_finished`) separate from `requested_view_rect` (what the in-flight render covers). Publishing the former early draws the current texture at the incoming window's placement, which reads as the image jumping for a frame.
 - `viewport.wgsl`'s projection matrix carries the entire placement (fit + zoom + pan); its fragment shader is a plain `textureSample`. `GpuEditParams.zoom`/`pan_x`/`pan_y` are vestigial and intentionally unread.
-- Preview resolutions are multiplied by the window's `scale_factor` for pixel-perfect Retina/4K rendering. Render targets are additionally clamped to 1:1 with the source — past that there is no more detail to resolve. Zooming past 1.5 triggers `trigger_full_res_upgrade`, rebuilding `ImageResources` from cached RAW without subsampling.
-- Non-destructive crop uses normalized `[0.0, 1.0]` UV coords; while `is_cropping == 1` the GPU reveals full sensor data and dims discarded pixels (and windowing is skipped, since zoom/pan are disabled there).
+- Preview resolutions are multiplied by the window's `scale_factor` for pixel-perfect Retina/4K rendering. It comes from `window::get_scale_factor` (startup + every resize → `Message::ScaleFactorChanged`), never from the canvas, which cannot know it — a hardcoded 1.0 there once halved HiDPI preview resolution. Render targets are additionally clamped to 1:1 with the source — past that there is no more detail to resolve. Zooming past 1.5 triggers `trigger_full_res_upgrade`, rebuilding `ImageResources` from cached RAW without subsampling.
+- Non-destructive crop uses normalized `[0.0, 1.0]` UV coords; while `is_cropping == 1` the GPU reveals full sensor data and dims discarded pixels (and windowing is skipped, since zoom/pan are disabled there). `EditParams::is_cropping` is **tool state riding to the shader, not an edit**: `#[serde(skip)]`, forced to 0 for export, and re-derived from `editor.is_cropping` by `sync_tool_flags()` (inside `update_pipeline`, and wherever params are replaced wholesale). Persisting it once made images reopen and export as the crop-mode visualisation.
+
+### E. Large Catalogues (`views::library`, `ui::filmstrip`)
+iced rebuilds the whole view after **every** message, so per-message cost must not scale with the catalogue.
+- The library grid and the filmstrip are virtualised: only rows/slots near the scroll offset are built, with spacers for the rest (`GridGeometry`, `filmstrip::visible_items`). Offsets arrive via each scrollable's `on_scroll`; a tab switch rebuilds those scrollables at offset 0, so `handle_tab_changed` resets the stored offsets to match. `reveal_selection` scrolls either one to keep keyboard navigation in view.
+- Never add a subscription that emits per mouse move (the old global `CursorMoved` tracking rebuilt every thumbnail on each move). Prefer widget-scoped events — the grid's wheel boost uses its `mouse_area` enter/exit.
+- Never build image handles with `Handle::from_bytes` inside `view`: each call mints a new id, and iced re-decodes the image every rebuild. Build once (`LazyLock`), or use `from_path`.
 - **UV is not isotropic.** Mask geometry lives in full-image UV, but what's displayed is the crop sub-rect stretched over a full-image-aspect target, so the two axes carry different pixels-per-unit. Anything angular (rotated radial masks) must un-distort by `core::viewport::mask_uv_aspect`, rotate, then redistort — rotating in raw UV shears. Rotation angles are cyclic: use `wrap_degrees`, never a clamp, or a drag sticks at ±180°.
 
 ## Strict Engineering Constraints (must follow)
@@ -142,7 +152,9 @@ compute it independently and disagreed at any zoom != 1.0.
    `Enter` → `Message::ModalConfirm` → dispatch on `active_modal`
    (`handlers::window::handle_modal_confirm`). Modal-scoped shortcuts bind
    globally and guard with `if editor.active_modal != Modal::X { return
-   Task::none(); }` as the handler's first line.
+   Task::none(); }` as the handler's first line. Key presses a focused widget
+   already captured (text inputs, hovered sliders) are dropped before routing —
+   otherwise typing in a text field fires shortcuts (Backspace → Delete).
 5. **GPU memory is freed lazily, and `SharedContext` is created once.** Dropping
    a wgpu `Texture`/`Buffer` only queues it for reclamation — the allocation
    survives until the next `poll`. Every `poll` in this crate is *inside* a

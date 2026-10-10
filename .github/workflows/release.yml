@@ -24,11 +24,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # actions-rs/toolchain is archived and runs on a deprecated Node
+      # runtime; dtolnay/rust-toolchain is the maintained equivalent.
       - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -46,7 +45,6 @@ jobs:
           mkdir -p dist/$APP-linux
 
           cp target/release/$APP dist/$APP-linux/
-          cp target/release/$APP.d dist/$APP-linux/ || true
           cp -r assets dist/$APP-linux/
           cp README.md dist/$APP-linux/ || true
           cp LICENSE dist/$APP-linux/ || true

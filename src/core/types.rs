@@ -74,6 +74,7 @@ pub struct EditParams {
     /// - Negative = cooler (bluer)
     /// - Positive = warmer (yellower)
     /// - 0.0 = as-shot
+    ///
     /// For DCP interpolation, this is converted to Kelvin at the call site.
     pub temperature: f32,
 
@@ -118,6 +119,13 @@ pub struct EditParams {
     // Phase 135: Non-destructive crop visibility
     /// Flag to indicate if the user is currently cropping
     /// If 1, the shader will show the full image with the crop dimmed outside.
+    ///
+    /// UI state riding along for the shader, NOT an edit — so never persisted.
+    /// It used to be: a crop-handle release flushed `1` to SQLite, and the
+    /// image then reopened (and exported) as the crop-mode visualisation —
+    /// the whole sensor, outside dimmed, squeezed into the cropped aspect.
+    /// `skip` also heals rows already written with `1`.
+    #[serde(skip)]
     pub is_cropping: u32,
 
     // ========== Color Profile ==========

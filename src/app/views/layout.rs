@@ -18,10 +18,39 @@ use super::modals::{
 
 /// Height of the custom title bar. Module-level because the menu bar has to be
 /// given this height explicitly — see `view_title_bar`.
-const TITLE_BAR_HEIGHT: f32 = 35.0;
+pub(crate) const TITLE_BAR_HEIGHT: f32 = 35.0;
 
 // Phase 69: Brand Identity
 const LOGO_BYTES: &[u8] = include_bytes!("../../../assets/logo.png");
+
+/// The logo's image handle, built once.
+///
+/// `Handle::from_bytes` mints a fresh unique id on every call, and iced keys
+/// its decoded-image cache by that id — so building the handle inside `view`
+/// copied the PNG and decoded it again on every view rebuild, which iced
+/// does after every message.
+fn logo() -> Handle {
+    static LOGO: std::sync::LazyLock<Handle> =
+        std::sync::LazyLock::new(|| Handle::from_bytes(LOGO_BYTES));
+    LOGO.clone()
+}
+
+/// The splash artwork, looked up beside the executable first.
+///
+/// A bare relative path only resolved when the app was launched from the
+/// repository root; started any other way (a desktop launcher, the release
+/// zip) the splash was simply blank. Not embedded: it is ~10 MB.
+fn splash() -> Handle {
+    static SPLASH: std::sync::LazyLock<Handle> = std::sync::LazyLock::new(|| {
+        let relative = std::path::Path::new("assets").join("splash.png");
+        let beside_exe = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join(&relative)))
+            .filter(|path| path.exists());
+        Handle::from_path(beside_exe.unwrap_or(relative))
+    });
+    SPLASH.clone()
+}
 
 /// Build the user interface
 pub fn view(editor: &RawEditor) -> Element<'_, Message> {
@@ -60,7 +89,7 @@ pub fn view(editor: &RawEditor) -> Element<'_, Message> {
 fn view_splash(editor: &RawEditor) -> Element<'_, Message> {
     let left_content = column![
         Space::with_height(Length::Fill),
-        iced::widget::image("assets/splash.png")
+        iced::widget::image(splash())
             .width(Length::Fill)
             .content_fit(iced::ContentFit::Cover),
         Space::with_height(Length::Fill),
@@ -81,7 +110,7 @@ fn view_splash(editor: &RawEditor) -> Element<'_, Message> {
         column![
             Space::with_height(Length::Fill),
             container(
-                Image::new(Handle::from_bytes(LOGO_BYTES.to_vec()))
+                Image::new(logo())
                     .height(Length::Fixed(72.0))
                     .content_fit(iced::ContentFit::Contain)
             )
@@ -387,7 +416,7 @@ fn view_title_bar(editor: &RawEditor) -> Element<'_, Message> {
     ).width(Length::Fill).height(Length::Fill).align_x(iced::alignment::Horizontal::Center).align_y(iced::alignment::Vertical::Center);
 
     let controls = row![
-        container(Image::new(Handle::from_bytes(LOGO_BYTES.to_vec())).height(Length::Fixed(24.0)).content_fit(iced::ContentFit::Contain)).height(Length::Fill).align_y(iced::alignment::Vertical::Center).padding([8,15]),
+        container(Image::new(logo()).height(Length::Fixed(24.0)).content_fit(iced::ContentFit::Contain)).height(Length::Fill).align_y(iced::alignment::Vertical::Center).padding([8,15]),
         iced::widget::Space::with_width(Length::Fixed(5.0)),
         button(container(text(ui::icons::MINIMIZE).font(ICON_FONT).size(14)).width(Length::Fill).height(Length::Fill).align_x(iced::alignment::Horizontal::Center).align_y(iced::alignment::Vertical::Center)).on_press(Message::MinimizeWindow).style(ui::styles::WindowControlButton::style).width(Length::Fixed(45.0)).height(Length::Fill),
         button(container(text(ui::icons::MAXIMIZE).font(ICON_FONT).size(14)).width(Length::Fill).height(Length::Fill).align_x(iced::alignment::Horizontal::Center).align_y(iced::alignment::Vertical::Center)).on_press(Message::MaximizeWindow).style(ui::styles::WindowControlButton::style).width(Length::Fixed(45.0)).height(Length::Fill),

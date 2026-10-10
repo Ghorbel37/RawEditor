@@ -1,5 +1,7 @@
-// The line below is to remove all the warnings for unused methods, fields, etc. To optimize token use
-#![allow(dead_code)]
+// Tests build params up field by field (`let mut p = default(); p.x = …`),
+// which reads better than one giant literal. Production code is still held to
+// the lint by the non-test build.
+#![cfg_attr(test, allow(clippy::field_reassign_with_default))]
 
 mod app;
 pub mod color;
@@ -21,7 +23,7 @@ pub fn main() -> iced::Result {
     )
     .subscription(app::state::RawEditor::subscription)
     .theme(app::view::theme)
-    .font(include_bytes!("../assets/fonts/icons.ttf"))
+    .font(ui::icons::ICON_FONT_BYTES)
     .default_font(Font::with_name("JetBrainsMono Nerd Font"))
     .window(iced::window::Settings {
         size: iced::Size::new(900.0, 350.0),

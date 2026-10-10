@@ -1405,11 +1405,6 @@ pub fn get_debayer_shader() -> &'static str {
     DEBAYER_SHADER
 }
 
-/// Legacy alias — returns the color shader for backward compatibility
-pub fn get_shader() -> &'static str {
-    PASSTHROUGH_SHADER
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

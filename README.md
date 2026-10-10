@@ -118,6 +118,7 @@ shrinks. Images are rendered one at a time at full sensor resolution, so memory
 use stays flat whether the batch is five images or five hundred. Each image
 uses its own saved edits, a failure never stalls the rest of the queue, and
 existing files are never overwritten — a numbered suffix is added instead.
+JPEGs keep the original's capture date, camera, lens and exposure details.
 
 ---
 
@@ -255,6 +256,7 @@ cargo clippy            # lints
 | <kbd>C</kbd> | Crop mode |
 | <kbd>W</kbd> | White balance eyedropper |
 | <kbd>R</kbd> | Reset all edits |
+| <kbd>Ctrl</kbd>+click a slider | Reset that slider |
 | <kbd>Ctrl</kbd>+<kbd>Z</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd> | Undo / redo |
 | <kbd>Ctrl</kbd>+<kbd>C</kbd> | Copy settings — choose which |
 | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd> | Copy all settings |
@@ -275,8 +277,10 @@ Working and in use, but young. Known gaps:
   that does apply it.
 - The catalogue has no migration tooling; a schema change means rebuilding it.
 - Colour calibration has been verified in depth against Nikon NEF files.
-  Decoding covers the formats [rawler](https://github.com/dnglab/dnglab)
-  supports, but other makes have had less scrutiny.
+  Import accepts Bayer-sensor RAWs that [rawler](https://github.com/dnglab/dnglab)
+  decodes — NEF/NRW, CR2/CR3, ARW, DNG, ORF, RW2/RWL, PEF and SRW — but other
+  makes have had less scrutiny. Fujifilm X-Trans and other non-Bayer sensors
+  are not supported yet.
 
 ---
 

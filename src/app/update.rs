@@ -4,6 +4,44 @@ use crate::app::state::RawEditor;
 use iced::Task;
 
 pub fn update(editor: &mut RawEditor, message: Message) -> Task<Message> {
+    // Ctrl/Cmd+click resets a slider to its default. iced fires `on_change`
+    // for that click but no `on_release`, so the CommitEdit every other slider
+    // gesture ends with never arrives — commit it here instead. Holding the
+    // modifier can't mean anything else: there is no Ctrl+drag on a slider.
+    let slider_reset = editor.last_modifiers.command() && is_slider_change(&message);
+    let task = dispatch(editor, message);
+    if slider_reset {
+        editor.commit_current_state();
+    }
+    task
+}
+
+/// Messages emitted by the Develop sidebar's sliders.
+fn is_slider_change(message: &Message) -> bool {
+    matches!(
+        message,
+        Message::ExposureChanged(_)
+            | Message::ContrastChanged(_)
+            | Message::HighlightsChanged(_)
+            | Message::ShadowsChanged(_)
+            | Message::WhitesChanged(_)
+            | Message::BlacksChanged(_)
+            | Message::VibranceChanged(_)
+            | Message::ProfileCurveChanged(_)
+            | Message::GtParamChanged(..)
+            | Message::SaturationChanged(_)
+            | Message::TemperatureChanged(_)
+            | Message::TintChanged(_)
+            | Message::LumaNoiseChanged(_)
+            | Message::ColorNoiseChanged(_)
+            | Message::SharpeningChanged(_)
+            | Message::SharpenMaskingChanged(_)
+            | Message::RotationChanged(_)
+            | Message::MaskAdjustmentChanged(..)
+    )
+}
+
+fn dispatch(editor: &mut RawEditor, message: Message) -> Task<Message> {
     match message {
         // Library
         Message::DatabaseLoaded(res) => handlers::library::handle_database_loaded(editor, res),
@@ -11,7 +49,6 @@ pub fn update(editor: &mut RawEditor, message: Message) -> Task<Message> {
         Message::ImportFromCamera => handlers::library::handle_import_from_camera(editor),
         Message::ImportComplete(res) => handlers::library::handle_import_complete(editor, res),
         Message::CacheProcessed(res) => handlers::library::handle_cache_processed(editor, res),
-        Message::ThumbnailGenerated(_) => Task::none(),
         Message::SetRating(r) => handlers::library::handle_set_rating(editor, r),
         Message::SetFlag(f) => handlers::library::handle_set_flag(editor, f),
         Message::ToggleAutoAdvance => handlers::library::handle_toggle_auto_advance(editor),
@@ -33,7 +70,6 @@ pub fn update(editor: &mut RawEditor, message: Message) -> Task<Message> {
         Message::PreviewCached(id, res) => {
             handlers::navigation::handle_preview_cached(editor, id, res)
         }
-        Message::PreloadPreview(_) => Task::none(),
 
         // Develop
         Message::ExposureChanged(v) => handlers::develop::handle_exposure_changed(editor, v),
@@ -189,14 +225,15 @@ pub fn update(editor: &mut RawEditor, message: Message) -> Task<Message> {
             handlers::window::handle_set_raw_preload_ahead(editor, v)
         }
         Message::SetMinFreeRam(v) => handlers::window::handle_set_min_free_ram(editor, v),
+        Message::SavePreferences => handlers::window::handle_save_preferences(editor),
         Message::ResetPreferences => handlers::window::handle_reset_preferences(editor),
         Message::HistogramToggled(b) => handlers::window::handle_histogram_toggled(editor, b),
         Message::ToggleProfiler => {
             editor.show_profiler = !editor.show_profiler;
             Task::none()
         }
-        Message::RenderFinished(bytes, dims, view_rect, d, u, r, cpu) => {
-            handlers::develop::handle_render_finished(editor, bytes, dims, view_rect, d, u, r, cpu)
+        Message::RenderFinished(id, bytes, dims, view_rect, d, u, r, cpu) => {
+            handlers::develop::handle_render_finished(editor, id, bytes, dims, view_rect, d, u, r, cpu)
         }
         Message::RenderFailed => {
             // GPU render task failed (shader error, device lost, etc.).
@@ -210,22 +247,20 @@ pub fn update(editor: &mut RawEditor, message: Message) -> Task<Message> {
                 Task::none()
             }
         }
-        Message::ViewportResized(w, h, s) => {
-            let old_s = editor.scale_factor;
+        Message::ViewportResized(w, h) => {
             let (old_w, old_h) = editor.viewport_size;
             editor.viewport_size = (w, h);
-            editor.scale_factor = s;
 
-            // Re-render on a scale-factor change (different resolution needed)
-            // and on a size change (different visible window, and at zoom the
-            // buffer only covers the window the old size implied).
+            // Re-render on a size change: a different visible window, and at
+            // zoom the buffer only covers the window the old size implied.
             let resized = (w - old_w).abs() > 0.5 || (h - old_h).abs() > 0.5;
-            if (s - old_s).abs() > 0.001 || resized {
+            if resized {
                 handlers::navigation::throttled_render(editor)
             } else {
                 Task::none()
             }
         }
+        Message::ScaleFactorChanged(s) => handlers::window::handle_scale_factor_changed(editor, s),
 
         // Loading
         Message::RawDataLoaded(id, res) => handlers::loading::handle_raw_data_loaded(editor, id, res),
@@ -233,12 +268,27 @@ pub fn update(editor: &mut RawEditor, message: Message) -> Task<Message> {
         Message::ImageResourcesReady(id, res) => {
             handlers::loading::handle_image_resources_ready(editor, id, res)
         }
-        Message::PreviewGenerated(_) => Task::none(),
 
         // Scroll boost + filmstrip momentum
         Message::WheelScrolled(delta) => handlers::scroll::handle_wheel(editor, delta),
-        Message::GlobalCursorMoved(pos) => handlers::scroll::handle_global_cursor_moved(editor, pos),
-        Message::WindowResized(size) => handlers::scroll::handle_window_resized(editor, size),
+        Message::GridHovered(over) => {
+            editor.cursor_over_grid = over;
+            Task::none()
+        }
+        Message::GridScrolled(y, width, height) => {
+            editor.grid_scroll_y = y;
+            editor.grid_viewport = (width, height);
+            Task::none()
+        }
+        Message::FilmstripScrolled(x, width) => {
+            editor.filmstrip_scroll_x = x;
+            editor.filmstrip_view_w = width;
+            Task::none()
+        }
+        Message::WindowResized(size) => {
+            editor.window_size = size;
+            handlers::window::query_scale_factor()
+        }
         Message::KineticTick(now) => handlers::scroll::handle_kinetic_tick(editor, now),
         Message::FilmstripWheel(delta) => handlers::scroll::handle_filmstrip_wheel(editor, delta),
     }

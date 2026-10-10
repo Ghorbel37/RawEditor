@@ -262,7 +262,7 @@ pub fn handle_process_next_export(editor: &mut RawEditor) -> Task<Message> {
             // Each image's own saved edits. For the image currently open in
             // Develop, prefer the in-memory params: they may hold a gesture
             // that has not been flushed to SQLite yet.
-            let params = if Some(image_id) == editor.selected_image_id {
+            let mut params = if Some(image_id) == editor.selected_image_id {
                 editor.current_edit_params
             } else {
                 editor
@@ -271,6 +271,9 @@ pub fn handle_process_next_export(editor: &mut RawEditor) -> Task<Message> {
                     .and_then(|lib| lib.load_edit_params(image_id).ok())
                     .unwrap_or_default()
             };
+            // Exporting while the crop tool is open must still produce the
+            // cropped photo, not the tool's dimmed full-sensor preview.
+            params.is_cropping = 0;
             // Reuse an already-decoded RAW when the develop/cull preload has
             // one. Skips a multi-second decode per image for the common
             // "cull, then export the selects" flow, and costs nothing: the
@@ -442,15 +445,23 @@ pub fn handle_export_pipeline_ready(
             // setting was never read, so the checkbox and the size field did
             // nothing at all.
             let (target_width, target_height) = resized_dims(cropped_w, cropped_h, &settings);
-            let filename = if let Some(img) = editor.images.iter().find(|i| i.id == image_id) {
-                Path::new(&img.path)
-                    .file_stem()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string()
-            } else {
-                format!("image_{}", image_id)
-            };
+            if let Err(e) = check_export_size(&context, target_width, target_height, settings.format) {
+                tracing::error!("Export of image {image_id} refused: {e}");
+                editor.status = format!("Export failed: {e}");
+                set_job_state(editor, image_id, crate::app::state::ExportJobState::Failed(e));
+                context.reclaim();
+                return Task::perform(async {}, |_| Message::ProcessNextExport);
+            }
+            let source = editor
+                .images
+                .iter()
+                .find(|i| i.id == image_id)
+                .map(|img| PathBuf::from(&img.path));
+            let filename = source
+                .as_deref()
+                .and_then(Path::file_stem)
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_else(|| format!("image_{}", image_id));
 
             Task::perform(
                 async move {
@@ -476,7 +487,8 @@ pub fn handle_export_pipeline_ready(
                         .await;
                         ExportPixels::Rgba8(bytes)
                     };
-                    save_export_async(filename, pixels, target_width, target_height, settings).await
+                    save_export_async(filename, source, pixels, target_width, target_height, settings)
+                        .await
                 },
                 move |res| Message::ExportSaveComplete(image_id, res),
             )
@@ -547,6 +559,27 @@ fn resized_dims(width: u32, height: u32, settings: &ExportSettings) -> (u32, u32
     )
 }
 
+/// Reject an export the GPU or the encoder cannot produce, before any work.
+///
+/// Without this a too-large render failed wgpu validation mid-batch, and a
+/// JPEG past 65535px had its dimensions silently truncated by the `as u16`
+/// the encoder requires.
+fn check_export_size(
+    context: &gpu::shared::SharedContext,
+    width: u32,
+    height: u32,
+    format: ExportFormat,
+) -> Result<(), String> {
+    context.check_texture_size(width, height)?;
+    let bytes_per_pixel: u64 = if format == ExportFormat::Tiff { 8 } else { 4 };
+    let row = (width as u64 * bytes_per_pixel).next_multiple_of(256);
+    context.check_buffer_size(row * height as u64)?;
+    if format == ExportFormat::Jpeg && (width > u16::MAX as u32 || height > u16::MAX as u32) {
+        return Err(format!("{width}×{height} is larger than JPEG allows (65535px)"));
+    }
+    Ok(())
+}
+
 /// Pick a destination path, adding ` (2)`, ` (3)`… rather than overwriting.
 ///
 /// Two source folders commonly hold the same stems (DSC_0001 from two cards,
@@ -580,6 +613,7 @@ enum ExportPixels {
 
 async fn save_export_async(
     filename: String,
+    source: Option<PathBuf>,
     pixels: ExportPixels,
     width: u32,
     height: u32,
@@ -587,7 +621,19 @@ async fn save_export_async(
 ) -> Result<PathBuf, String> {
     tokio::task::spawn_blocking(move || {
         use std::fs::File;
-        use std::io::BufWriter;
+        use std::io::{BufWriter, Write};
+
+        // A failed GPU readback hands back an empty buffer. Catch it before a
+        // file exists, rather than leaving an empty or truncated image on disk.
+        let (got, want) = match &pixels {
+            ExportPixels::Rgba8(b) => (b.len(), width as usize * height as usize * 4),
+            ExportPixels::Rgb16(s) => (s.len(), width as usize * height as usize * 3),
+        };
+        if got != want {
+            return Err(format!(
+                "GPU readback returned {got} samples, expected {want} — nothing was written"
+            ));
+        }
 
         let output_dir = settings.base_path.join(&settings.subfolder);
         std::fs::create_dir_all(&output_dir).map_err(|e| e.to_string())?;
@@ -600,52 +646,56 @@ async fn save_export_async(
 
         let output_path = unique_output_path(&output_dir, &filename, extension);
         let file = File::create(&output_path).map_err(|e| e.to_string())?;
-        let writer = BufWriter::new(file);
+        let mut writer = BufWriter::new(file);
 
-        match (settings.format, pixels) {
-            (ExportFormat::Png, ExportPixels::Rgba8(bytes)) => {
-                let mut encoder = png::Encoder::new(writer, width, height);
-                encoder.set_color(png::ColorType::Rgba);
-                encoder.set_depth(png::BitDepth::Eight);
-
-                let mut png_writer = encoder.write_header().map_err(|e| e.to_string())?;
-                png_writer
-                    .write_image_data(&bytes)
-                    .map_err(|e| e.to_string())?;
-            }
-            (ExportFormat::Jpeg, ExportPixels::Rgba8(bytes)) => {
-                if !bytes.len().is_multiple_of(4) {
-                    return Err(format!(
-                        "Export buffer length {} is not a multiple of 4",
-                        bytes.len()
-                    ));
+        let encoded = (|| -> Result<(), String> {
+            match (settings.format, pixels) {
+                (ExportFormat::Png, ExportPixels::Rgba8(bytes)) => {
+                    let mut encoder = png::Encoder::new(&mut writer, width, height);
+                    encoder.set_color(png::ColorType::Rgba);
+                    encoder.set_depth(png::BitDepth::Eight);
+                    let mut png_writer = encoder.write_header().map_err(|e| e.to_string())?;
+                    png_writer.write_image_data(&bytes).map_err(|e| e.to_string())?;
+                    // `finish` rather than drop: dropping swallows the error.
+                    png_writer.finish().map_err(|e| e.to_string())?;
                 }
-                let rgb_bytes: Vec<u8> = bytes
-                    .chunks_exact(4)
-                    .flat_map(|rgba| [rgba[0], rgba[1], rgba[2]])
-                    .collect();
+                (ExportFormat::Jpeg, ExportPixels::Rgba8(bytes)) => {
+                    let mut encoder = jpeg_encoder::Encoder::new(&mut writer, settings.quality);
+                    // Capture date, camera, lens and exposure from the RAW, so
+                    // the export sorts and reads like the original. Best
+                    // effort: a RAW without readable EXIF still exports.
+                    if let Some(app1) = source.as_deref().and_then(crate::raw::exif::export_app1) {
+                        if let Err(e) = encoder.add_app_segment(1, &app1) {
+                            tracing::warn!("Exporting without EXIF: {e}");
+                        }
+                    }
+                    // Encoded straight from RGBA — the encoder ignores alpha.
+                    // The RGB repack this used to do was a third full-frame
+                    // buffer (~72 MB at 24 MP) alive next to the readback copy.
+                    encoder
+                        .encode(&bytes, width as u16, height as u16, jpeg_encoder::ColorType::Rgba)
+                        .map_err(|e| e.to_string())?;
+                }
+                (ExportFormat::Tiff, ExportPixels::Rgb16(samples)) => {
+                    tiff::encoder::TiffEncoder::new(&mut writer)
+                        .map_err(|e| e.to_string())?
+                        .write_image::<tiff::encoder::colortype::RGB16>(width, height, &samples)
+                        .map_err(|e| e.to_string())?;
+                }
+                (format, _) => {
+                    return Err(format!("Export pixel buffer does not match format {format}"));
+                }
+            }
+            // Explicit: a BufWriter flushes on drop but discards the error, so
+            // a full disk used to report a truncated file as a success.
+            writer.flush().map_err(|e| e.to_string())
+        })();
 
-                let encoder = jpeg_encoder::Encoder::new(writer, settings.quality);
-                encoder
-                    .encode(
-                        &rgb_bytes,
-                        width as u16,
-                        height as u16,
-                        jpeg_encoder::ColorType::Rgb,
-                    )
-                    .map_err(|e| e.to_string())?;
-            }
-            (ExportFormat::Tiff, ExportPixels::Rgb16(samples)) => {
-                tiff::encoder::TiffEncoder::new(writer)
-                    .map_err(|e| e.to_string())?
-                    .write_image::<tiff::encoder::colortype::RGB16>(width, height, &samples)
-                    .map_err(|e| e.to_string())?;
-            }
-            (format, _) => {
-                return Err(format!("Export pixel buffer does not match format {format}"));
-            }
+        if let Err(e) = encoded {
+            drop(writer);
+            let _ = std::fs::remove_file(&output_path);
+            return Err(e);
         }
-
         Ok(output_path)
     })
     .await

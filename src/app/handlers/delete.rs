@@ -34,44 +34,33 @@ struct DeleteTarget {
     cache_working: Option<String>,
 }
 
-fn target_ids(editor: &RawEditor) -> Vec<i64> {
-    if !editor.multi_selection.is_empty() {
-        editor.multi_selection.iter().copied().collect()
-    } else if let Some(id) = editor.selected_image_id {
-        vec![id]
-    } else {
-        vec![]
-    }
-}
-
 /// Dispatcher for Message::DeleteImage: instant-unmark when every target is
 /// already marked, otherwise opens the confirmation modal.
 pub fn handle_delete_image_requested(editor: &mut RawEditor) -> Task<Message> {
     if editor.active_modal != Modal::None {
         return Task::none();
     }
-    let ids = target_ids(editor);
+    let ids = editor.action_target_ids();
     if ids.is_empty() {
         return Task::none();
     }
 
-    let all_marked = ids.iter().all(|id| {
-        editor
-            .images
-            .iter()
-            .find(|i| i.id == *id)
-            .map(|i| i.rating == MARKED_FOR_REMOVAL_RATING)
-            .unwrap_or(false)
-    });
+    let marked: std::collections::HashSet<i64> = editor
+        .images
+        .iter()
+        .filter(|i| i.rating == MARKED_FOR_REMOVAL_RATING)
+        .map(|i| i.id)
+        .collect();
+    let all_marked = ids.iter().all(|id| marked.contains(id));
 
     if all_marked {
         if let Some(lib) = &editor.library {
-            for &id in &ids {
-                let _ = lib.set_image_rating(id, 0);
-                if let Some(img) = editor.images.iter_mut().find(|i| i.id == id) {
-                    img.rating = 0;
-                }
+            if let Err(e) = lib.set_ratings(&ids, 0) {
+                tracing::error!("Failed to unmark {} image(s): {e}", ids.len());
+                editor.status = format!("Could not unmark: {e}");
+                return Task::none();
             }
+            editor.apply_to_images(&ids, |img| img.rating = 0);
         }
         editor.status = format!("Unmarked {} image(s)", ids.len());
         Task::none()
@@ -93,12 +82,12 @@ pub fn handle_mark_for_removal_confirmed(editor: &mut RawEditor) -> Task<Message
     }
 
     if let Some(lib) = &editor.library {
-        for &id in &ids {
-            let _ = lib.set_image_rating(id, MARKED_FOR_REMOVAL_RATING);
-            if let Some(img) = editor.images.iter_mut().find(|i| i.id == id) {
-                img.rating = MARKED_FOR_REMOVAL_RATING;
-            }
+        if let Err(e) = lib.set_ratings(&ids, MARKED_FOR_REMOVAL_RATING) {
+            tracing::error!("Failed to mark {} image(s) for removal: {e}", ids.len());
+            editor.status = format!("Could not mark for removal: {e}");
+            return Task::none();
         }
+        editor.apply_to_images(&ids, |img| img.rating = MARKED_FOR_REMOVAL_RATING);
     }
     editor.status = format!("Marked {} image(s) for removal", ids.len());
 
@@ -254,7 +243,13 @@ async fn hard_delete_async(targets: Vec<DeleteTarget>, db_path: PathBuf) -> Hard
             }
 
             match trash_or_missing(&t.path) {
-                Ok(()) => match conn.execute("DELETE FROM images WHERE id = ?1", [t.id]) {
+                // Edits go explicitly: `ON DELETE CASCADE` is inert because
+                // foreign keys are never enabled (see `apply_pragmas`), so
+                // this used to orphan an `edits` row per deleted image.
+                Ok(()) => match conn
+                    .execute("DELETE FROM edits WHERE image_id = ?1", [t.id])
+                    .and_then(|_| conn.execute("DELETE FROM images WHERE id = ?1", [t.id]))
+                {
                     Ok(_) => deleted_ids.push(t.id),
                     Err(e) => {
                         tracing::error!("delete: DB row delete failed for {}: {}", t.id, e);

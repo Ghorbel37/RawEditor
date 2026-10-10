@@ -1,6 +1,5 @@
 use iced::widget::{button, container, image, mouse_area, row, scrollable, text, stack, Space};
 use iced::{Background, Border, Color, Element, Length, Theme};
-use std::path::PathBuf;
 
 use crate::database::models::{Image, MARKED_FOR_REMOVAL_RATING};
 use crate::app::message::Message;
@@ -12,37 +11,80 @@ pub fn scroll_id() -> scrollable::Id {
     scrollable::Id::new("filmstrip")
 }
 
+/// Thumbnail size, and the horizontal padding either side of each one.
+const THUMB_W: f32 = 140.0;
+const THUMB_H: f32 = 105.0;
+const ITEM_PAD_X: f32 = 16.0;
+/// Width of one filmstrip slot. Fixed, which is what lets the strip be
+/// virtualised and lets navigation compute where an image sits.
+pub const ITEM_WIDTH: f32 = THUMB_W + 2.0 * ITEM_PAD_X;
+/// Slots built beyond each edge of the visible strip.
+const OVERSCAN_ITEMS: usize = 4;
+
+/// Slots `first..last` worth building for a scroll offset and visible width.
+pub fn visible_items(scroll_x: f32, view_width: f32, count: usize) -> (usize, usize) {
+    let first = ((scroll_x.max(0.0) / ITEM_WIDTH).floor() as usize)
+        .saturating_sub(OVERSCAN_ITEMS)
+        .min(count);
+    let last = (((scroll_x.max(0.0) + view_width) / ITEM_WIDTH).ceil() as usize + OVERSCAN_ITEMS)
+        .min(count);
+    (first, last.max(first))
+}
+
+/// The scroll offset that centres slot `index`, or `None` if it is already
+/// fully visible.
+pub fn scroll_to_reveal(index: usize, scroll_x: f32, view_width: f32) -> Option<f32> {
+    let left = index as f32 * ITEM_WIDTH;
+    if left >= scroll_x && left + ITEM_WIDTH <= scroll_x + view_width {
+        return None;
+    }
+    Some((left - (view_width - ITEM_WIDTH) / 2.0).max(0.0))
+}
+
 /// Render the filmstrip timeline at the bottom of the Develop and Cull tabs.
 ///
 /// Takes the whole editor rather than a selection set so it can use
 /// `RawEditor::is_selected` — the same predicate the library grid uses. It
 /// previously read `multi_selection` alone, which disagreed with the grid
 /// whenever `selected_image_id` was not also in the set.
+///
+/// Virtualised like the library grid: only the slots near the visible window
+/// are built. This view is rebuilt on every frame of a momentum glide, and it
+/// used to rebuild every thumbnail in the catalogue each time.
 pub fn view<'a>(
     images: &[&'a Image],
     editor: &crate::app::state::RawEditor,
 ) -> Element<'a, Message> {
-    // Build row with thumbnails
-    let mut thumbnails = Vec::new();
+    let view_width = if editor.filmstrip_view_w > 0.0 {
+        editor.filmstrip_view_w
+    } else {
+        editor.window_size.width
+    };
+    let (first, last) = visible_items(editor.filmstrip_scroll_x, view_width, images.len());
 
-    for img in images {
+    let mut thumbnails: Vec<Element<'a, Message>> = Vec::with_capacity(last - first + 2);
+    thumbnails.push(Space::with_width(Length::Fixed(first as f32 * ITEM_WIDTH)).into());
+
+    for img in &images[first..last] {
         let img = *img;
-        // Skip images without thumbnail
-        let thumb_path_str = match &img.cache_path_thumb {
-            Some(p) => p,
-            None => continue, // Skip this image
-        };
-        
         let is_selected = editor.is_selected(img.id);
-        
-        // Get thumbnail path (256px cache)
-        let thumb_path = PathBuf::from(thumb_path_str);
-        
-        // Create image widget
-        let img_widget = image(iced::widget::image::Handle::from_path(thumb_path))
-            .width(Length::Fixed(140.0))
-            .height(Length::Fixed(105.0));
-        
+
+        // Images still waiting on their cache tiers get a blank slot rather
+        // than being skipped: every slot must be ITEM_WIDTH wide for the
+        // index → position arithmetic above to hold.
+        let img_widget: Element<'a, Message> = match &img.cache_path_thumb {
+            Some(path) => image(iced::widget::image::Handle::from_path(path))
+                .width(Length::Fixed(THUMB_W))
+                .height(Length::Fixed(THUMB_H))
+                .into(),
+            None => container(Space::new(Length::Fixed(THUMB_W), Length::Fixed(THUMB_H)))
+                .style(|_| container::Style {
+                    background: Some(Background::Color(Color::from_rgb(0.12, 0.12, 0.12))),
+                    ..Default::default()
+                })
+                .into(),
+        };
+
         // Phase 56: Overlay star rating (or the "marked for removal" badge,
         // which reuses this same field via a reserved sentinel — must be
         // checked first or `img.rating as usize` below would try to build a
@@ -120,10 +162,10 @@ pub fn view<'a>(
         // Wrap in container for selection styling
         let thumbnail_container = container(thumbnail_content)
             .padding(iced::Padding {
-                top: 4.0,      // Top padding
-                right: 16.0,    // Creates 4px gap between images (2+2)
-                bottom: 4.0,   // Bottom padding
-                left: 16.0,     // Creates 4px gap between images (2+2)
+                top: 4.0,
+                right: ITEM_PAD_X,
+                bottom: 4.0,
+                left: ITEM_PAD_X,
             })
             .style(move |_theme: &Theme| {
                 let mut style = if is_selected {
@@ -194,6 +236,9 @@ pub fn view<'a>(
         
         thumbnails.push(thumbnail_button);
     }
+    thumbnails.push(
+        Space::with_width(Length::Fixed((images.len() - last) as f32 * ITEM_WIDTH)).into(),
+    );
 
     // Create row from thumbnails - minimal spacing
     let film_row = row(thumbnails)
@@ -207,6 +252,9 @@ pub fn view<'a>(
     // Make it scrollable horizontally
     let scrollable_film = scrollable(film_row)
         .id(scroll_id())
+        .on_scroll(|viewport| {
+            Message::FilmstripScrolled(viewport.absolute_offset().x, viewport.bounds().width)
+        })
         .direction(scrollable::Direction::Horizontal(
             scrollable::Scrollbar::new()
                 .width(8)
@@ -264,4 +312,29 @@ pub fn view<'a>(
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn visible_items_cover_the_strip_plus_overscan() {
+        // 10 slots fit in 1720px.
+        assert_eq!(visible_items(0.0, 1720.0, 1000), (0, 10 + OVERSCAN_ITEMS));
+        let (first, last) = visible_items(100.0 * ITEM_WIDTH, 1720.0, 1000);
+        assert_eq!(first, 100 - OVERSCAN_ITEMS);
+        assert_eq!(last, 110 + OVERSCAN_ITEMS);
+        assert_eq!(visible_items(0.0, 1720.0, 3), (0, 3));
+    }
+
+    #[test]
+    fn reveal_centres_an_off_screen_slot_and_leaves_visible_ones() {
+        assert_eq!(scroll_to_reveal(2, 0.0, 1720.0), None);
+        let x = scroll_to_reveal(50, 0.0, 1720.0).expect("slot 50 is off screen");
+        let centre = 50.0 * ITEM_WIDTH + ITEM_WIDTH / 2.0;
+        assert!((x + 1720.0 / 2.0 - centre).abs() < 1e-3);
+        // Never scrolls before the start.
+        assert_eq!(scroll_to_reveal(0, 500.0, 1720.0), Some(0.0));
+    }
 }

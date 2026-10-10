@@ -42,6 +42,32 @@ pub fn handle_check_for_updates(editor: &mut RawEditor) -> Task<Message> {
     Task::none()
 }
 
+/// Ask the window for its current DPI scale factor.
+///
+/// Called at startup and after every resize: iced has no dedicated rescale
+/// event, but moving to a monitor with a different DPI resizes the window.
+pub fn query_scale_factor() -> Task<Message> {
+    window::get_latest()
+        .and_then(window::get_scale_factor)
+        .map(Message::ScaleFactorChanged)
+}
+
+/// The develop render target is sized in physical pixels, so a new scale
+/// factor needs a new render to stay sharp.
+pub fn handle_scale_factor_changed(editor: &mut RawEditor, scale: f32) -> Task<Message> {
+    if !scale.is_finite() || scale <= 0.0 || (scale - editor.scale_factor).abs() < 0.001 {
+        return Task::none();
+    }
+    tracing::info!("Display scale factor: {scale}");
+    editor.scale_factor = scale;
+    if editor.current_tab == crate::app::message::AppTab::Develop
+        && matches!(editor.editor_readiness, crate::app::state::EditorReadiness::Ready(_))
+    {
+        return crate::app::handlers::navigation::throttled_render(editor);
+    }
+    Task::none()
+}
+
 pub fn handle_minimize_window() -> Task<Message> {
     window::get_latest().and_then(|id| window::minimize(id, true))
 }
@@ -160,7 +186,6 @@ pub fn handle_set_cache_capacity(editor: &mut RawEditor, val: f32) -> Task<Messa
     if let Some(non_zero_cap) = std::num::NonZeroUsize::new(new_capacity) {
         editor.preview_cache.resize(non_zero_cap);
     }
-    editor.save_preferences();
     Task::none()
 }
 
@@ -177,41 +202,43 @@ pub fn handle_set_raw_preload_budget(editor: &mut RawEditor, val: f32) -> Task<M
         editor.evict_raw_cache_to_budget();
     }
 
-    editor.save_preferences();
     Task::none()
 }
 
 pub fn handle_set_preview_preload_behind(editor: &mut RawEditor, val: f32) -> Task<Message> {
     editor.preview_preload_behind =
         (val.max(0.0) as usize).min(crate::app::state::PREVIEW_PRELOAD_BEHIND_MAX);
-    editor.save_preferences();
     Task::none()
 }
 
 pub fn handle_set_preview_preload_ahead(editor: &mut RawEditor, val: f32) -> Task<Message> {
     editor.preview_preload_ahead =
         (val.max(0.0) as usize).min(crate::app::state::PREVIEW_PRELOAD_AHEAD_MAX);
-    editor.save_preferences();
     Task::none()
 }
 
 pub fn handle_set_raw_preload_behind(editor: &mut RawEditor, val: f32) -> Task<Message> {
     editor.raw_preload_behind =
         (val.max(0.0) as usize).min(crate::app::state::RAW_PRELOAD_BEHIND_MAX);
-    editor.save_preferences();
     Task::none()
 }
 
 pub fn handle_set_raw_preload_ahead(editor: &mut RawEditor, val: f32) -> Task<Message> {
     editor.raw_preload_ahead =
         (val.max(0.0) as usize).min(crate::app::state::RAW_PRELOAD_AHEAD_MAX);
-    editor.save_preferences();
     Task::none()
 }
 
 pub fn handle_set_min_free_ram(editor: &mut RawEditor, val: f32) -> Task<Message> {
     editor.min_free_ram_mb =
         (val.max(0.0) as u32).min(crate::app::state::MIN_FREE_RAM_MB_MAX);
+    Task::none()
+}
+
+/// Slider release in Preferences. The setters above only update state: they
+/// fire on every drag tick, and each used to rewrite settings.json on the UI
+/// thread while the slider moved.
+pub fn handle_save_preferences(editor: &mut RawEditor) -> Task<Message> {
     editor.save_preferences();
     Task::none()
 }

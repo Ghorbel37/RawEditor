@@ -1,7 +1,7 @@
 use iced::Task;
 use std::sync::Arc;
 use crate::app::state::{RawEditor, EditorReadiness};
-use crate::app::message::{AppTab, Message};
+use crate::app::message::Message;
 use crate::raw;
 use crate::gpu;
 
@@ -16,7 +16,7 @@ pub fn handle_raw_data_loaded(
             editor.insert_raw_cache(image_id, raw.clone());
             apply_raw_preload_cleanup(editor, image_id);
 
-            if editor.current_tab == AppTab::Develop && editor.selected_image_id == Some(image_id) {
+            if awaiting_raw(editor, image_id) {
                 prepare_image_resources_from_raw(editor, image_id, raw)
             } else {
                 Task::none()
@@ -42,10 +42,7 @@ pub fn handle_raw_preloaded(
     match result {
         Ok(raw) => {
             editor.insert_raw_cache(image_id, raw.clone());
-            if editor.current_tab == AppTab::Develop
-                && editor.selected_image_id == Some(image_id)
-                && matches!(editor.editor_readiness, EditorReadiness::Loading(id) if id == image_id)
-            {
+            if awaiting_raw(editor, image_id) {
                 return prepare_image_resources_from_raw(editor, image_id, raw);
             }
             Task::none()
@@ -57,12 +54,24 @@ pub fn handle_raw_preloaded(
     }
 }
 
+/// True when Develop is waiting on exactly this RAW to finish loading.
+///
+/// Deliberately NOT gated on the current tab. `Loading(id)` is a promise that
+/// a load is in flight; if the user stepped out to Library while it decoded
+/// and the result were dropped, coming back would find "still loading", start
+/// nothing, and wait forever.
+fn awaiting_raw(editor: &RawEditor, image_id: i64) -> bool {
+    editor.selected_image_id == Some(image_id)
+        && matches!(editor.editor_readiness, EditorReadiness::Loading(id) if id == image_id)
+}
+
 pub fn prepare_image_resources_from_raw(
     editor: &mut RawEditor,
     image_id: i64,
     raw: Arc<raw::loader::RawDataResult>,
 ) -> Task<Message> {
     editor.current_metadata = Some(metadata_snapshot(&raw));
+    editor.current_metadata_id = Some(image_id);
 
     // Phase 140: Store current DCP profile
     editor.current_dcp_profile = raw.dcp_profile.clone();
@@ -144,6 +153,7 @@ pub fn handle_image_resources_ready(editor: &mut RawEditor, image_id: i64, resul
                 editor.gpu_context = Some(context.clone());
             }
 
+            editor.sync_tool_flags();
             if let Some(ctx) = &editor.gpu_context {
                 let (interpolated, wb_override) =
                     crate::app::handlers::develop::resolve_wb_and_dcp(editor, &editor.current_edit_params);
@@ -156,8 +166,11 @@ pub fn handle_image_resources_ready(editor: &mut RawEditor, image_id: i64, resul
             editor.canvas_cache.clear();
             editor.histogram_cache.clear();
 
-            editor.is_rendering = true;
-            crate::app::handlers::develop::trigger_async_render(editor)
+            // Throttled, not forced: a render can still be in flight here
+            // (the previous image, or the subsampled pass before a full-res
+            // upgrade). Starting a second one alongside it raced the two, and
+            // whichever landed last won the screen.
+            crate::app::handlers::navigation::throttled_render(editor)
         }
         Err(e) => {
             editor.status = format!("GPU Init Failed: {}", e);

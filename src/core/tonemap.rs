@@ -65,6 +65,9 @@ pub const TONE_LUT_SIZE: usize = 4096;
 /// Log rather than linear so the table's resolution follows where the eye
 /// (and the curve's curvature) actually is. Monotonic, `encode(0) == 0`,
 /// `encode(TONE_LUT_MAX) == 1`.
+// Production only ever decodes (baking walks the LUT's own grid); this is the
+// Rust twin of the WGSL encoder, kept so the round trip stays tested.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn tone_lut_encode(x: f32) -> f32 {
     (1.0 + x.max(0.0)).log2() / (1.0 + TONE_LUT_MAX).log2()
 }

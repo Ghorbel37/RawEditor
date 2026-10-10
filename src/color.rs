@@ -74,10 +74,7 @@ pub fn mat3_apply(m: &[f32; 9], v: [f32; 3]) -> [f32; 3] {
 /// # Returns
 /// * Camera-to-sRGB matrix as a flat `[f32; 9]` array (row-major)
 pub fn calculate_cam_to_srgb(raw_matrix: [f32; 9], wb_multipliers: [f32; 4], matrix_is_d65: bool) -> [f32; 9] {
-    crate::debug_log!(
-        crate::debug::DEBUG_APP,
-        "🎨 Phase 48: Calculating Cam-to-sRGB with Bradford Adaptation..."
-    );
+    tracing::trace!("Calculating cam-to-sRGB with Bradford adaptation");
 
     // Step 1: Load xyz_to_cam matrix (Camera's XYZ -> Cam conversion in D50)
     // Input is row-major [r0c0, r0c1, r0c2, r1c0, ...], cgmath needs column-major
@@ -97,10 +94,7 @@ pub fn calculate_cam_to_srgb(raw_matrix: [f32; 9], wb_multipliers: [f32; 4], mat
     let cam_to_xyz_d50 = match xyz_to_cam.invert() {
         Some(m) => m,
         None => {
-            crate::debug_log!(
-                crate::debug::DEBUG_APP,
-                "⚠️ Failed to invert XYZ-to-Cam matrix, using identity"
-            );
+            tracing::warn!("Failed to invert XYZ-to-Cam matrix, using identity");
             return [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
         }
     };
@@ -190,17 +184,7 @@ pub fn calculate_cam_to_srgb(raw_matrix: [f32; 9], wb_multipliers: [f32; 4], mat
         final_matrix.z.z, // Row 2
     ];
 
-    crate::debug_log!(
-        crate::debug::DEBUG_APP,
-        "✅ Bradford-adapted Cam-to-sRGB matrix calculated"
-    );
-    crate::debug_log!(
-        crate::debug::DEBUG_APP,
-        "   Row sums: {:.4}, {:.4}, {:.4}",
-        r0_sum,
-        r1_sum,
-        r2_sum
-    );
+    tracing::trace!("Cam-to-sRGB row sums: {r0_sum:.4}, {r1_sum:.4}, {r2_sum:.4}");
 
     result
 }

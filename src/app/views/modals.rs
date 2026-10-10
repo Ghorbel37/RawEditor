@@ -275,6 +275,7 @@ pub fn view_preferences_modal<'a>(editor: &'a RawEditor) -> Element<'a, Message>
                 editor.min_free_ram_mb as f32,
                 Message::SetMinFreeRam
             )
+            .on_release(Message::SavePreferences)
             .step(256.0_f32)
             .style(ui::styles::ProSlider::style),
             {
@@ -328,7 +329,8 @@ pub fn view_preferences_modal<'a>(editor: &'a RawEditor) -> Element<'a, Message>
                 editor.cache_capacity as f32,
                 Message::SetCacheCapacity
             )
-            .step(10.0),
+            .on_release(Message::SavePreferences)
+            .step(10.0_f32),
             text("Controls how many high-res previews are kept in RAM.")
                 .size(11)
                 .style(|_| text::Style {
@@ -355,7 +357,8 @@ pub fn view_preferences_modal<'a>(editor: &'a RawEditor) -> Element<'a, Message>
                 editor.raw_preload_budget_mb as f32,
                 Message::SetRawPreloadBudget
             )
-            .step(64.0),
+            .on_release(Message::SavePreferences)
+            .step(64.0_f32),
             text("Develop RAW preloading budget. Set to 0 to disable RAW preloading.")
                 .size(11)
                 .style(|_| text::Style {
@@ -387,13 +390,15 @@ pub fn view_preferences_modal<'a>(editor: &'a RawEditor) -> Element<'a, Message>
                 editor.preview_preload_behind as f32,
                 Message::SetPreviewPreloadBehind
             )
-            .step(1.0),
+            .on_release(Message::SavePreferences)
+            .step(1.0_f32),
             slider(
                 0.0..=crate::app::state::PREVIEW_PRELOAD_AHEAD_MAX as f32,
                 editor.preview_preload_ahead as f32,
                 Message::SetPreviewPreloadAhead
             )
-            .step(1.0),
+            .on_release(Message::SavePreferences)
+            .step(1.0_f32),
             text("How many working previews stay queued around your current image.")
                 .size(11)
                 .style(|_| text::Style {
@@ -425,13 +430,15 @@ pub fn view_preferences_modal<'a>(editor: &'a RawEditor) -> Element<'a, Message>
                 editor.raw_preload_behind as f32,
                 Message::SetRawPreloadBehind
             )
-            .step(1.0),
+            .on_release(Message::SavePreferences)
+            .step(1.0_f32),
             slider(
                 0.0..=crate::app::state::RAW_PRELOAD_AHEAD_MAX as f32,
                 editor.raw_preload_ahead as f32,
                 Message::SetRawPreloadAhead
             )
-            .step(1.0),
+            .on_release(Message::SavePreferences)
+            .step(1.0_f32),
             text("How many full RAWs are pre-decoded for faster Develop navigation.")
                 .size(11)
                 .style(|_| text::Style {

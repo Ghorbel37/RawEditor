@@ -18,7 +18,6 @@ const TAG_PROFILE_HUE_SAT_MAP_DATA_1: u16 = 50982; // WAS WRONG: was 50938
 const TAG_PROFILE_HUE_SAT_MAP_DATA_2: u16 = 50983; // WAS WRONG: was 50939
 const TAG_PROFILE_TONE_CURVE:         u16 = 50940;
 const TAG_BASELINE_EXPOSURE_OFFSET:   u16 = 51109;
-const TAG_PROFILE_NAME:               u16 = 50936;
 
 // TIFF type sizes in bytes
 fn tiff_type_size(typ: u16) -> u32 {
@@ -33,7 +32,6 @@ fn tiff_type_size(typ: u16) -> u32 {
 
 struct RawTag {
     typ:   u16,
-    count: u32,
     data:  Vec<u8>,
 }
 
@@ -95,7 +93,7 @@ fn read_ifd(path: &Path) -> Result<HashMap<u16, RawTag>, String> {
             buf
         };
 
-        map.insert(tag, RawTag { typ, count, data });
+        map.insert(tag, RawTag { typ, data });
     }
 
     Ok(map)
@@ -310,11 +308,9 @@ fn illuminant_weight(profile: &DcpProfile, kelvin: f32) -> f32 {
 /// Used by the CCT solver (`color::wb_to_kelvin_tint` and friends).
 pub fn interpolate_color_matrix(profile: &DcpProfile, kelvin: f32) -> [f32; 9] {
     let weight = illuminant_weight(profile, kelvin);
-    let mut cm = [0.0f32; 9];
-    for i in 0..9 {
-        cm[i] = profile.color_matrix_1[i] * (1.0 - weight) + profile.color_matrix_2[i] * weight;
-    }
-    cm
+    std::array::from_fn(|i| {
+        profile.color_matrix_1[i] * (1.0 - weight) + profile.color_matrix_2[i] * weight
+    })
 }
 
 pub fn interpolate_at_temperature(
@@ -470,6 +466,55 @@ pub fn bake_tone_curve(points: &[(f32, f32)], tone: ToneSettings) -> Vec<f32> {
             srgb_to_linear(y_blended)
         })
         .collect()
+}
+
+/// The DCP for a camera, parsed at most once per profile file.
+///
+/// Every RAW load used to re-read and re-parse the profile — including each
+/// preloaded neighbour, all from the same camera. Entries are keyed by path
+/// AND modification time, so dropping a corrected profile into the folder
+/// still takes effect without a restart. A file that fails to parse is
+/// remembered too, rather than re-failing (and re-logging) on every image.
+pub fn load_profile_for_camera(make: &str, model: &str) -> Option<std::sync::Arc<DcpProfile>> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::SystemTime;
+
+    type Entry = (Option<SystemTime>, Option<Arc<DcpProfile>>);
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Entry>>> = OnceLock::new();
+
+    let path = find_profile_for_camera(make, model)?;
+    let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+    let cache = CACHE.get_or_init(Default::default);
+
+    if let Ok(cache) = cache.lock() {
+        if let Some((stamp, profile)) = cache.get(&path) {
+            if *stamp == modified {
+                return profile.clone();
+            }
+        }
+    }
+
+    // Parsed outside the lock: two loads racing on a cold cache just parse
+    // twice, which beats serialising every RAW decode behind the file read.
+    let profile = match parse_dcp(&path) {
+        Ok(profile) => {
+            tracing::info!(
+                "DCP {:?} parsed: fm1={} hsm_dims={:?}",
+                path,
+                profile.forward_matrix_1.is_some(),
+                profile.hue_sat_dims,
+            );
+            Some(Arc::new(profile))
+        }
+        Err(e) => {
+            tracing::error!("DCP {:?} failed to parse: {e}", path);
+            None
+        }
+    };
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(path, (modified, profile.clone()));
+    }
+    profile
 }
 
 pub fn find_profile_for_camera(_make: &str, model: &str) -> Option<PathBuf> {

@@ -5,9 +5,8 @@ use crate::gpu;
 use crate::raw;
 use crate::ui::preview_renderer::{CropHandle, MaskHandle};
 use iced::widget::image::Handle;
-use iced::{Point, Rectangle, Task};
+use iced::{Point, Task};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Phase 95: Simplified editor status (pipeline is now in separate fields)
@@ -42,14 +41,6 @@ pub enum MaskTool {
     PlacingLinear,
     /// Next click on the preview places a radial gradient
     PlacingRadial,
-}
-
-/// Phase 83: Pick/Reject flags
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Flag {
-    Unflagged = 0,
-    Pick = 1,
-    Reject = -1,
 }
 
 use lru::LruCache;
@@ -206,8 +197,6 @@ pub struct RawEditor {
     pub pending_cache_count: i64,
     /// Currently selected image ID
     pub selected_image_id: Option<i64>,
-    /// Cache directory for full-size previews
-    pub preview_cache_dir: PathBuf,
     /// Phase 73: RAM cache for 1280px previews (Look-Ahead)
     pub preview_cache: LruCache<i64, CachedPreview>,
     /// RAW preload RAM budget in MB (0 = disabled)
@@ -333,6 +322,10 @@ pub struct RawEditor {
     /// Phase 103: High-quality rendered preview (async updated)
     /// Phase 41: Current image metadata for inspection
     pub current_metadata: Option<raw::loader::RawDataResult>,
+    /// Which image `current_metadata` was read from. It is only refreshed by
+    /// a Develop RAW load, so without this the Cull overlay showed whatever
+    /// photo was last opened in Develop. Read it via `selected_metadata`.
+    pub current_metadata_id: Option<i64>,
     /// Phase 54: Edit settings clipboard for copy/paste.
     ///
     /// Carries the copied params AND which categories were selected, so paste
@@ -397,11 +390,23 @@ pub struct RawEditor {
     pub full_res_upgrading: bool,
 
     // ── Scroll boost + filmstrip momentum ──────────────────────────────────
-    /// Window-space cursor position, updated by the global CursorMoved
-    /// subscription. Used to route wheel events to the region under the cursor.
-    pub global_cursor: Point,
-    /// Current window size, updated by the global Resized subscription.
+    /// True while the cursor is over the library grid, from the grid's own
+    /// `mouse_area` enter/exit. Routes the wheel boost. This replaced a global
+    /// CursorMoved subscription, which sent a message — and so rebuilt the
+    /// entire view, every thumbnail included — on every single mouse move.
+    pub cursor_over_grid: bool,
+    /// Library grid scroll offset (px), from the scrollable's `on_scroll`.
+    /// The grid is virtualised: only rows near this offset are built.
+    pub grid_scroll_y: f32,
+    /// Visible size of the grid's scroll viewport (px), also from
+    /// `on_scroll`. `(0, 0)` until the first report — see `window_size`.
+    pub grid_viewport: (f32, f32),
+    /// Window size, from Opened/Resized events (rare, so cheap). Only used to
+    /// estimate the grid viewport for the first frame, before it reports in.
     pub window_size: iced::Size,
+    /// Filmstrip scroll offset and visible width (px), from `on_scroll`.
+    pub filmstrip_scroll_x: f32,
+    pub filmstrip_view_w: f32,
     /// Filmstrip momentum velocity in px/s along the scroll axis; 0.0 = idle
     /// (the kinetic `window::frames()` subscription only runs while nonzero).
     pub filmstrip_velocity: f32,
@@ -438,15 +443,15 @@ impl InfoOverlayState {
     }
 }
 
-/// Phase 80: Configurable Cache Size
-pub const PRELOAD_BEHIND: usize = 10;
-pub const PRELOAD_AHEAD: usize = 50;
-// Phase 81: Increased cache capacity
-pub const CACHE_CAPACITY: usize = 200;
-// RAW preload window for develop mode
-pub const RAW_PRELOAD_BEHIND: usize = 1;
-pub const RAW_PRELOAD_AHEAD: usize = 4;
-pub const RAW_PRELOAD_BUDGET_MB_DEFAULT: u32 = 1024;
+/// True when `path` lies inside `folder` or any of its subfolders.
+///
+/// Component-wise, not a string prefix: `/photos/2024` must not match
+/// `/photos/2024-old/a.NEF`, which a bare `str::starts_with` happily did —
+/// clicking one folder in the sidebar also showed its similarly-named siblings.
+pub fn path_is_within(path: &str, folder: &str) -> bool {
+    std::path::Path::new(path).starts_with(folder)
+}
+
 pub const RAW_CACHE_ENTRY_CAPACITY: usize = 4096;
 pub const PREVIEW_PRELOAD_BEHIND_MAX: usize = 30;
 pub const PREVIEW_PRELOAD_AHEAD_MAX: usize = 100;
@@ -466,8 +471,6 @@ impl RawEditor {
     pub fn new() -> (Self, Task<Message>) {
         tracing::info!("RAW Editor starting (instant splash screen)...");
 
-        // Initialize preview cache directory (fast)
-        let preview_cache_dir = raw::preview::get_preview_cache_dir();
         let settings = crate::core::settings::AppSettings::load_or_default();
         let cache_capacity = settings.cache_capacity.clamp(20, 500);
         let raw_preload_budget_mb = settings.raw_preload_budget_mb.min(4096);
@@ -491,7 +494,6 @@ impl RawEditor {
                 images: Vec::new(), // Empty until database loads
                 pending_cache_count: 0,
                 selected_image_id: None,
-                preview_cache_dir,
                 preview_cache: LruCache::new(NonZeroUsize::new(cache_capacity).unwrap()),
                 raw_preload_budget_mb,
                 min_free_ram_mb: settings.min_free_ram_mb.min(MIN_FREE_RAM_MB_MAX),
@@ -536,6 +538,7 @@ impl RawEditor {
                 working_preview_dims: (1, 1),
                 rendered_preview_dims: (1, 1),
                 current_metadata: None,
+                current_metadata_id: None,
                 edit_clipboard: None,
                 copy_categories: settings.copy_categories,
                 multi_selection: HashSet::new(),
@@ -571,8 +574,12 @@ impl RawEditor {
                 is_rendering: false,
                 pending_render: false,
                 full_res_upgrading: false,
-                global_cursor: Point::ORIGIN,
+                cursor_over_grid: false,
+                grid_scroll_y: 0.0,
+                grid_viewport: (0.0, 0.0),
                 window_size: iced::Size::new(1920.0, 1080.0),
+                filmstrip_scroll_x: 0.0,
+                filmstrip_view_w: 0.0,
                 filmstrip_velocity: 0.0,
                 last_kinetic_tick: None,
                 last_wheel_time: None,
@@ -592,10 +599,7 @@ impl RawEditor {
                 pending_raw_loads: HashSet::new(),
                 queued_raw_loads: Vec::new(),
             },
-            Task::perform(
-                database::library::load_database("".to_string()),
-                Message::DatabaseLoaded,
-            ),
+            Task::perform(database::library::load_database(), Message::DatabaseLoaded),
         )
     }
 
@@ -628,6 +632,21 @@ impl RawEditor {
         self.flush_edits();
         let params_to_push = self.current_edit_params;
         if let Some((stack, index)) = self.get_current_history() {
+            // A release that changed nothing — clicking a slider without
+            // dragging, grabbing a crop handle and letting go — must not add a
+            // step, or the next Undo visibly does nothing. `is_cropping` is
+            // tool state, so entering crop mode alone isn't an edit either.
+            let unchanged = stack.get(*index).is_some_and(|top| {
+                let mut a = *top;
+                let mut b = params_to_push;
+                a.is_cropping = 0;
+                b.is_cropping = 0;
+                a == b
+            });
+            if unchanged {
+                return;
+            }
+
             // Truncate any redo history
             stack.truncate(*index + 1);
 
@@ -641,6 +660,16 @@ impl RawEditor {
                 *index
             );
         }
+    }
+
+    /// Mirror the crop tool's on/off state into the params the shader reads.
+    ///
+    /// `is_cropping` rides in `EditParams` only because that is what reaches
+    /// the GPU. Anything that swaps the params wholesale — undo/redo, reset,
+    /// loading another image's edits — would otherwise leave the shader and
+    /// the crop overlay disagreeing about whether crop mode is on.
+    pub fn sync_tool_flags(&mut self) {
+        self.current_edit_params.is_cropping = u32::from(self.is_cropping);
     }
 
     /// True while the mask tool wants the preview canvas (placement mode or a
@@ -697,7 +726,7 @@ impl RawEditor {
                 }
                 self.library_folder_filter
                     .as_ref()
-                    .map(|folder| img.path.starts_with(folder))
+                    .map(|folder| path_is_within(&img.path, folder))
                     .unwrap_or(true)
             })
             // Marked-for-removal is hidden where acting on it would be wrong:
@@ -710,9 +739,42 @@ impl RawEditor {
             .collect()
     }
 
+    /// RAW metadata for the selected image, or `None` when what is held
+    /// belongs to some other image (or nothing has been loaded yet).
+    pub fn selected_metadata(&self) -> Option<&raw::loader::RawDataResult> {
+        if self.current_metadata_id.is_some() && self.current_metadata_id == self.selected_image_id
+        {
+            self.current_metadata.as_ref()
+        } else {
+            None
+        }
+    }
+
     /// Ids of [`Self::displayed_images`], in the same order.
     pub fn displayed_ids(&self) -> Vec<i64> {
         self.displayed_images().iter().map(|i| i.id).collect()
+    }
+
+    /// The images a rate / flag / delete action applies to: the whole
+    /// multi-selection when there is one, else the current image.
+    pub fn action_target_ids(&self) -> Vec<i64> {
+        if !self.multi_selection.is_empty() {
+            self.multi_selection.iter().copied().collect()
+        } else {
+            self.selected_image_id.into_iter().collect()
+        }
+    }
+
+    /// Apply `f` to the in-memory catalogue rows for `ids`.
+    ///
+    /// One pass over the catalogue with a set lookup — the per-id
+    /// `iter().find()` this replaces was O(selection × catalogue) on every
+    /// select-all rating.
+    pub fn apply_to_images(&mut self, ids: &[i64], mut f: impl FnMut(&mut ImageData)) {
+        let ids: HashSet<i64> = ids.iter().copied().collect();
+        for img in self.images.iter_mut().filter(|img| ids.contains(&img.id)) {
+            f(img);
+        }
     }
 
     /// True when this image should render as selected.
@@ -789,57 +851,6 @@ impl RawEditor {
             (full_w * self.current_edit_params.crop[2]).max(1.0)
         };
         fw * self.zoom * self.scale_factor / visible_w * 100.0
-    }
-
-    // Phase 67: Calculate image screen bounds for interaction
-    pub fn get_image_screen_bounds(&self) -> Rectangle {
-        let (vw, vh) = self.viewport_size;
-        let (dw, dh) = self.image_display_dims();
-        crate::core::viewport::image_rect(dw, dh, vw, vh, self.zoom, self.pan_offset)
-    }
-
-    // Phase 67: Detect if cursor is over a crop handle
-    pub fn detect_crop_handle(&self, cursor_pos: Point) -> Option<CropHandle> {
-        if self.image_resources.is_some() {
-            let bounds = self.get_image_screen_bounds();
-            let crop = self.current_edit_params.crop;
-
-            let crop_x = bounds.x + (crop[0] * bounds.width);
-            let crop_y = bounds.y + (crop[1] * bounds.height);
-            let crop_w = crop[2] * bounds.width;
-            let crop_h = crop[3] * bounds.height;
-
-            let handle_radius = 15.0; // Hitbox radius (generous)
-
-            let check_handle = |x, y| {
-                let dx = cursor_pos.x - x;
-                let dy = cursor_pos.y - y;
-                (dx * dx + dy * dy) < handle_radius * handle_radius
-            };
-
-            if check_handle(crop_x, crop_y) {
-                return Some(CropHandle::TopLeft);
-            }
-            if check_handle(crop_x + crop_w, crop_y) {
-                return Some(CropHandle::TopRight);
-            }
-            if check_handle(crop_x, crop_y + crop_h) {
-                return Some(CropHandle::BottomLeft);
-            }
-            if check_handle(crop_x + crop_w, crop_y + crop_h) {
-                return Some(CropHandle::BottomRight);
-            }
-
-            // Phase 70: Check if inside body
-            if cursor_pos.x >= crop_x
-                && cursor_pos.x <= crop_x + crop_w
-                && cursor_pos.y >= crop_y
-                && cursor_pos.y <= crop_y + crop_h
-            {
-                return Some(CropHandle::Body);
-            }
-        }
-        None
     }
 
     /// Helper to save current edit parameters to database
@@ -1013,10 +1024,20 @@ impl RawEditor {
         use iced::keyboard;
         use iced::keyboard::key::Named;
 
-        let keyboard_subscription = iced::event::listen_with(|event, _status, _window| {
+        let keyboard_subscription = iced::event::listen_with(|event, status, _window| {
             // Phase 55: Track modifier key changes for Ctrl/Cmd+Click
             if let iced::Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) = event {
                 return Some(Message::ModifiersChanged(modifiers));
+            }
+
+            // A focused widget already consumed this key — typing into the
+            // export subfolder field, or a hovered slider's arrow keys. Without
+            // this, Backspace in a text field opened the Delete dialog, `r`
+            // reset the open image's edits and digits re-rated the selection.
+            if status == iced::event::Status::Captured
+                && matches!(event, iced::Event::Keyboard(keyboard::Event::KeyPressed { .. }))
+            {
+                return None;
             }
 
             // Scroll boost + filmstrip momentum: routed by cursor region in
@@ -1024,10 +1045,10 @@ impl RawEditor {
             if let iced::Event::Mouse(iced::mouse::Event::WheelScrolled { delta }) = event {
                 return Some(Message::WheelScrolled(delta));
             }
-            if let iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) = event {
-                return Some(Message::GlobalCursorMoved(position));
-            }
-            if let iced::Event::Window(iced::window::Event::Resized(size)) = event {
+            if let iced::Event::Window(
+                iced::window::Event::Resized(size) | iced::window::Event::Opened { size, .. },
+            ) = event
+            {
                 return Some(Message::WindowResized(size));
             }
             // Alt-tabbing away while Space is held sends the KeyReleased to
@@ -1259,10 +1280,17 @@ mod tests {
         assert_eq!(e.displayed_ids(), vec![1, 2, 3, 4, 5]);
 
         e.library_folder_filter = Some("/photos/2024".to_string());
-        // Prefix match, so 2024-old is included — this mirrors the existing
-        // filter behaviour, which the sidebar's remove button deliberately
-        // does NOT share.
-        assert_eq!(e.displayed_ids(), vec![1, 2, 3, 5]);
+        // Component match: 2024-old is a different folder and stays hidden.
+        assert_eq!(e.displayed_ids(), vec![1, 2, 5]);
+    }
+
+    #[test]
+    fn folder_filter_includes_subfolders_but_not_similarly_named_siblings() {
+        assert!(path_is_within("/photos/2024/a.NEF", "/photos/2024"));
+        assert!(path_is_within("/photos/2024/nested/b.NEF", "/photos/2024"));
+        assert!(path_is_within("/photos/2024/a.NEF", "/photos/2024/"));
+        assert!(!path_is_within("/photos/2024-old/c.NEF", "/photos/2024"));
+        assert!(!path_is_within("/photos/20/c.NEF", "/photos/2024"));
     }
 
     #[test]
@@ -1315,5 +1343,49 @@ mod tests {
         let before = e.current_edit_params.before_reference();
         e.current_edit_params = before;
         assert_eq!(e.image_display_dims(), normal);
+    }
+
+    fn history_len(e: &mut RawEditor) -> usize {
+        e.get_current_history().map(|(stack, _)| stack.len()).unwrap_or(0)
+    }
+
+    /// Clicking a slider without moving it still fires CommitEdit; that must
+    /// not leave an Undo step that visibly does nothing.
+    #[test]
+    fn a_commit_that_changed_nothing_adds_no_undo_step() {
+        let mut e = editor();
+        e.selected_image_id = Some(1);
+        let base = history_len(&mut e);
+
+        e.commit_current_state();
+        assert_eq!(history_len(&mut e), base);
+
+        e.current_edit_params.exposure = 1.0;
+        e.commit_current_state();
+        assert_eq!(history_len(&mut e), base + 1);
+
+        // Toggling the crop tool alone is not an edit either.
+        e.current_edit_params.is_cropping = 1;
+        e.commit_current_state();
+        assert_eq!(history_len(&mut e), base + 1);
+    }
+
+    /// History entries recorded in crop mode carry the shader flag; undoing
+    /// after leaving crop mode must not switch the crop visualisation back on.
+    #[test]
+    fn undo_keeps_the_shader_crop_flag_in_step_with_the_tool() {
+        let mut e = editor();
+        e.selected_image_id = Some(1);
+        e.current_tab = AppTab::Develop;
+        e.is_cropping = true;
+        e.sync_tool_flags();
+        let _ = history_len(&mut e);
+        e.current_edit_params.crop = [0.1, 0.1, 0.5, 0.5];
+        e.commit_current_state();
+
+        e.is_cropping = false; // "Done"
+        let _ = crate::app::handlers::develop::handle_undo(&mut e);
+        assert_eq!(e.current_edit_params.crop, [0.0, 0.0, 1.0, 1.0], "undo restored the old crop");
+        assert_eq!(e.current_edit_params.is_cropping, 0, "but not the old tool state");
     }
 }

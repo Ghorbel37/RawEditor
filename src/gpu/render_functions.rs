@@ -180,6 +180,9 @@ pub async fn render_to_vec(
     }
 }
 
+/// Test-only now: the app renders through `render_display_and_histogram`
+/// (display) and `render_to_vec` (export).
+#[cfg(test)]
 pub async fn render_to_bytes(
     context: &SharedContext,
     resources: &ImageResources,
@@ -421,8 +424,8 @@ pub async fn render_to_bytes_16bit(
             let start = (y * bytes_per_row) as usize;
             let end = start + (width * 8) as usize;
             let row_f16: &[half::f16] = bytemuck::cast_slice(&data[start..end]);
-            for pixel in row_f16.chunks_exact(4) {
-                for &channel in &pixel[0..3] {
+            for pixel in row_f16.as_chunks::<4>().0 {
+                for &channel in &pixel[..3] {
                     let v = (channel.to_f32().clamp(0.0, 1.0) * 65535.0).round() as u16;
                     result.push(v);
                 }
@@ -462,7 +465,7 @@ mod tests {
     /// into a flat band gets redistributed — i.e. if detail actually returns.
     fn luma_cv(rgba: &[u8], mask: &[bool]) -> f64 {
         let vals: Vec<f64> = rgba
-            .chunks_exact(4)
+            .as_chunks::<4>().0.iter()
             .zip(mask)
             .filter(|(_, m)| **m)
             .map(|(p, _)| 0.2126 * p[0] as f64 + 0.7152 * p[1] as f64 + 0.0722 * p[2] as f64)
@@ -480,7 +483,7 @@ mod tests {
 
     fn mean_luma(rgba: &[u8], mask: &[bool]) -> f64 {
         let vals: Vec<f64> = rgba
-            .chunks_exact(4)
+            .as_chunks::<4>().0.iter()
             .zip(mask)
             .filter(|(_, m)| **m)
             .map(|(p, _)| 0.2126 * p[0] as f64 + 0.7152 * p[1] as f64 + 0.0722 * p[2] as f64)
@@ -578,7 +581,7 @@ mod tests {
             // The blown region: near-white at highlights 0. This is where the
             // complaint lives — it renders as a flat grey when pulled down.
             let mask: Vec<bool> = flat
-                .chunks_exact(4)
+                .as_chunks::<4>().0.iter()
                 .map(|p| {
                     let l = 0.2126 * p[0] as f64 + 0.7152 * p[1] as f64 + 0.0722 * p[2] as f64;
                     l > 245.0
@@ -766,7 +769,7 @@ mod tests {
                 assert_eq!(out.len(), camera.len(), "{mapper}: size changed");
 
                 let mean = out
-                    .chunks_exact(4)
+                    .as_chunks::<4>().0.iter()
                     .map(|p| {
                         0.2126 * p[0] as f64 + 0.7152 * p[1] as f64 + 0.0722 * p[2] as f64
                     })
@@ -822,8 +825,12 @@ mod tests {
     fn render_matches_baseline() {
         let test_raw = test_raw_path();
         if !std::path::Path::new(&test_raw).exists() { return; }
-        let dump = std::env::var("BASELINE_PATH")
-            .unwrap_or_else(|_| "/tmp/claude-1000/-home-hsf001-Documents-Projects-RawEditor/028f8b11-7603-4252-bf13-d33b9672250b/scratchpad/baseline.bin".to_string());
+        let dump = std::env::var("BASELINE_PATH").unwrap_or_else(|_| {
+            std::env::temp_dir()
+                .join("raw-editor-render-baseline.bin")
+                .to_string_lossy()
+                .into_owned()
+        });
         let writing = std::env::var("BASELINE").as_deref() == Ok("write");
 
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).build().unwrap();

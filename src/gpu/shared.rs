@@ -53,18 +53,39 @@ impl SharedContext {
             .await
             .ok_or("Failed to find suitable GPU adapter")?;
 
-        // Request device and queue
+        // Request device and queue.
+        //
+        // The size limits come from the adapter, not `Limits::default()`. The
+        // defaults are WebGPU's portable floor — 8192px textures, 256 MB
+        // buffers — and a full-resolution pass of any sensor wider than 8192px
+        // (45 MP and up), or the 16-bit readback of a 45 MP TIFF export (~360
+        // MB), failed validation outright. Every desktop GPU supports far more.
+        let adapter_limits = adapter.limits();
+        let required_limits = wgpu::Limits {
+            max_texture_dimension_1d: adapter_limits.max_texture_dimension_1d,
+            max_texture_dimension_2d: adapter_limits.max_texture_dimension_2d,
+            max_buffer_size: adapter_limits.max_buffer_size,
+            ..wgpu::Limits::default()
+        };
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("RAW Editor Device"),
                     required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::default(),
+                    required_limits,
                 },
                 None,
             )
             .await
             .map_err(|e| format!("Failed to create device: {:?}", e))?;
+
+        // wgpu's default handler panics on any validation error, which takes
+        // the whole app — and any unflushed edits — down with it. Sizes are
+        // checked up front (`check_texture_size`), so anything that still gets
+        // here is a bug to log, not a reason to crash a photo editor.
+        device.on_uncaptured_error(Box::new(|e| {
+            tracing::error!("Uncaptured GPU error: {e}");
+        }));
 
         let device = Arc::new(device);
         let queue = Arc::new(queue);
@@ -305,6 +326,32 @@ impl SharedContext {
 }
 
 impl SharedContext {
+    /// Refuse a texture this device cannot allocate, with a message a user
+    /// can act on, instead of letting wgpu fail validation mid-render.
+    pub fn check_texture_size(&self, width: u32, height: u32) -> Result<(), String> {
+        let max = self.device.limits().max_texture_dimension_2d;
+        if width == 0 || height == 0 || width > max || height > max {
+            return Err(format!(
+                "{width}×{height} exceeds this GPU's {max}px texture limit"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Refuse a readback buffer larger than the device allows — see
+    /// `check_texture_size`.
+    pub fn check_buffer_size(&self, bytes: u64) -> Result<(), String> {
+        let max = self.device.limits().max_buffer_size;
+        if bytes > max {
+            return Err(format!(
+                "a {} MB render exceeds this GPU's {} MB buffer limit",
+                bytes >> 20,
+                max >> 20
+            ));
+        }
+        Ok(())
+    }
+
     /// Let wgpu actually reclaim textures and buffers whose Rust handles have
     /// already been dropped.
     ///
@@ -327,11 +374,16 @@ impl SharedContext {
 /// Contains all the image-specific data that changes when switching images
 #[derive(Debug)]
 pub struct ImageResources {
+    // Handles that exist to own their GPU allocations: the bind groups are
+    // what the passes actually read. Never read directly, hence the allows.
+    #[allow(dead_code)]
     pub texture: wgpu::Texture,
+    #[allow(dead_code)]
     pub texture_view: wgpu::TextureView,
     /// Phase 128: Debayer bind group (Pass 1 input: R16Uint raw texture)
     pub debayer_bind_group: wgpu::BindGroup,
     /// Phase 128: Intermediate debayered texture (Rgba16Float, full resolution)
+    #[allow(dead_code)] // owner — see `texture`
     pub debayer_texture: wgpu::Texture,
     pub debayer_texture_view: wgpu::TextureView,
     /// Phase 128: Color bind group (Pass 2 input: Rgba16Float intermediate)
@@ -341,8 +393,6 @@ pub struct ImageResources {
     pub height: u32,
     pub original_width: u32,
     pub original_height: u32,
-    pub preview_width: u32,
-    pub preview_height: u32,
     pub histogram_width: u32,
     pub histogram_height: u32,
     pub image_id: i64,
@@ -360,8 +410,10 @@ pub struct ImageResources {
     pub current_params: std::sync::Mutex<GpuEditParams>,
     // Phase 140: DCP Textures
     pub hsv_lut_texture: wgpu::Texture,
+    #[allow(dead_code)] // owner — see `texture`
     pub hsv_lut_view: wgpu::TextureView,
     pub tone_curve_texture: wgpu::Texture,
+    #[allow(dead_code)] // owner — see `texture`
     pub tone_curve_view: wgpu::TextureView,
     pub has_dcp: bool,
     /// True when the DCP embeds a ProfileToneCurve. Only consulted while the
@@ -568,7 +620,6 @@ impl ImageResources {
         max_preview_width: Option<u32>,
         orientation: u32,
     ) -> Result<Self, String> {
-        const DEFAULT_PREVIEW_WIDTH: u32 = 1280;
         let max_w = max_preview_width.unwrap_or(u32::MAX);
 
         // Stride-sample the Bayer data to a ~max_w working size.
@@ -588,9 +639,14 @@ impl ImageResources {
         };
         let raw_data: &[u16] = owned_downsampled.as_deref().unwrap_or(raw_data);
 
-        let aspect_ratio = width as f32 / height as f32;
-        let preview_width = width.min(DEFAULT_PREVIEW_WIDTH);
-        let preview_height = (preview_width as f32 / aspect_ratio) as u32;
+        context.check_texture_size(width, height)?;
+        if raw_data.len() < (width as usize) * (height as usize) {
+            return Err(format!(
+                "RAW buffer holds {} samples, {width}×{height} needs {}",
+                raw_data.len(),
+                width as usize * height as usize
+            ));
+        }
 
         // Dedicated whole-image pass for the histogram. Sized from the
         // DISPLAY aspect, not the sensor aspect: a portrait shot has its
@@ -605,11 +661,9 @@ impl ImageResources {
         let histogram_height = ((histogram_width as f32 / display_aspect) as u32).max(1);
 
         tracing::debug!(
-            "Texture {}x{}, Preview {}x{}, Histogram {}x{}",
+            "Texture {}x{}, Histogram {}x{}",
             width,
             height,
-            preview_width,
-            preview_height,
             histogram_width,
             histogram_height
         );
@@ -632,56 +686,27 @@ impl ImageResources {
             view_formats: &[],
         });
 
-        // Upload RAW data with padding
-        let bytes_per_pixel = 2;
-        let unpadded_bytes_per_row = width * bytes_per_pixel;
-        let padded_bytes_per_row = (unpadded_bytes_per_row + 255) & !255;
-
-        let raw_bytes = bytemuck::cast_slice(raw_data);
-
-        if unpadded_bytes_per_row == padded_bytes_per_row {
-            context.queue.write_texture(
-                wgpu::ImageCopyTexture {
-                    texture: &texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                raw_bytes,
-                wgpu::ImageDataLayout {
-                    offset: 0,
-                    bytes_per_row: Some(unpadded_bytes_per_row),
-                    rows_per_image: Some(height),
-                },
-                texture_size,
-            );
-        } else {
-            let mut padded_data = Vec::with_capacity((padded_bytes_per_row * height) as usize);
-            for y in 0..height {
-                let start = (y * unpadded_bytes_per_row) as usize;
-                let end = start + unpadded_bytes_per_row as usize;
-                padded_data.extend_from_slice(&raw_bytes[start..end]);
-                padded_data.extend(
-                    std::iter::repeat_n(0, (padded_bytes_per_row - unpadded_bytes_per_row) as usize),
-                );
-            }
-
-            context.queue.write_texture(
-                wgpu::ImageCopyTexture {
-                    texture: &texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &padded_data,
-                wgpu::ImageDataLayout {
-                    offset: 0,
-                    bytes_per_row: Some(padded_bytes_per_row),
-                    rows_per_image: Some(height),
-                },
-                texture_size,
-            );
-        }
+        // Upload the mosaic as-is. `Queue::write_texture` has no 256-byte
+        // row-alignment rule (that applies only to buffer↔texture copies), so
+        // the padded staging copy built here before — another ~50 MB per
+        // full-resolution load or export at 24 MP — was never needed.
+        let unpadded_bytes_per_row = width * 2;
+        let pixel_count = (width as usize) * (height as usize);
+        context.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(&raw_data[..pixel_count]),
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(unpadded_bytes_per_row),
+                rows_per_image: Some(height),
+            },
+            texture_size,
+        );
 
         let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
@@ -847,8 +872,6 @@ impl ImageResources {
             height,
             original_width,
             original_height,
-            preview_width,
-            preview_height,
             histogram_width,
             histogram_height,
             image_id,

@@ -1,9 +1,8 @@
 use iced::widget::image::Handle;
 use iced::widget::{
-    button, container, column, row, scrollable, stack, text, Image, Space,
+    button, container, column, mouse_area, row, scrollable, stack, text, Image, Space,
 };
 use iced::{Alignment, Background, Border, Color, Element, Length, Theme};
-use iced_aw::Wrap;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -20,6 +19,110 @@ const THUMB_PRESET_LARGE: f32 = 230.0;
 const THUMB_PRESET_XL: f32 = 280.0;
 const LIBRARY_TOOLBAR_HEIGHT: f32 = 56.0;
 const LIBRARY_STATUS_HEIGHT: f32 = 42.0;
+const LIBRARY_SIDEBAR_WIDTH: f32 = 250.0;
+
+/// Gap between cards, and the margin around the whole grid.
+const GRID_SPACING: f32 = 12.0;
+const GRID_PADDING: f32 = 12.0;
+/// A card is its thumbnail plus 7px of padding on every side.
+const CARD_CHROME: f32 = 14.0;
+/// Rows built beyond each edge of the viewport, so a fast wheel flick lands
+/// on already-built cards rather than a blank frame.
+const GRID_OVERSCAN_ROWS: usize = 2;
+
+/// Layout of the virtualised library grid.
+///
+/// The grid used to push EVERY image into one `Wrap`, so each view rebuild —
+/// which iced does after every message — built, diffed and laid out tens of
+/// thousands of widgets for a large catalogue, to show a few dozen. Only the
+/// rows near the viewport are built now, with spacers standing in for the
+/// rest so the scrollbar still spans the whole catalogue.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GridGeometry {
+    pub columns: usize,
+    pub card_width: f32,
+    /// Card height plus the gap below it.
+    pub row_height: f32,
+    pub viewport_height: f32,
+}
+
+impl GridGeometry {
+    pub fn new(thumbnail_size: f32, viewport: (f32, f32)) -> Self {
+        let card_width = thumbnail_size + CARD_CHROME;
+        let card_height = thumbnail_size * 0.75 + CARD_CHROME;
+        let usable = (viewport.0 - 2.0 * GRID_PADDING).max(card_width);
+        let columns = ((usable + GRID_SPACING) / (card_width + GRID_SPACING)).floor().max(1.0);
+        Self {
+            columns: columns as usize,
+            card_width,
+            row_height: card_height + GRID_SPACING,
+            viewport_height: viewport.1.max(1.0),
+        }
+    }
+
+    /// The editor's grid as it is (or is about to be) laid out.
+    pub fn of(editor: &RawEditor) -> Self {
+        let viewport = if editor.grid_viewport.0 > 0.0 {
+            editor.grid_viewport
+        } else {
+            // First frame, before the scrollable has reported its size:
+            // everything the window has that the chrome around it doesn't.
+            let w = editor.window_size;
+            (
+                w.width - LIBRARY_SIDEBAR_WIDTH,
+                w.height
+                    - super::layout::TITLE_BAR_HEIGHT
+                    - LIBRARY_TOOLBAR_HEIGHT
+                    - LIBRARY_STATUS_HEIGHT,
+            )
+        };
+        Self::new(editor.thumbnail_size, viewport)
+    }
+
+    pub fn total_rows(&self, images: usize) -> usize {
+        images.div_ceil(self.columns)
+    }
+
+    /// Content-space y of a row's top edge.
+    pub fn row_top(&self, row: usize) -> f32 {
+        GRID_PADDING + row as f32 * self.row_height
+    }
+
+    /// Rows `first..last` to build for this scroll offset: those on screen
+    /// plus `GRID_OVERSCAN_ROWS` either side, clamped to the catalogue.
+    pub fn visible_rows(&self, scroll_y: f32, total_rows: usize) -> (usize, usize) {
+        let y = (scroll_y - GRID_PADDING).max(0.0);
+        let first = ((y / self.row_height).floor() as usize)
+            .saturating_sub(GRID_OVERSCAN_ROWS)
+            .min(total_rows);
+        let last = (((y + self.viewport_height) / self.row_height).ceil() as usize
+            + GRID_OVERSCAN_ROWS)
+            .min(total_rows);
+        (first, last.max(first))
+    }
+
+    /// Indices into the image list covered by rows `first..last`. Clamped:
+    /// with a stale scroll offset (a filter just shrank the catalogue) the
+    /// rows can start past the last, partially filled one.
+    pub fn image_range(&self, first: usize, last: usize, images: usize) -> std::ops::Range<usize> {
+        let end = (last * self.columns).min(images);
+        (first * self.columns).min(end)..end
+    }
+
+    /// The scroll offset that brings `row` fully into view, or `None` if it
+    /// already is.
+    pub fn scroll_to_reveal(&self, row: usize, scroll_y: f32) -> Option<f32> {
+        let top = self.row_top(row) - GRID_PADDING;
+        let bottom = self.row_top(row) + self.row_height;
+        if top < scroll_y {
+            Some(top.max(0.0))
+        } else if bottom > scroll_y + self.viewport_height {
+            Some((bottom - self.viewport_height).max(0.0))
+        } else {
+            None
+        }
+    }
+}
 
 /// Scroll routing (`handlers::scroll`) targets the grid by this id.
 pub fn grid_scroll_id() -> scrollable::Id {
@@ -516,6 +619,47 @@ fn view_image_card<'a>(img: &'a ImageData, is_selected: bool, size: f32) -> Elem
         .into()
 }
 
+/// The virtualised thumbnail grid — see [`GridGeometry`].
+fn view_grid<'a>(editor: &'a RawEditor, images: &[&'a ImageData]) -> Element<'a, Message> {
+    let geom = GridGeometry::of(editor);
+    let total_rows = geom.total_rows(images.len());
+    let (first, last) = geom.visible_rows(editor.grid_scroll_y, total_rows);
+
+    let mut rows = column![Space::with_height(Length::Fixed(first as f32 * geom.row_height))];
+    for chunk in images[geom.image_range(first, last, images.len())].chunks(geom.columns) {
+        let cards = chunk.iter().fold(row![].spacing(GRID_SPACING), |cards, img| {
+            cards.push(view_image_card(img, is_image_selected(editor, img.id), editor.thumbnail_size))
+        });
+        rows = rows.push(container(cards).height(Length::Fixed(geom.row_height)));
+    }
+    rows = rows.push(Space::with_height(Length::Fixed(
+        (total_rows - last) as f32 * geom.row_height,
+    )));
+
+    // Fixed to exactly `columns` cards so a short last row stays left-aligned
+    // under the rest, as the old Wrap laid it out.
+    let grid_width =
+        geom.columns as f32 * geom.card_width + (geom.columns - 1) as f32 * GRID_SPACING;
+    let content = container(rows.width(Length::Fixed(grid_width)))
+        .width(Length::Fill)
+        .align_x(iced::alignment::Horizontal::Center)
+        .padding(GRID_PADDING);
+
+    mouse_area(
+        scrollable(content)
+            .id(grid_scroll_id())
+            .on_scroll(|viewport| {
+                let bounds = viewport.bounds();
+                Message::GridScrolled(viewport.absolute_offset().y, bounds.width, bounds.height)
+            })
+            .height(Length::Fill)
+            .width(Length::Fill),
+    )
+    .on_enter(Message::GridHovered(true))
+    .on_exit(Message::GridHovered(false))
+    .into()
+}
+
 fn view_filter_bar<'a>(editor: &'a RawEditor) -> Element<'a, Message> {
     row![
         button(text("All").size(12))
@@ -695,7 +839,7 @@ fn view_library_sidebar<'a>(
         .height(Length::Fill),
     )
     .padding(10)
-    .width(Length::Fixed(250.0))
+    .width(Length::Fixed(LIBRARY_SIDEBAR_WIDTH))
     .height(Length::Fill)
     .style(|_| container::Style {
         background: Some(Background::Color(Color::from_rgb(0.09, 0.09, 0.09))),
@@ -730,7 +874,11 @@ fn view_library_toolbar<'a>(editor: &'a RawEditor) -> Element<'a, Message> {
         .align_y(Alignment::Center)
         .width(Length::Fill),
     )
-    .padding(12)
+    // 8px vertically, not 12: the bar is LIBRARY_TOOLBAR_HEIGHT (56) tall,
+    // and the Export button needs ~37px. At 12px it got 32, and iced lays out
+    // text given less than one line of height at zero width — the button
+    // rendered as an empty pill.
+    .padding([8, 12])
     .style(|_| container::Style {
         background: Some(Background::Color(Color::from_rgb(0.10, 0.10, 0.10))),
         border: Border {
@@ -813,21 +961,10 @@ fn view_status_bar<'a>(
 
 pub fn view_library(editor: &RawEditor) -> Element<'_, Message> {
     let folder_stats = collect_folder_stats(editor);
-    let filtered_images: Vec<&ImageData> = editor
-        .images
-        .iter()
-        // MARKED_FOR_REMOVAL_RATING (255) always satisfies `>=` against any
-        // real threshold 0-5, so marked images stay visible here regardless
-        // of the rating filter — intentional, not an oversight.
-        .filter(|img| editor.min_filter_rating == 0 || img.rating >= editor.min_filter_rating)
-        .filter(|img| {
-            editor
-                .library_folder_filter
-                .as_ref()
-                .map(|folder| img.path.starts_with(folder))
-                .unwrap_or(true)
-        })
-        .collect();
+    // The shared predicate, not a local copy of it — see
+    // `RawEditor::displayed_images` for why the per-tab filters live in one
+    // place (marked-for-removal images intentionally stay visible here).
+    let filtered_images: Vec<&ImageData> = editor.displayed_images();
 
     let cached_count = filtered_images
         .iter()
@@ -882,29 +1019,7 @@ pub fn view_library(editor: &RawEditor) -> Element<'_, Message> {
         })
         .into()
     } else {
-        let thumbnail_grid = filtered_images.iter().fold(
-            Wrap::new().spacing(12.0).line_spacing(12.0),
-            |wrap, img| {
-                let is_selected = is_image_selected(editor, img.id);
-                wrap.push(view_image_card(img, is_selected, editor.thumbnail_size))
-            },
-        );
-
-        let centered_grid = container(thumbnail_grid)
-            .width(Length::Shrink)
-            .align_x(iced::alignment::Horizontal::Center);
-
-        container(
-            scrollable(
-                container(centered_grid)
-                    .width(Length::Fill)
-                    .align_x(iced::alignment::Horizontal::Center)
-                    .padding([12, 12]),
-            )
-            .id(grid_scroll_id())
-            .height(Length::Fill)
-            .width(Length::Fill),
-        )
+        container(view_grid(editor, &filtered_images))
         .width(Length::Fill)
         .height(Length::Fill)
         .clip(true)
@@ -976,4 +1091,53 @@ pub fn view_library(editor: &RawEditor) -> Element<'_, Message> {
         ..Default::default()
     })
     .into()
+}
+
+#[cfg(test)]
+mod grid_tests {
+    use super::*;
+
+    #[test]
+    fn columns_fill_the_viewport_without_overflowing() {
+        // card 234px + 12px gaps: 4 cards need 4*234 + 3*12 = 972 (+24 padding).
+        assert_eq!(GridGeometry::new(220.0, (996.0, 800.0)).columns, 4);
+        assert_eq!(GridGeometry::new(220.0, (995.0, 800.0)).columns, 3);
+        // Never zero, however narrow.
+        assert_eq!(GridGeometry::new(220.0, (10.0, 800.0)).columns, 1);
+    }
+
+    #[test]
+    fn visible_rows_cover_the_viewport_plus_overscan() {
+        let g = GridGeometry::new(220.0, (996.0, 400.0)); // row_height 191
+        assert_eq!(g.visible_rows(0.0, 100), (0, 3 + GRID_OVERSCAN_ROWS));
+        // Scrolled 10 rows down: starts overscan rows above the first visible.
+        let (first, last) = g.visible_rows(g.row_top(10), 100);
+        assert_eq!(first, 10 - GRID_OVERSCAN_ROWS);
+        assert!(last >= 10 + 3);
+        // Clamped at the end of the catalogue.
+        assert_eq!(g.visible_rows(1e9, 100), (100, 100));
+    }
+
+    /// 10 images in rows of 4: the third row holds only two, and a stale
+    /// offset past the end must yield an empty range, not a panic.
+    #[test]
+    fn image_range_never_runs_past_the_catalogue() {
+        let g = GridGeometry::new(220.0, (996.0, 400.0));
+        assert_eq!(g.columns, 4);
+        assert_eq!(g.image_range(0, 3, 10), 0..10);
+        assert_eq!(g.image_range(2, 3, 10), 8..10);
+        let (first, last) = g.visible_rows(1e9, g.total_rows(10));
+        assert!(g.image_range(first, last, 10).is_empty());
+    }
+
+    #[test]
+    fn reveal_scrolls_only_when_the_row_is_off_screen() {
+        let g = GridGeometry::new(220.0, (996.0, 400.0));
+        assert_eq!(g.scroll_to_reveal(0, 0.0), None);
+        // Row 5 is below a 400px viewport at offset 0: bring its bottom in.
+        let y = g.scroll_to_reveal(5, 0.0).expect("row 5 is off screen");
+        assert!((g.row_top(5) + g.row_height - (y + 400.0)).abs() < 1e-3);
+        // Row 0 is above when scrolled down: bring its top back.
+        assert_eq!(g.scroll_to_reveal(0, 2000.0), Some(0.0));
+    }
 }

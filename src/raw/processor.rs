@@ -5,7 +5,7 @@
 ///
 /// Cascading means each small tier is resized from the previous tier, not from
 /// full resolution. This makes thumbnail and instant preview generation ~10× faster.
-use super::jpeg::extract_largest_jpeg;
+use super::jpeg::largest_embedded_jpeg;
 use image::{imageops::FilterType, ImageFormat};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -42,8 +42,8 @@ const TIER_INSTANT: u32 = 384;
 const TIER_WORKING: u32 = 1280;
 
 fn get_cache_dir(tier_name: &str) -> Result<PathBuf, String> {
-    let mut path = dirs_next::cache_dir()
-        .or_else(dirs_next::home_dir)
+    let mut path = dirs::cache_dir()
+        .or_else(dirs::home_dir)
         .ok_or_else(|| "Could not determine cache directory".to_string())?;
     path.push("raw-editor");
     path.push(tier_name);
@@ -54,14 +54,11 @@ fn get_cache_dir(tier_name: &str) -> Result<PathBuf, String> {
 
 /// Process a RAW image and generate all 3 cache tiers.
 /// Returns `(thumb_path, instant_path, working_path)`.
-pub fn process_image(
-    raw_path: &Path,
-    image_id: i64,
-    _cache_dir: &Path,
-) -> Result<(String, String, String), String> {
-    // Extract the largest embedded JPEG without pre-validation.
-    // Skipping the validator eliminates 1-3 redundant full JPEG decodes.
-    let jpeg_data = extract_largest_jpeg(raw_path, None)?
+pub fn process_image(raw_path: &Path, image_id: i64) -> Result<(String, String, String), String> {
+    // One read serves both the JPEG scan and the orientation lookup, which
+    // used to open and parse the file a second time.
+    let file = fs::read(raw_path).map_err(|e| format!("Failed to read RAW file: {e}"))?;
+    let jpeg_data = largest_embedded_jpeg(&file)
         .ok_or_else(|| format!("No embedded JPEG in {:?}", raw_path.file_name()))?;
 
     tracing::debug!(
@@ -70,13 +67,13 @@ pub fn process_image(
         raw_path.file_name().unwrap_or_default()
     );
 
-    let source = decode_jpeg(&jpeg_data)
+    let source = decode_jpeg(jpeg_data)
         .map_err(|e| format!("Failed to decode JPEG: {}", e))?;
 
     // Embedded previews are stored in native sensor orientation; the camera
     // only records the rotation as an EXIF tag. Apply it here so the library
     // grid and cached previews show portrait shots upright.
-    let source = apply_exif_orientation(source, raw_path);
+    let source = apply_orientation(source, exif_orientation(&file));
 
     tracing::debug!("   Original size: {}x{}", source.width(), source.height());
 
@@ -96,10 +93,9 @@ pub fn process_image(
     Ok((thumb_path, instant_path, working_path))
 }
 
-/// Rotate a decoded embedded JPEG to match the raw file's EXIF orientation
-/// (1/3/6/8 after normalisation; mirrored variants map to their rotations).
-pub fn apply_exif_orientation(img: image::DynamicImage, raw_path: &Path) -> image::DynamicImage {
-    let orientation = read_exif_orientation(raw_path);
+/// Rotate a decoded embedded JPEG to the RAW's normalised EXIF orientation
+/// (1/3/6/8; mirrored variants map to their rotations).
+fn apply_orientation(img: image::DynamicImage, orientation: u32) -> image::DynamicImage {
     match orientation {
         3 => image::DynamicImage::ImageRgba8(image::imageops::rotate180(&img)),
         6 => image::DynamicImage::ImageRgba8(image::imageops::rotate90(&img)),
@@ -108,11 +104,13 @@ pub fn apply_exif_orientation(img: image::DynamicImage, raw_path: &Path) -> imag
     }
 }
 
-/// Container-level EXIF orientation read (cheap — no image decode).
-fn read_exif_orientation(path: &Path) -> u32 {
-    let Ok(file) = std::fs::File::open(path) else { return 1 };
-    let mut bufreader = std::io::BufReader::new(&file);
-    let Ok(exif_data) = exif::Reader::new().read_from_container(&mut bufreader) else { return 1 };
+/// Container-level EXIF orientation from the RAW's bytes (no image decode).
+fn exif_orientation(file: &[u8]) -> u32 {
+    let Ok(exif_data) =
+        exif::Reader::new().read_from_container(&mut std::io::Cursor::new(file))
+    else {
+        return 1;
+    };
     let orientation = exif_data
         .get_field(exif::Tag::Orientation, exif::In::PRIMARY)
         .and_then(|f| f.value.get_uint(0))
@@ -135,18 +133,6 @@ fn save_tier(img: &image::DynamicImage, tier_name: &str, image_id: i64) -> Resul
         .map_err(|e| format!("Failed to save {} tier: {}", tier_name, e))?;
     tracing::debug!("   → {}px tier: {}", img.width(), file_path.display());
     Ok(file_path.to_string_lossy().to_string())
-}
-
-/// Normalize a raw pixel value based on black and white levels.
-pub fn normalize_pixel(value: u16, black_level: u32, white_level: u32) -> f32 {
-    let val = value as f32;
-    let bl = black_level as f32;
-    let wl = white_level as f32;
-    if val <= bl {
-        0.0
-    } else {
-        ((val - bl) / (wl - bl)).clamp(0.0, 1.0)
-    }
 }
 
 #[cfg(test)]

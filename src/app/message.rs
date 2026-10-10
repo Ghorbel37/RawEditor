@@ -59,19 +59,6 @@ pub struct ImportResult {
     pub skipped_count: usize,
 }
 
-/// Result of thumbnail generation
-#[derive(Debug, Clone)]
-pub struct ThumbnailResult {
-    pub generated_count: usize,
-}
-
-/// Result of preview generation
-#[derive(Debug, Clone)]
-pub struct PreviewResult {
-    pub image_id: i64,
-    pub preview_path: Result<String, String>,
-}
-
 /// Application messages (events)
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
@@ -85,16 +72,13 @@ pub enum Message {
     ImportFolder,
     /// Placeholder for camera import workflow
     ImportFromCamera,
-    /// Background import completed with results
-    ImportComplete(ImportResult),
-    /// Background thumbnail generation completed
-    ThumbnailGenerated(ThumbnailResult),
+    /// Background import finished (or failed — e.g. the catalogue could not
+    /// be opened).
+    ImportComplete(Result<ImportResult, String>),
     /// Phase 28: Multi-tier cache processing completed
     /// Result is (image_id, thumb_path, instant_path, working_path) or (image_id, error)
     CacheProcessed(Result<(i64, String, String, String), (i64, String)>),
 
-    /// Background preview generation completed
-    PreviewGenerated(PreviewResult),
     /// User switched to a different tab
     TabChanged(AppTab),
 
@@ -266,7 +250,7 @@ pub enum Message {
     /// Confirm forgetting the pending folder.
     RemoveFolderConfirmed,
     /// Result of the async folder picker; `None` = cancelled.
-    ImportFolderPicked(Option<ImportResult>),
+    ImportFolderPicked(Option<PathBuf>),
     /// Help > Check for Updates — opens the releases page.
     CheckForUpdates,
     /// Open the project page in the default browser.
@@ -286,6 +270,8 @@ pub enum Message {
     SetRawPreloadBehind(f32),
     SetRawPreloadAhead(f32),
     SetMinFreeRam(f32),
+    /// A Preferences slider was released: persist the settings once.
+    SavePreferences,
     ResetPreferences,
 
     /// User selected an image from the grid
@@ -306,8 +292,6 @@ pub enum Message {
     /// Select previous image (Left arrow)
     SelectPreviousImage,
 
-    /// Phase 73: Preload preview for adjacent image
-    PreloadPreview(i64),
     /// Phase 73: Preview loaded from cache/disk
     /// Phase 76: Eager Background Decoding (width, height, pixels)
     PreviewCached(i64, Result<(u32, u32, std::sync::Arc<[u8]>), String>),
@@ -364,8 +348,8 @@ pub enum Message {
     DragWindow,
 
     // ========== Histogram Messages (Phase 22) ==========
-    /// Phase 116: Interaction & Coordinate System Fixes
-    ViewportResized(f32, f32, f32),
+    /// The develop viewport's logical size changed: (width, height).
+    ViewportResized(f32, f32),
 
     /// Render task failed (GPU error / shader panic) — releases the throttle lock
     RenderFailed,
@@ -373,6 +357,9 @@ pub enum Message {
     /// whole-image histogram, and timings. Both GPU passes land together, so
     /// this is the only render-completion message.
     RenderFinished(
+        /// Image the render was made from. A render still in flight when the
+        /// user navigates must not land on the next image's viewport.
+        i64,
         std::sync::Arc<[u8]>,
         (u32, u32),
         /// The window these bytes cover. Travels with them so the viewport
@@ -390,15 +377,22 @@ pub enum Message {
     HistogramToggled(bool),
 
     // ========== Scroll boost + filmstrip momentum ==========
-    /// Raw wheel event from the global subscription, routed by cursor
-    /// position to the library grid (the filmstrip has its own dedicated
+    /// Raw wheel event from the global subscription, applied to the library
+    /// grid while the cursor is over it (the filmstrip has its own dedicated
     /// interceptor — see FilmstripWheel — so it isn't handled here).
     WheelScrolled(iced::mouse::ScrollDelta),
-    /// Window-space cursor position, tracked globally so wheel routing knows
-    /// which region the cursor is over (WheelScrolled itself carries no position).
-    GlobalCursorMoved(iced::Point),
-    /// Window resize, needed for the same region routing.
+    /// Cursor entered (`true`) or left the library grid.
+    GridHovered(bool),
+    /// The library grid scrolled or resized: (vertical offset, viewport
+    /// width, viewport height) in px.
+    GridScrolled(f32, f32, f32),
+    /// The filmstrip scrolled: (horizontal offset, visible width) in px.
+    FilmstripScrolled(f32, f32),
+    /// Window resize — the moment the scale factor may have changed too
+    /// (dragging the window to a monitor with a different DPI).
     WindowResized(iced::Size),
+    /// The window's DPI scale factor, as reported by the windowing system.
+    ScaleFactorChanged(f32),
     /// One frame tick of the filmstrip's kinetic (momentum) scroll.
     KineticTick(std::time::Instant),
     /// Wheel event captured directly by the filmstrip's own overlay

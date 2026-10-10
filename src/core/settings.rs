@@ -88,8 +88,15 @@ impl AppSettings {
 
         let payload = serde_json::to_string_pretty(self)
             .map_err(|e| format!("Failed to serialize settings: {}", e))?;
-        std::fs::write(&path, payload)
-            .map_err(|e| format!("Failed to write settings file {}: {}", path.display(), e))
+        // Write-then-rename, so the file is always either the old settings or
+        // the new ones. A crash mid-`write` used to leave it truncated, the
+        // next launch failed to parse it, and `load_or_default` silently reset
+        // every preference.
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, payload)
+            .map_err(|e| format!("Failed to write settings file {}: {}", tmp.display(), e))?;
+        std::fs::rename(&tmp, &path)
+            .map_err(|e| format!("Failed to replace settings file {}: {}", path.display(), e))
     }
 
     pub fn settings_path() -> PathBuf {

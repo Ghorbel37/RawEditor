@@ -4,7 +4,6 @@
 /// EXIF metadata is still read via kamadak-exif since rawler's Exif struct is internal to its decoders.
 use std::path::Path;
 use tokio::task;
-use std::path::PathBuf;
 
 /// Result type for RAW data loading
 #[derive(Debug, Clone)]
@@ -63,17 +62,32 @@ fn load_raw_data_blocking(path: &str) -> Result<RawDataResult, String> {
     }
 
     // Phase 119: rawler::decode_file replaces RawLoader::new().decode_file()
-    let raw_image = rawler::decode_file(path)
+    let mut raw_image = rawler::decode_file(path)
         .map_err(|e| format!("Failed to decode RAW: {:?}", e))?;
 
-    // Extract raw sensor data (full buffer)
-    let full_data: Vec<u16> = match &raw_image.data {
-        rawler::RawImageData::Integer(values) => values.clone(),
-        rawler::RawImageData::Float(values) => values
-            .iter()
-            .map(|&v| (v * 65535.0).clamp(0.0, 65535.0) as u16)
-            .collect(),
-    };
+    // The debayer pass reads one sample per photosite from a 2×2 CFA.
+    // Anything else — X-Trans's 6×6 pattern, linear DNGs with three samples
+    // per pixel — would be reinterpreted as Bayer and develop as colour noise,
+    // so refuse it with a reason instead.
+    let cfa = &raw_image.camera.cfa;
+    if raw_image.cpp != 1 || cfa.width != 2 || cfa.height != 2 {
+        return Err(format!(
+            "Unsupported sensor layout ({}×{} CFA, {} sample(s) per pixel) — only Bayer RAWs can be developed",
+            cfa.width, cfa.height, raw_image.cpp
+        ));
+    }
+
+    // Take the sensor buffer rather than cloning it: the clone was a second
+    // full-size copy (~50 MB at 24 MP) alive for the rest of the decode, on a
+    // path that runs for every preloaded neighbour as well as the open image.
+    let full_data: Vec<u16> =
+        match std::mem::replace(&mut raw_image.data, rawler::RawImageData::Integer(Vec::new())) {
+            rawler::RawImageData::Integer(values) => values,
+            rawler::RawImageData::Float(values) => values
+                .iter()
+                .map(|&v| (v * 65535.0).clamp(0.0, 65535.0) as u16)
+                .collect(),
+        };
 
     // Phase 119: rawler uses active_area: Option<Rect> instead of crops: Vec<usize>
     // Rect has fields: p (Point: x, y) and d (Dim2: w, h)
@@ -99,26 +113,9 @@ fn load_raw_data_blocking(path: &str) -> Result<RawDataResult, String> {
             tracing::warn!("Crop resulted in empty image, using full sensor dump");
             (full_data, full_width as u32, full_height as u32, [0usize; 4])
         } else {
-            let mut cropped_data = Vec::with_capacity(crop_width * crop_height);
-
-            'crop: for y in 0..crop_height {
-                let src_y = top + y;
-                if src_y >= full_height {
-                    break 'crop;
-                }
-                let src_start = src_y * full_width + left;
-                let src_end = src_start + crop_width;
-                if src_start < full_data.len() && src_end <= full_data.len() {
-                    cropped_data.extend_from_slice(&full_data[src_start..src_end]);
-                }
-            }
-
-            (
-                cropped_data,
-                crop_width as u32,
-                crop_height as u32,
-                [top, right, bottom, left],
-            )
+            let (cropped, rows) =
+                crop_in_place(full_data, full_width, full_height, left, top, crop_width, crop_height);
+            (cropped, crop_width as u32, rows as u32, [top, right, bottom, left])
         }
     } else {
         tracing::warn!("No active_area found, using full sensor dump");
@@ -137,14 +134,6 @@ fn load_raw_data_blocking(path: &str) -> Result<RawDataResult, String> {
     let left_crop = crops_margins[3] as u32;
     cfa_pattern = cfa_pattern ^ ((top_crop % 2) << 1) ^ (left_crop % 2);
 
-    // Phase 43: Compute per-CFA black levels from cropped mosaic (P0.1 percentile)
-    let measured_black_levels = compute_cfa_black_levels_percentile(
-        &data,
-        width as usize,
-        height as usize,
-        cfa_pattern,
-    );
-
     tracing::info!(
         "Loaded RAW data: {}x{} ({} pixels)",
         width, height, data.len()
@@ -156,28 +145,32 @@ fn load_raw_data_blocking(path: &str) -> Result<RawDataResult, String> {
     // (crushed shadows) and varies frame-to-frame (inconsistent tone between shots).
     // rawler's as_bayer_array() is documented RGBE order [R, G, B, G2];
     // our pipeline wants [R, G1, G2, B].
+    //
+    // The percentile is a full pass over the mosaic plus 1 MB of histograms,
+    // so it only runs when it is actually going to be used.
     let meta_black = raw_image.blacklevel.as_bayer_array();
-    let black_levels = if meta_black.iter().any(|&v| v > 0.0) {
+    let (black_levels, measured_black_levels) = if meta_black.iter().any(|&v| v > 0.0) {
         tracing::info!(
-            "Black levels from camera metadata: R={:.1} G={:.1} B={:.1} G2={:.1} (measured P0.1 was R={:.1} G1={:.1} G2={:.1} B={:.1})",
+            "Black levels from camera metadata: R={:.1} G={:.1} B={:.1} G2={:.1}",
             meta_black[0], meta_black[1], meta_black[2], meta_black[3],
-            measured_black_levels[0], measured_black_levels[1],
-            measured_black_levels[2], measured_black_levels[3]
         );
-        [
+        let black = [
             meta_black[0] as u32, // R
             meta_black[1] as u32, // G1
             meta_black[3] as u32, // G2
             meta_black[2] as u32, // B
-        ]
+        ];
+        (black, black.map(|b| b as f32))
     } else {
         tracing::warn!("No metadata black level; falling back to measured P0.1 percentile");
-        [
-            measured_black_levels[0] as u32,
-            measured_black_levels[1] as u32,
-            measured_black_levels[2] as u32,
-            measured_black_levels[3] as u32,
-        ]
+        // Phase 43: per-CFA black levels from the cropped mosaic (P0.1 percentile)
+        let measured = compute_cfa_black_levels_percentile(
+            &data,
+            width as usize,
+            height as usize,
+            cfa_pattern,
+        );
+        (measured.map(|b| b as u32), measured)
     };
 
     // White balance coefficients — guard ALL four channels against NaN/inf/zero
@@ -303,27 +296,8 @@ fn load_raw_data_blocking(path: &str) -> Result<RawDataResult, String> {
         extract_metadata_kamadak(path.to_str().unwrap_or_default());
     let orientation = normalize_orientation(exif_orientation);
 
-    // Phase 140: Load DCP profile if available
-    let dcp_profile = crate::raw::dcp::find_profile_for_camera(&raw_image.make, &raw_image.model)
-    .and_then(|p: PathBuf| {
-        tracing::info!("Found DCP profile at {:?}", p);
-        match crate::raw::dcp::parse_dcp(&p) {
-            Ok(profile) => {
-                tracing::info!(  // ← ADD THIS
-                    "DCP parse OK: fm1={} hsm_dims={:?} hsm1_entries={:?}",
-                    profile.forward_matrix_1.is_some(),
-                    profile.hue_sat_dims,
-                    profile.hue_sat_data_1.as_ref().map(|v| v.len())
-                );
-                Some(profile)
-            }
-            Err(e) => {
-                tracing::error!("DCP parse FAILED: {}", e);  // ← AND THIS
-                None
-            }
-        }
-    })
-    .map(std::sync::Arc::new);
+    // Phase 140: Load DCP profile if available (parsed once, then shared)
+    let dcp_profile = crate::raw::dcp::load_profile_for_camera(&raw_image.make, &raw_image.model);
 
     Ok(RawDataResult {
         data,
@@ -348,6 +322,40 @@ fn load_raw_data_blocking(path: &str) -> Result<RawDataResult, String> {
         dcp_profile,
         orientation,
     })
+}
+
+/// Cut the active area out of a full sensor dump, reusing its allocation.
+///
+/// Rows only ever move towards the front (the destination of row `y` starts
+/// at or before its source), so compacting forward with `copy_within` is
+/// safe and needs no second buffer. Returns the buffer and the number of
+/// whole rows actually present — a truncated file yields fewer than asked.
+fn crop_in_place(
+    mut data: Vec<u16>,
+    full_width: usize,
+    full_height: usize,
+    left: usize,
+    top: usize,
+    crop_width: usize,
+    crop_height: usize,
+) -> (Vec<u16>, usize) {
+    let mut rows = 0;
+    for y in 0..crop_height {
+        let src_y = top + y;
+        if src_y >= full_height {
+            break;
+        }
+        let src = src_y * full_width + left;
+        if src + crop_width > data.len() {
+            break;
+        }
+        data.copy_within(src..src + crop_width, rows * crop_width);
+        rows += 1;
+    }
+    // No shrink_to_fit: the margins are a few percent of the sensor, and
+    // shrinking can mean reallocating — the very copy this avoids.
+    data.truncate(rows * crop_width);
+    (data, rows)
 }
 
 /// Phase 119: EXIF extraction via kamadak-exif only (rexif removed)
@@ -519,4 +527,28 @@ fn compute_cfa_black_levels_percentile(
     );
 
     ordered_blacks
+}
+
+#[cfg(test)]
+mod crop_tests {
+    use super::crop_in_place;
+
+    /// 5×4 sensor numbered 0..20; crop the 3×2 block at (1,1).
+    #[test]
+    fn crop_in_place_extracts_the_active_area() {
+        let data: Vec<u16> = (0..20).collect();
+        let (out, rows) = crop_in_place(data, 5, 4, 1, 1, 3, 2);
+        assert_eq!(rows, 2);
+        assert_eq!(out, vec![6, 7, 8, 11, 12, 13]);
+    }
+
+    /// A short file must report the rows it really has, so width × height
+    /// always matches the buffer handed to the GPU.
+    #[test]
+    fn crop_in_place_stops_at_a_truncated_buffer() {
+        let data: Vec<u16> = (0..12).collect(); // claims 5×4, holds 2.4 rows
+        let (out, rows) = crop_in_place(data, 5, 4, 0, 0, 5, 4);
+        assert_eq!(rows, 2);
+        assert_eq!(out.len(), 10);
+    }
 }

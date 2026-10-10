@@ -4,7 +4,7 @@
 // configuration API.
 //
 // Library grid: we let iced apply its native scroll and nudge it further
-// with `scroll_by`, routed by the globally-tracked cursor position.
+// with `scroll_by`, while the grid's own mouse_area reports the cursor over it.
 //
 // Filmstrip: iced's Stack widget dispatches wheel events top-layer-first and
 // stops at the first layer that captures them (see iced_widget::stack::
@@ -26,11 +26,6 @@ use iced::Task;
 use crate::app::message::{AppTab, Message};
 use crate::app::state::RawEditor;
 use crate::app::state::Modal;
-
-const TITLE_BAR_H: f32 = 35.0;
-const LIB_SIDEBAR_W: f32 = 250.0;
-const LIB_TOOLBAR_H: f32 = 56.0;
-const LIB_STATUS_H: f32 = 42.0;
 
 /// Extra multiplier on top of iced's native 60px/line.
 const GRID_MULT: f32 = 4.0;
@@ -68,17 +63,7 @@ const STOP_SPEED: f32 = 15.0;
 const DECAY_SLOW: f32 = 1.2;
 const DECAY_FAST: f32 = 6.5;
 
-pub fn handle_global_cursor_moved(editor: &mut RawEditor, pos: iced::Point) -> Task<Message> {
-    editor.global_cursor = pos;
-    Task::none()
-}
-
-pub fn handle_window_resized(editor: &mut RawEditor, size: iced::Size) -> Task<Message> {
-    editor.window_size = size;
-    Task::none()
-}
-
-/// Library grid boost, routed by cursor position from the global subscription.
+/// Library grid boost, applied while the cursor is over the grid.
 pub fn handle_wheel(editor: &mut RawEditor, delta: ScrollDelta) -> Task<Message> {
     if editor.active_modal != Modal::None || editor.current_tab != AppTab::Library {
         return Task::none();
@@ -91,12 +76,7 @@ pub fn handle_wheel(editor: &mut RawEditor, delta: ScrollDelta) -> Task<Message>
         return Task::none();
     }
 
-    let c = editor.global_cursor;
-    let w = editor.window_size;
-    let over_grid = c.x > LIB_SIDEBAR_W
-        && c.y > TITLE_BAR_H + LIB_TOOLBAR_H
-        && c.y < w.height - LIB_STATUS_H;
-    if over_grid {
+    if editor.cursor_over_grid {
         return scrollable::scroll_by(
             crate::app::views::library::grid_scroll_id(),
             AbsoluteOffset { x: 0.0, y: -(GRID_MULT - 1.0) * 60.0 * lines },

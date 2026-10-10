@@ -26,10 +26,9 @@ pub fn handle_toggle_mask_placement(editor: &mut RawEditor, mask_type: u32) -> T
 
     editor.is_wb_picking = false;
     if editor.is_cropping {
-        // Leaving crop mode also clears its GPU flag (same as the WB picker).
+        // update_pipeline below clears the shader's crop flag to match.
         editor.is_cropping = false;
         editor.drag_mode = DragMode::None;
-        editor.current_edit_params.is_cropping = 0;
     }
     editor.mask_tool = target;
     editor.status = if mask_type == 0 {
@@ -171,7 +170,7 @@ pub fn handle_mask_handle_grabbed(
     editor.is_dragging = true;
     // NOTE: `_bounds` is the image rect, NOT the canvas. `viewport_size` is
     // the canvas size (set by Message::ViewportResized) and every consumer —
-    // zoom-to-cursor, pan, get_image_screen_bounds, and the drag math itself —
+    // zoom-to-cursor, pan, and the drag math itself —
     // re-derives the image rect from it via core::viewport::image_rect.
     // Assigning the image rect here corrupted all of those for the rest of the
     // session, and made the drag pivot around a phantom center on any

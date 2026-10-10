@@ -49,8 +49,11 @@ impl Library {
     /// - macOS: ~/Library/Application Support/raw-editor/raw_editor.db
     /// - Windows: %APPDATA%\raw-editor\raw_editor.db
     pub fn new() -> SqlResult<Self> {
-        let db_path = Self::get_db_path();
+        Self::open_at(&Self::get_db_path())
+    }
 
+    /// Open (creating if needed) the catalogue at `db_path`.
+    pub fn open_at(db_path: &std::path::Path) -> SqlResult<Self> {
         // Ensure the parent directory exists
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)
@@ -58,12 +61,12 @@ impl Library {
         }
 
         // Open or create the database
-        let conn = Connection::open(&db_path)?;
+        let conn = Connection::open(db_path)?;
         apply_pragmas(&conn);
 
         tracing::info!("Database initialized at: {}", db_path.display());
 
-        let mut library = Library { conn, db_path };
+        let mut library = Library { conn, db_path: db_path.to_path_buf() };
         library.init_schema()?;
 
         Ok(library)
@@ -178,16 +181,9 @@ impl Library {
         &self.conn
     }
 
-    /// Get a count of images in the library
-    pub fn image_count(&self) -> SqlResult<i64> {
-        let count: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM images", [], |row| row.get(0))?;
-        Ok(count)
-    }
-
-    /// Import a new image into the library
-    /// Returns the new image ID
+    /// Import a single image (test fixture; the app imports whole folders
+    /// in one transaction — see `handlers::library::import_folder_blocking`).
+    #[cfg(test)]
     pub fn import_image(&self, path: &str, filename: &str) -> SqlResult<i64> {
         use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -208,43 +204,16 @@ impl Library {
     /// Returns a vector of Image structs ordered by import date (newest first)
     pub fn get_all_images(&self) -> SqlResult<Vec<Image>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, filename, path, cache_path_thumb, cache_path_instant, cache_path_working, COALESCE(file_status, 'exists'), COALESCE(rating, 0), COALESCE(flag, 0) 
-             FROM images 
-             ORDER BY imported_at DESC"
+            // `path` breaks ties deterministically. Every file of one import
+            // shares its timestamp, and without a tiebreak SQLite returned
+            // them in whatever order the filesystem happened to list them.
+            // DESC keeps the newest-first order the grid has always shown.
+            "SELECT id, filename, path, cache_path_thumb, cache_path_instant, cache_path_working, COALESCE(file_status, 'exists'), COALESCE(rating, 0), COALESCE(flag, 0)
+             FROM images
+             ORDER BY imported_at DESC, path DESC"
         )?;
 
         let image_iter = stmt.query_map([], |row| {
-            Ok(Image {
-                id: row.get(0)?,
-                filename: row.get(1)?,
-                path: row.get(2)?,
-                cache_path_thumb: row.get(3)?,
-                cache_path_instant: row.get(4)?,
-                cache_path_working: row.get(5)?,
-                file_status: row.get(6)?,
-                rating: row.get(7)?,           // Phase 56
-                flag: row.get(8).unwrap_or(0), // Phase 83
-            })
-        })?;
-
-        let mut images = Vec::new();
-        for image in image_iter {
-            images.push(image?);
-        }
-
-        Ok(images)
-    }
-
-    /// Get images that need thumbnail generation (cache_status = 'pending')
-    pub fn get_pending_images(&self, limit: usize) -> SqlResult<Vec<Image>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, filename, path, cache_path_thumb, cache_path_instant, cache_path_working, COALESCE(file_status, 'exists'), COALESCE(rating, 0), COALESCE(flag, 0) 
-             FROM images 
-             WHERE cache_status = 'pending' 
-             LIMIT ?1"
-        )?;
-
-        let image_iter = stmt.query_map([limit], |row| {
             Ok(Image {
                 id: row.get(0)?,
                 filename: row.get(1)?,
@@ -304,6 +273,24 @@ impl Library {
         Ok(true)
     }
 
+    /// Requeue images a previous session claimed but never finished.
+    ///
+    /// Cache workers mark a row `processing` before decoding it. If the app
+    /// quit (or crashed) mid-import, those rows stayed `processing` forever:
+    /// nothing ever claims a non-`pending` row again, so the images sat on
+    /// "Queued..." with no thumbnail in every later session. Only safe at
+    /// startup, before this session's workers exist.
+    pub fn requeue_interrupted_cache_jobs(&self) -> SqlResult<usize> {
+        let n = self.conn.execute(
+            "UPDATE images SET cache_status = 'pending' WHERE cache_status = 'processing'",
+            [],
+        )?;
+        if n > 0 {
+            tracing::warn!("Requeued {n} image(s) left mid-caching by a previous session");
+        }
+        Ok(n)
+    }
+
     pub fn verify_cache_paths(&self) -> SqlResult<usize> {
         type CachedPathsRow = (i64, Option<String>, Option<String>, Option<String>);
 
@@ -318,6 +305,8 @@ impl Library {
             .filter_map(|r| r.ok())
             .collect();
 
+        // One transaction for the whole sweep rather than one commit per row.
+        let tx = self.conn.unchecked_transaction()?;
         let mut reset_count = 0;
         for (id, thumb, instant, working) in cached_images {
             let missing = [thumb.as_deref(), instant.as_deref(), working.as_deref()]
@@ -326,7 +315,7 @@ impl Library {
                 .any(|path| !std::path::Path::new(path).exists());
 
             if missing {
-                self.conn.execute(
+                tx.execute(
                     "UPDATE images
                      SET cache_status = 'pending',
                          cache_path_thumb = NULL,
@@ -338,6 +327,7 @@ impl Library {
                 reset_count += 1;
             }
         }
+        tx.commit()?;
 
         if reset_count > 0 {
             tracing::warn!(
@@ -349,36 +339,48 @@ impl Library {
         Ok(reset_count)
     }
 
-    /// Verify that RAW files still exist on disk
-    /// Mark as 'deleted' if file is missing
+    /// Reconcile `file_status` with what is actually on disk, in BOTH
+    /// directions. Returns how many images are currently missing.
+    ///
+    /// Only ever marking files `deleted` (never back) meant a library on an
+    /// external drive that was unplugged at launch stayed "Missing" for good,
+    /// even after the drive came back.
     pub fn verify_files(&self) -> SqlResult<usize> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, path FROM images WHERE file_status = 'exists'")?;
+            .prepare("SELECT id, path, COALESCE(file_status, 'exists') FROM images")?;
 
-        let existing_images: Vec<(i64, String)> = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        let rows: Vec<(i64, String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
             .filter_map(|r| r.ok())
             .collect();
 
-        let mut deleted_count = 0;
-        for (id, file_path) in existing_images {
-            // Check if file exists
-            if !std::path::Path::new(&file_path).exists() {
-                // Mark as deleted since file is missing
-                self.conn.execute(
-                    "UPDATE images SET file_status = 'deleted' WHERE id = ?1",
-                    rusqlite::params![id],
+        let tx = self.conn.unchecked_transaction()?;
+        let (mut missing, mut gone, mut back) = (0usize, 0usize, 0usize);
+        for (id, file_path, status) in rows {
+            let exists = std::path::Path::new(&file_path).exists();
+            let want = if exists { "exists" } else { "deleted" };
+            if !exists {
+                missing += 1;
+            }
+            if status != want {
+                tx.execute(
+                    "UPDATE images SET file_status = ?1 WHERE id = ?2",
+                    rusqlite::params![want, id],
                 )?;
-                deleted_count += 1;
+                if exists { back += 1 } else { gone += 1 }
             }
         }
+        tx.commit()?;
 
-        if deleted_count > 0 {
-            tracing::warn!("Marked {} missing files as deleted", deleted_count);
+        if gone > 0 {
+            tracing::warn!("Marked {gone} missing file(s) as deleted");
+        }
+        if back > 0 {
+            tracing::info!("{back} previously missing file(s) are available again");
         }
 
-        Ok(deleted_count)
+        Ok(missing)
     }
 
     // ========== Edit Parameters Management ==========
@@ -445,16 +447,6 @@ impl Library {
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
     }
 
-    /// Check if an image has any edits applied
-    pub fn has_edits(&self, image_id: i64) -> SqlResult<bool> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM edits WHERE image_id = ?1",
-            [image_id],
-            |row| row.get(0),
-        )?;
-        Ok(count > 0)
-    }
-
     /// Delete all edits for an image (reset to unedited)
     pub fn delete_edits(&self, image_id: i64) -> SqlResult<()> {
         self.conn
@@ -462,31 +454,43 @@ impl Library {
         Ok(())
     }
 
-    /// Phase 56: Set star rating for an image (0-5)
-    pub fn set_image_rating(&self, image_id: i64, rating: u8) -> SqlResult<()> {
-        self.conn.execute(
-            "UPDATE images SET rating = ?1 WHERE id = ?2",
-            rusqlite::params![rating, image_id],
-        )?;
-        Ok(())
+    /// Rate a whole selection in ONE transaction.
+    ///
+    /// These run on the UI thread (rating is a keypress), and a select-all
+    /// rating used to be one autocommit — one WAL commit — per image. All or
+    /// nothing, so the catalogue can never end up half-rated.
+    pub fn set_ratings(&self, ids: &[i64], rating: u8) -> SqlResult<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare("UPDATE images SET rating = ?1 WHERE id = ?2")?;
+            for id in ids {
+                stmt.execute(rusqlite::params![rating, id])?;
+            }
+        }
+        tx.commit()
     }
 
-    /// Phase 83: Set Pick/Reject flag (-1, 0, 1)
-    pub fn set_image_flag(&self, image_id: i64, flag: i8) -> SqlResult<()> {
-        self.conn.execute(
-            "UPDATE images SET flag = ?1 WHERE id = ?2",
-            rusqlite::params![flag, image_id],
-        )?;
-        Ok(())
+    /// Flag a whole selection in one transaction — see `set_ratings`.
+    pub fn set_flags(&self, ids: &[i64], flag: i8) -> SqlResult<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare("UPDATE images SET flag = ?1 WHERE id = ?2")?;
+            for id in ids {
+                stmt.execute(rusqlite::params![flag, id])?;
+            }
+        }
+        tx.commit()
     }
 
-    /// Remove an image's catalog row entirely (used by hard delete). The
-    /// async hard-delete task opens its own connection rather than calling
-    /// this directly (Send-safety across the task boundary — see
-    /// handlers::delete) but this is kept for API completeness.
-    pub fn delete_image(&self, id: i64) -> SqlResult<()> {
-        self.conn.execute("DELETE FROM images WHERE id = ?1", [id])?;
-        Ok(())
+    /// Save edit params for several images in one transaction (paste onto a
+    /// selection). Returns how many were written.
+    pub fn save_edit_params_many(&self, edits: &[(i64, EditParams)]) -> SqlResult<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+        for (id, params) in edits {
+            self.save_edit_params(*id, params)?;
+        }
+        tx.commit()?;
+        Ok(edits.len())
     }
 
     /// Forget a batch of images: remove their catalogue rows and edit history.
@@ -495,11 +499,10 @@ impl Library {
     ///
     /// Takes an explicit id list rather than matching on a path prefix. The
     /// caller derives the ids from the same in-memory predicate the sidebar
-    /// filter displays, so "remove this folder" removes exactly the images the
-    /// grid was showing. A `path LIKE ?||'/%'` query would quietly disagree
-    /// with that (the filter uses a bare prefix match, so `/photos/2024` also
-    /// matches `/photos/2024-old/`) and would need `%` and `_` escaped out of
-    /// real directory names.
+    /// row represents, so "remove this folder" removes exactly what the user
+    /// clicked. A `path LIKE ?||'/%'` query would need `%` and `_` escaped out
+    /// of real directory names, and would also sweep up subfolders, which
+    /// have sidebar rows of their own.
     ///
     /// The `edits` rows are deleted EXPLICITLY. `edits` declares
     /// `ON DELETE CASCADE`, but `PRAGMA foreign_keys` is never enabled (see
@@ -548,6 +551,54 @@ impl Library {
         )?;
         Ok(())
     }
+}
+
+// Implement Debug for better error messages
+impl std::fmt::Debug for Library {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Library")
+            .field("db_path", &self.db_path)
+            .finish()
+    }
+}
+
+/// Open the catalogue, reconcile it with the disk, and load every row.
+///
+/// Runs on a blocking thread: the reconciliation stats every RAW file and
+/// every cache tier, which on a large library — or one on a network or
+/// external drive — is far too slow to sit on an async worker.
+pub async fn load_database() -> Result<Vec<super::models::Image>, String> {
+    tokio::task::spawn_blocking(load_database_blocking)
+        .await
+        .map_err(|e| format!("Database task failed: {e}"))?
+}
+
+fn load_database_blocking() -> Result<Vec<super::models::Image>, String> {
+    let lib = Library::new().map_err(|e| format!("Failed to initialize library: {e}"))?;
+    if lib.migrate_cache_version().unwrap_or(false) {
+        for tier in ["thumb", "instant", "working"] {
+            if let Some(mut dir) = dirs::cache_dir() {
+                dir.push("raw-editor");
+                dir.push(tier);
+                if let Err(e) = std::fs::remove_dir_all(&dir) {
+                    tracing::warn!("Could not clear stale cache tier {tier}: {e}");
+                }
+            }
+        }
+    }
+    // Each step is best-effort: a failure here must not keep the user out of
+    // their catalogue, so log it and carry on.
+    if let Err(e) = lib.requeue_interrupted_cache_jobs() {
+        tracing::warn!("Could not requeue interrupted cache jobs: {e}");
+    }
+    if let Err(e) = lib.verify_cache_paths() {
+        tracing::warn!("Could not verify cache tiers: {e}");
+    }
+    if let Err(e) = lib.verify_files() {
+        tracing::warn!("Could not verify RAW files: {e}");
+    }
+    lib.get_all_images()
+        .map_err(|e| format!("Failed to load images: {e}"))
 }
 
 #[cfg(test)]
@@ -734,7 +785,7 @@ mod tests {
         let lib = in_memory_library();
         let id = lib.import_image("/rate.nef", "rate.nef").unwrap();
 
-        lib.set_image_rating(id, 5).unwrap();
+        lib.set_ratings(&[id], 5).unwrap();
         let images = lib.get_all_images().unwrap();
         let img = images.iter().find(|i| i.id == id).unwrap();
         assert_eq!(img.rating, 5);
@@ -747,12 +798,12 @@ mod tests {
         let lib = in_memory_library();
         let id = lib.import_image("/flag.nef", "flag.nef").unwrap();
 
-        lib.set_image_flag(id, 1).unwrap();
+        lib.set_flags(&[id], 1).unwrap();
         let images = lib.get_all_images().unwrap();
         let img = images.iter().find(|i| i.id == id).unwrap();
         assert_eq!(img.flag, 1);
 
-        lib.set_image_flag(id, -1).unwrap();
+        lib.set_flags(&[id], -1).unwrap();
         let images = lib.get_all_images().unwrap();
         let img = images.iter().find(|i| i.id == id).unwrap();
         assert_eq!(img.flag, -1);
@@ -766,26 +817,16 @@ mod tests {
         let lib = in_memory_library();
         let id = lib.import_image("/mark.nef", "mark.nef").unwrap();
 
-        lib.set_image_rating(id, MARKED_FOR_REMOVAL_RATING).unwrap();
+        lib.set_ratings(&[id], MARKED_FOR_REMOVAL_RATING).unwrap();
         let images = lib.get_all_images().unwrap();
         let img = images.iter().find(|i| i.id == id).unwrap();
         assert_eq!(img.rating, MARKED_FOR_REMOVAL_RATING);
 
         // Un-marking reuses the same setter with a normal rating.
-        lib.set_image_rating(id, 0).unwrap();
+        lib.set_ratings(&[id], 0).unwrap();
         let images = lib.get_all_images().unwrap();
         let img = images.iter().find(|i| i.id == id).unwrap();
         assert_eq!(img.rating, 0);
-    }
-
-    #[test]
-    fn test_delete_image_removes_row() {
-        let lib = in_memory_library();
-        let id = lib.import_image("/gone.nef", "gone.nef").unwrap();
-        assert!(lib.get_all_images().unwrap().iter().any(|i| i.id == id));
-
-        lib.delete_image(id).unwrap();
-        assert!(!lib.get_all_images().unwrap().iter().any(|i| i.id == id));
     }
 
     // ── cache version migration resets stale cached images ────────────────────
@@ -813,50 +854,142 @@ mod tests {
         assert!(!lib.migrate_cache_version().unwrap());
     }
 
-    // ── get_pending_images respects limit ─────────────────────────────────────
+    // ── startup recovery ──────────────────────────────────────────────────────
+
+    fn status_of(lib: &Library, id: i64) -> (String, String) {
+        lib.conn
+            .query_row(
+                "SELECT cache_status, file_status FROM images WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    /// A row left `processing` by a session that quit mid-import must become
+    /// claimable again, or that image never gets a thumbnail.
+    #[test]
+    fn interrupted_cache_jobs_are_requeued() {
+        let lib = in_memory_library();
+        let a = lib.import_image("/a.nef", "a.nef").unwrap();
+        let b = lib.import_image("/b.nef", "b.nef").unwrap();
+        lib.conn
+            .execute("UPDATE images SET cache_status = 'processing' WHERE id = ?1", [a])
+            .unwrap();
+        lib.set_image_cache_paths(b, "/t", "/i", "/w").unwrap();
+
+        assert_eq!(lib.requeue_interrupted_cache_jobs().unwrap(), 1);
+        assert_eq!(status_of(&lib, a).0, "pending");
+        assert_eq!(status_of(&lib, b).0, "cached", "finished rows are left alone");
+    }
+
+    /// Missing files are marked, and — the half that used to be missing —
+    /// files that come back (an external drive reconnected) are unmarked.
+    #[test]
+    fn verify_files_tracks_files_disappearing_and_coming_back() {
+        let dir = std::env::temp_dir().join(format!("raw-editor-verify-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("x.nef");
+        std::fs::write(&path, b"raw").unwrap();
+
+        let lib = in_memory_library();
+        let id = lib.import_image(path.to_str().unwrap(), "x.nef").unwrap();
+        assert_eq!(lib.verify_files().unwrap(), 0);
+        assert_eq!(status_of(&lib, id).1, "exists");
+
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(lib.verify_files().unwrap(), 1);
+        assert_eq!(status_of(&lib, id).1, "deleted");
+
+        std::fs::write(&path, b"raw").unwrap();
+        assert_eq!(lib.verify_files().unwrap(), 0);
+        assert_eq!(status_of(&lib, id).1, "exists");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── batched writes ────────────────────────────────────────────────────────
 
     #[test]
-    fn test_get_pending_images_limit() {
+    fn set_ratings_and_flags_apply_to_every_id() {
         let lib = in_memory_library();
-        for i in 0..5 {
-            lib.import_image(&format!("/img{}.nef", i), &format!("img{}.nef", i)).unwrap();
-        }
-        let pending = lib.get_pending_images(2).unwrap();
-        assert_eq!(pending.len(), 2);
-    }
-}
+        let ids: Vec<i64> = (0..5)
+            .map(|i| lib.import_image(&format!("/{i}.nef"), "x.nef").unwrap())
+            .collect();
+        lib.set_ratings(&ids[..3], 4).unwrap();
+        lib.set_flags(&ids[2..], -1).unwrap();
 
-// Implement Debug for better error messages
-impl std::fmt::Debug for Library {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Library")
-            .field("db_path", &self.db_path)
-            .finish()
+        let images = lib.get_all_images().unwrap();
+        let by_id = |id: i64| images.iter().find(|i| i.id == id).unwrap();
+        assert!(ids[..3].iter().all(|&id| by_id(id).rating == 4));
+        assert!(ids[3..].iter().all(|&id| by_id(id).rating == 0));
+        assert!(ids[2..].iter().all(|&id| by_id(id).flag == -1));
+        assert!(ids[..2].iter().all(|&id| by_id(id).flag == 0));
     }
-}
 
-/// Async helper to load the database
-pub async fn load_database(_path: String) -> Result<Vec<super::models::Image>, String> {
-    match Library::new() {
-        Ok(lib) => {
-            if lib.migrate_cache_version().unwrap_or(false) {
-                for tier in ["thumb", "instant", "working"] {
-                    if let Some(mut dir) = dirs_next::cache_dir() {
-                        dir.push("raw-editor");
-                        dir.push(tier);
-                        if let Err(e) = std::fs::remove_dir_all(&dir) {
-                            tracing::warn!("Could not clear stale cache tier {tier}: {e}");
-                        }
-                    }
-                }
-            }
-            let _ = lib.verify_cache_paths();
-            let _ = lib.verify_files();
-            match lib.get_all_images() {
-            Ok(images) => Ok(images),
-            Err(e) => Err(format!("Failed to load images: {}", e)),
-            }
+    #[test]
+    fn save_edit_params_many_writes_each_image_its_own_params() {
+        let lib = in_memory_library();
+        let a = lib.import_image("/a.nef", "a.nef").unwrap();
+        let b = lib.import_image("/b.nef", "b.nef").unwrap();
+        let mut pa = crate::core::types::EditParams::default();
+        pa.exposure = 1.0;
+        let mut pb = crate::core::types::EditParams::default();
+        pb.exposure = -2.0;
+
+        assert_eq!(lib.save_edit_params_many(&[(a, pa), (b, pb)]).unwrap(), 2);
+        assert_eq!(lib.load_edit_params(a).unwrap().exposure, 1.0);
+        assert_eq!(lib.load_edit_params(b).unwrap().exposure, -2.0);
+    }
+
+    /// Crop mode is UI state: a flush while the crop tool is open must not
+    /// make the image reopen (or export) in the tool's visualisation.
+    #[test]
+    fn the_crop_tool_flag_is_never_persisted() {
+        let lib = in_memory_library();
+        let id = lib.import_image("/c.nef", "c.nef").unwrap();
+        let mut p = crate::core::types::EditParams::default();
+        p.crop = [0.1, 0.1, 0.5, 0.5];
+        p.is_cropping = 1;
+        lib.save_edit_params(id, &p).unwrap();
+
+        let loaded = lib.load_edit_params(id).unwrap();
+        assert_eq!(loaded.is_cropping, 0);
+        assert_eq!(loaded.crop, [0.1, 0.1, 0.5, 0.5]);
+    }
+
+    /// Rows written by older builds, with the flag set, heal on load.
+    #[test]
+    fn a_legacy_row_with_the_crop_tool_flag_loads_without_it() {
+        let lib = in_memory_library();
+        let id = lib.import_image("/d.nef", "d.nef").unwrap();
+        let mut json: serde_json::Value =
+            serde_json::from_str(&crate::core::types::EditParams::default().to_json().unwrap())
+                .unwrap();
+        json["is_cropping"] = 1.into();
+        lib.conn
+            .execute(
+                "INSERT INTO edits (image_id, settings_json) VALUES (?1, ?2)",
+                rusqlite::params![id, json.to_string()],
+            )
+            .unwrap();
+        assert_eq!(lib.load_edit_params(id).unwrap().is_cropping, 0);
+    }
+
+    /// Ties on `imported_at` (a whole import shares one timestamp) must come
+    /// back in a fixed order, not whatever the filesystem listed.
+    #[test]
+    fn images_from_one_import_have_a_stable_order() {
+        let lib = in_memory_library();
+        for name in ["/b.nef", "/a.nef", "/c.nef"] {
+            lib.conn
+                .execute(
+                    "INSERT INTO images (path, filename, imported_at) VALUES (?1, ?1, 500)",
+                    [name],
+                )
+                .unwrap();
         }
-        Err(e) => Err(format!("Failed to initialize library: {}", e)),
+        let paths: Vec<String> = lib.get_all_images().unwrap().into_iter().map(|i| i.path).collect();
+        assert_eq!(paths, vec!["/c.nef", "/b.nef", "/a.nef"]);
     }
 }

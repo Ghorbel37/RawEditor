@@ -166,8 +166,7 @@ pub fn handle_toggle_crop(editor: &mut RawEditor) -> Task<Message> {
     } else {
         editor.drag_mode = DragMode::None;
     }
-    // Phase 135: Sync to edit params for GPU visualization
-    editor.current_edit_params.is_cropping = if editor.is_cropping { 1 } else { 0 };
+    // update_pipeline mirrors is_cropping into the params for the shader.
     update_pipeline(editor)
 }
 
@@ -397,17 +396,23 @@ pub fn handle_paste_settings(editor: &mut RawEditor) -> Task<Message> {
     // Other images in the selection: load each one's own params and merge into
     // them. Writing `current_edit_params` wholesale (as this used to) would
     // overwrite the categories the user chose NOT to copy.
+    // Written in one transaction: a paste onto a few hundred images used to
+    // commit once per image on the UI thread.
     let mut others = 0usize;
     if let Some(lib) = &editor.library {
-        for &id in &editor.multi_selection {
-            if Some(id) == editor.selected_image_id {
-                continue;
-            }
-            let mut target = lib.load_edit_params(id).unwrap_or_default();
-            crate::core::types::apply_categories(&mut target, &clip.params, clip.categories);
-            if lib.save_edit_params(id, &target).is_ok() {
-                others += 1;
-            }
+        let merged: Vec<(i64, crate::core::types::EditParams)> = editor
+            .multi_selection
+            .iter()
+            .filter(|&&id| Some(id) != editor.selected_image_id)
+            .map(|&id| {
+                let mut target = lib.load_edit_params(id).unwrap_or_default();
+                crate::core::types::apply_categories(&mut target, &clip.params, clip.categories);
+                (id, target)
+            })
+            .collect();
+        match lib.save_edit_params_many(&merged) {
+            Ok(n) => others = n,
+            Err(e) => tracing::error!("Failed to paste onto {} image(s): {e}", merged.len()),
         }
     }
 
@@ -437,6 +442,7 @@ pub fn handle_paste_settings(editor: &mut RawEditor) -> Task<Message> {
 #[allow(clippy::too_many_arguments)]
 pub fn handle_render_finished(
     editor: &mut RawEditor,
+    image_id: i64,
     bytes: std::sync::Arc<[u8]>,
     dims: (u32, u32),
     view_rect: [f32; 4],
@@ -445,15 +451,20 @@ pub fn handle_render_finished(
     render_ms: f32,
     update_ms: f32,
 ) -> Task<Message> {
-    editor.rendered_preview_bytes = Some(bytes);
-    editor.rendered_preview_dims = dims;
-    // Buffer and window swap in the same frame — see the note in
-    // trigger_async_render about why this is not published earlier.
-    editor.rendered_view_rect = view_rect;
-    editor.bump_preview_generation();
-    *editor.histogram_data.borrow_mut() = data;
-    editor.histogram_cache.clear();
-    editor.canvas_cache.clear();
+    // A render of the image the user has since navigated away from: drop the
+    // pixels, but still release the throttle below so the next render runs.
+    let current = editor.image_resources.as_ref().map(|r| r.image_id);
+    if current == Some(image_id) && !bytes.is_empty() {
+        editor.rendered_preview_bytes = Some(bytes);
+        editor.rendered_preview_dims = dims;
+        // Buffer and window swap in the same frame — see the note in
+        // trigger_async_render about why this is not published earlier.
+        editor.rendered_view_rect = view_rect;
+        editor.bump_preview_generation();
+        *editor.histogram_data.borrow_mut() = data;
+        editor.histogram_cache.clear();
+        editor.canvas_cache.clear();
+    }
 
     editor.profiler.push_frame(crate::core::profiler::ProfilerFrame {
         update_ms,
@@ -548,6 +559,7 @@ pub fn trigger_async_render(editor: &mut RawEditor) -> Task<Message> {
         let update_ms = t_update_start.elapsed().as_secs_f32() * 1000.0;
 
         let (hist_w, hist_h) = resources.histogram_dims();
+        let image_id = resources.image_id;
 
         return Task::perform(
             async move {
@@ -566,9 +578,10 @@ pub fn trigger_async_render(editor: &mut RawEditor) -> Task<Message> {
                     update_ms,
                 ))
             },
-            |res| match res {
+            move |res| match res {
                 Some((byte_arc, histogram, tw, th, vr, upload_ms, render_ms, update_ms)) => {
                     Message::RenderFinished(
+                        image_id,
                         byte_arc,
                         (tw, th),
                         vr,
@@ -597,11 +610,11 @@ pub fn handle_toggle_wb_picker(editor: &mut RawEditor) -> Task<Message> {
     }
     editor.is_wb_picking = !editor.is_wb_picking;
     if editor.is_wb_picking {
-        // Tools are mutually exclusive; leaving crop mode also clears its GPU flag.
+        // Tools are mutually exclusive; update_pipeline below clears the
+        // shader's crop flag to match.
         if editor.is_cropping {
             editor.is_cropping = false;
             editor.drag_mode = DragMode::None;
-            editor.current_edit_params.is_cropping = 0;
         }
         editor.mask_tool = crate::app::state::MaskTool::Inactive;
         editor.selected_mask = None;
@@ -627,7 +640,9 @@ pub fn handle_wb_picked(editor: &mut RawEditor, u: f32, v: f32) -> Task<Message>
         editor.status = "WB picker: raw data not in memory (reopen the image)".to_string();
         return Task::none();
     };
-    if raw.data.is_empty() || raw.width == 0 || raw.height == 0 {
+    // The 16×16 sample window below needs room on both sides; `clamp(8, w-9)`
+    // panics outright on anything narrower.
+    if raw.data.is_empty() || raw.width < 17 || raw.height < 17 {
         editor.is_wb_picking = false;
         editor.status = "WB picker: no raw pixels available".to_string();
         return Task::none();
@@ -671,7 +686,7 @@ pub fn handle_wb_picked(editor: &mut RawEditor, u: f32, v: f32) -> Task<Message>
             counts[channel] += 1;
         }
     }
-    if counts.iter().any(|&c| c == 0) {
+    if counts.contains(&0) {
         return Task::none();
     }
     let r = (sums[0] / counts[0] as f64) as f32;
@@ -821,6 +836,7 @@ pub(crate) fn update_pipeline(editor: &mut RawEditor) -> Task<Message> {
     // an fsync per event on the UI thread. `flush_edits` at the commit points
     // (CommitEdit, drag release, image/tab switch, close) does the write.
     editor.mark_edits_dirty();
+    editor.sync_tool_flags();
     // EditParams is Copy, so this sidesteps the borrow conflict for free.
     let params = editor.current_edit_params;
     push_uniforms_and_render(editor, &params)

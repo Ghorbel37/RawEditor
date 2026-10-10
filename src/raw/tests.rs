@@ -1,63 +1,3 @@
-use super::processor::normalize_pixel;
-
-// ── Crop loop regression ─────────────────────────────────────────────────────
-// Simulates the crop loop from raw/loader.rs to verify the labeled-break fix.
-// Previously `break` only exited the inner loop; now `break 'outer` exits both.
-
-fn simulate_crop(
-    full_data: &[u16],
-    full_width: usize,
-    full_height: usize,
-    top: usize,
-    left: usize,
-    crop_width: usize,
-    crop_height: usize,
-) -> Vec<u16> {
-    let mut cropped = Vec::new();
-    'outer: for y in 0..crop_height {
-        let src_y = top + y;
-        if src_y >= full_height {
-            break 'outer;
-        }
-        let src_start = src_y * full_width + left;
-        let src_end = src_start + crop_width;
-        if src_start < full_data.len() && src_end <= full_data.len() {
-            cropped.extend_from_slice(&full_data[src_start..src_end]);
-        }
-    }
-    cropped
-}
-
-#[test]
-fn test_crop_normal_case() {
-    // 4×4 grid, crop the centre 2×2
-    let data: Vec<u16> = (0..16).collect();
-    let cropped = simulate_crop(&data, 4, 4, 1, 1, 2, 2);
-    assert_eq!(cropped, vec![5, 6, 9, 10]);
-}
-
-#[test]
-fn test_crop_clamps_to_data_boundary() {
-    // crop_height larger than available rows — must not panic and must stop early
-    let data: Vec<u16> = (0..8).collect(); // 4×2 grid
-    let cropped = simulate_crop(&data, 4, 2, 0, 0, 4, 10); // request 10 rows, only 2 exist
-    assert_eq!(cropped.len(), 8); // only 2 actual rows × 4 pixels
-}
-
-#[test]
-fn test_crop_top_offset_past_end_returns_empty() {
-    let data: Vec<u16> = (0..8).collect();
-    let cropped = simulate_crop(&data, 4, 2, 99, 0, 4, 4); // top far beyond data
-    assert!(cropped.is_empty(), "Expected empty crop, got {:?}", cropped);
-}
-
-#[test]
-fn test_crop_zero_crop_dimensions() {
-    let data: Vec<u16> = (0..16).collect();
-    let cropped = simulate_crop(&data, 4, 4, 0, 0, 0, 0);
-    assert!(cropped.is_empty());
-}
-
 // ── Black-level histogram loop regression ────────────────────────────────────
 // The `break` inside the inner loop previously only exited the x-loop.
 // This simulates the fixed loop (labeled break) and verifies counts are correct.
@@ -197,7 +137,7 @@ fn test_export_dims_tiny_crop() {
 // ── Export buffer alignment guard ────────────────────────────────────────────
 
 fn validate_export_buffer(bytes: &[u8]) -> Result<(), String> {
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return Err(format!(
             "Export buffer length {} is not a multiple of 4",
             bytes.len()
@@ -232,47 +172,4 @@ fn test_system_time_unwrap_or_default_is_safe() {
         .unwrap_or_default()
         .as_secs() as i64;
     assert_eq!(secs, 0, "Pre-epoch time must not panic and must return 0");
-}
-
-#[test]
-fn test_normalization() {
-    // Test 1: 12-bit sensor data (0-4095)
-    // Black=0, White=4095, Input=2048 (approx mid-grey)
-    let black = 0;
-    let white = 4095;
-    let input = 2048;
-
-    let result = normalize_pixel(input, black, white);
-
-    // 2048 / 4095 = 0.500122...
-    assert!(
-        (result - 0.5).abs() < 0.001,
-        "Expected approx 0.5, got {}",
-        result
-    );
-}
-
-#[test]
-fn test_black_level_subtraction() {
-    // Test 2: Black level subtraction
-    // Input matches black level -> should be 0.0
-    let black = 100;
-    let white = 4095;
-    let input = 100;
-
-    let result = normalize_pixel(input, black, white);
-
-    assert_eq!(result, 0.0, "Expected 0.0 for input == black level");
-}
-
-#[test]
-fn test_clipping() {
-    let black = 100;
-    let white = 4095;
-
-    // Below black
-    assert_eq!(normalize_pixel(50, black, white), 0.0);
-
-    // Above white
-    assert_eq!(normalize_pixel(5000, black, white), 1.0);
 }

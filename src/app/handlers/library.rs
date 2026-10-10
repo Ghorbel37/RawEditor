@@ -1,6 +1,6 @@
 use iced::Task;
 use rusqlite::{Connection, OptionalExtension};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -23,15 +23,17 @@ pub fn handle_database_loaded(editor: &mut RawEditor, result: Result<Vec<crate::
                     use iced::window;
                     let maximize_window = window::get_latest().and_then(|id| window::maximize(id, true));
 
+                    let scale = crate::app::handlers::window::query_scale_factor();
                     if let Some(lib) = &editor.library {
                         let db_path = lib.path().clone();
                         editor.pending_cache_count = lib.count_pending_cache().unwrap_or(0);
                         return Task::batch(vec![
                             maximize_window,
+                            scale,
                             spawn_cache_workers(db_path),
                         ]);
                     }
-                    return maximize_window;
+                    return Task::batch(vec![maximize_window, scale]);
                 }
                 Err(e) => editor.status = format!("Failed to create library: {:?}", e),
             }
@@ -42,40 +44,39 @@ pub fn handle_database_loaded(editor: &mut RawEditor, result: Result<Vec<crate::
 }
 
 pub fn handle_import_folder(editor: &mut RawEditor) -> Task<Message> {
-    let Some(library) = &editor.library else {
+    if editor.library.is_none() {
         return Task::none();
-    };
+    }
     // AsyncFileDialog, not the blocking FileDialog: the blocking one runs the
     // native picker's event loop inside `update`, freezing the whole window
     // for as long as the dialog is open. The export path already does it this
     // way (handlers::export::handle_pick_export_base_path).
-    let db_path = library.path().clone();
     Task::perform(
-        async move {
-            let folder = rfd::AsyncFileDialog::new()
+        async {
+            rfd::AsyncFileDialog::new()
                 .set_title("Select Folder")
                 .pick_folder()
                 .await
-                .map(|handle| handle.path().to_path_buf());
-
-            match folder {
-                Some(folder_path) => Some(import_folder_async(folder_path, db_path).await),
-                None => None,
-            }
+                .map(|handle| handle.path().to_path_buf())
         },
         Message::ImportFolderPicked,
     )
 }
 
 /// Landing point for the async folder picker. `None` means the user cancelled.
+///
+/// The scan is a separate step from the picker so the status bar can say an
+/// import is running — a large card used to show nothing at all until done.
 pub fn handle_import_folder_picked(
     editor: &mut RawEditor,
-    result: Option<ImportResult>,
+    folder: Option<PathBuf>,
 ) -> Task<Message> {
-    match result {
-        Some(import) => handle_import_complete(editor, import),
-        None => Task::none(),
-    }
+    let (Some(folder), Some(library)) = (folder, &editor.library) else {
+        return Task::none();
+    };
+    editor.status = format!("Importing {}…", folder.display());
+    let db_path = library.path().clone();
+    Task::perform(import_folder_async(folder, db_path), Message::ImportComplete)
 }
 
 pub fn handle_import_from_camera(editor: &mut RawEditor) -> Task<Message> {
@@ -83,7 +84,18 @@ pub fn handle_import_from_camera(editor: &mut RawEditor) -> Task<Message> {
     Task::none()
 }
 
-pub fn handle_import_complete(editor: &mut RawEditor, result: ImportResult) -> Task<Message> {
+pub fn handle_import_complete(
+    editor: &mut RawEditor,
+    result: Result<ImportResult, String>,
+) -> Task<Message> {
+    let result = match result {
+        Ok(result) => result,
+        Err(e) => {
+            tracing::error!("Import failed: {e}");
+            editor.status = format!("Import failed: {e}");
+            return Task::none();
+        }
+    };
     if let Some(library) = &editor.library {
         // Full reload is correct here: the import added rows this process has
         // never seen. It runs once per import, not once per cached image.
@@ -147,20 +159,19 @@ pub fn handle_set_rating(editor: &mut RawEditor, rating: u8) -> Task<Message> {
     if editor.active_modal != crate::app::state::Modal::None {
         return Task::none();
     }
-    let ids: Vec<i64> = if !editor.multi_selection.is_empty() { 
-        editor.multi_selection.iter().copied().collect() 
-    } else if let Some(id) = editor.selected_image_id { 
-        vec![id] 
-    } else { 
-        vec![] 
+    let ids = editor.action_target_ids();
+    let Some(lib) = &editor.library else {
+        return Task::none();
     };
-    
-    if let Some(lib) = &editor.library {
-        for &id in &ids {
-            let _ = lib.set_image_rating(id, rating);
-            if let Some(img) = editor.images.iter_mut().find(|i| i.id == id) { img.rating = rating; }
-        }
+    // Memory follows the database: only touch the in-memory rows once the
+    // write has landed, so a failed write can't show ratings that a restart
+    // would silently take back.
+    if let Err(e) = lib.set_ratings(&ids, rating) {
+        tracing::error!("Failed to rate {} image(s): {e}", ids.len());
+        editor.status = format!("Could not save rating: {e}");
+        return Task::none();
     }
+    editor.apply_to_images(&ids, |img| img.rating = rating);
     editor.status = format!("Rated {} image(s)", ids.len());
     if editor.auto_advance {
         return Task::done(Message::SelectNextImage);
@@ -172,20 +183,16 @@ pub fn handle_set_flag(editor: &mut RawEditor, flag: i8) -> Task<Message> {
     if editor.active_modal != crate::app::state::Modal::None {
         return Task::none();
     }
-    let ids: Vec<i64> = if !editor.multi_selection.is_empty() { 
-        editor.multi_selection.iter().copied().collect() 
-    } else if let Some(id) = editor.selected_image_id { 
-        vec![id] 
-    } else { 
-        vec![] 
+    let ids = editor.action_target_ids();
+    let Some(lib) = &editor.library else {
+        return Task::none();
     };
-    
-    if let Some(lib) = &editor.library {
-        for &id in &ids {
-            let _ = lib.set_image_flag(id, flag);
-            if let Some(img) = editor.images.iter_mut().find(|i| i.id == id) { img.flag = flag; }
-        }
+    if let Err(e) = lib.set_flags(&ids, flag) {
+        tracing::error!("Failed to flag {} image(s): {e}", ids.len());
+        editor.status = format!("Could not save flag: {e}");
+        return Task::none();
     }
+    editor.apply_to_images(&ids, |img| img.flag = flag);
     editor.status = format!("Flagged {} image(s)", ids.len());
     if editor.auto_advance {
         return Task::done(Message::SelectNextImage);
@@ -358,35 +365,76 @@ fn spawn_cache_workers(db_path: PathBuf) -> Task<Message> {
 
 // Helpers
 
-async fn import_folder_async(folder_path: PathBuf, db_path: PathBuf) -> ImportResult {
-    tokio::task::spawn_blocking(move || {
-        let mut imported_count = 0;
-        let mut skipped_count = 0;
-        let conn = Connection::open(&db_path).expect("Failed to open database");
-        crate::database::library::apply_pragmas(&conn);
-        for entry in WalkDir::new(&folder_path).into_iter().filter_map(|e| e.ok()) {
-            let path = entry.path();
-            if path.is_file() {
-                if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-                    let ext_lower = ext.to_lowercase();
-                    if ["nef", "cr2", "arw", "dng", "orf", "rw2"].contains(&ext_lower.as_str()) {
-                        let path_str = path.to_string_lossy().to_string();
-                        let filename = path.file_name().unwrap().to_string_lossy().to_string();
-                        let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM images WHERE path = ?1)", [&path_str], |row| row.get(0)).unwrap_or(false);
-                        if !exists {
-                            let now = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs() as i64;
-                            conn.execute("INSERT INTO images (path, filename, imported_at, cache_status) VALUES (?1, ?2, ?3, 'pending')", (&path_str, &filename, &now)).expect("Failed to insert image");
-                            imported_count += 1;
-                        } else { skipped_count += 1; }
-                    }
-                }
-            }
+async fn import_folder_async(
+    folder_path: PathBuf,
+    db_path: PathBuf,
+) -> Result<ImportResult, String> {
+    tokio::task::spawn_blocking(move || import_folder_blocking(&folder_path, &db_path))
+        .await
+        .map_err(|e| format!("Import task failed: {e}"))?
+}
+
+/// Add every supported RAW under `folder` to the catalogue.
+///
+/// One transaction for the whole folder: it used to commit (and query for
+/// existence) once per file, and an error halfway through `expect`-panicked
+/// the import thread, leaving a partial import behind. `INSERT OR IGNORE`
+/// leans on the `path UNIQUE` constraint to skip files already catalogued.
+fn import_folder_blocking(folder: &Path, db_path: &Path) -> Result<ImportResult, String> {
+    let files = collect_raw_files(folder);
+    let mut conn =
+        Connection::open(db_path).map_err(|e| format!("Could not open the catalogue: {e}"))?;
+    crate::database::library::apply_pragmas(&conn);
+
+    // One timestamp for the batch, so its files sort as one group (by path)
+    // instead of splitting wherever the wall clock ticked over a second.
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    let db_err = |e: rusqlite::Error| format!("Catalogue write failed: {e}");
+    let tx = conn.transaction().map_err(db_err)?;
+    let mut imported_count = 0;
+    {
+        let mut insert = tx
+            .prepare(
+                "INSERT OR IGNORE INTO images (path, filename, imported_at, cache_status)
+                 VALUES (?1, ?2, ?3, 'pending')",
+            )
+            .map_err(db_err)?;
+        for path in &files {
+            let filename = path
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            imported_count += insert
+                .execute(rusqlite::params![path.to_string_lossy(), filename, now])
+                .map_err(db_err)?;
         }
-        ImportResult { imported_count, skipped_count }
-    }).await.expect("Import task failed")
+    }
+    tx.commit().map_err(db_err)?;
+
+    Ok(ImportResult {
+        imported_count,
+        skipped_count: files.len() - imported_count,
+    })
+}
+
+/// Supported RAW files under `folder`, recursively, in file-name order.
+///
+/// Skips macOS `._` AppleDouble sidecars: they carry the RAW's extension but
+/// hold only Finder metadata, and copying a card through a Mac leaves one
+/// beside every photo — each would otherwise import as a broken image.
+fn collect_raw_files(folder: &Path) -> Vec<PathBuf> {
+    WalkDir::new(folder)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| !entry.file_name().to_string_lossy().starts_with("._"))
+        .map(walkdir::DirEntry::into_path)
+        .filter(|path| raw::is_supported_raw(path) && path.is_file())
+        .collect()
 }
 
 async fn process_cache_async(db_path: PathBuf) -> Result<(i64, String, String, String), (i64, String)> {
@@ -415,8 +463,7 @@ async fn process_cache_async(db_path: PathBuf) -> Result<(i64, String, String, S
     };
 
     let result = tokio::task::spawn_blocking(move || {
-        let cache_dir = raw::preview::get_preview_cache_dir();
-        raw::processor::process_image(std::path::Path::new(&path), id, &cache_dir)
+        raw::processor::process_image(std::path::Path::new(&path), id)
     }).await.map_err(|e| (id, format!("Join Error: {}", e)))?;
 
     match result {
@@ -545,5 +592,54 @@ mod tests {
         let e = folder_editor();
         assert!(images_in_folder(&e, "/photos/nope").is_empty());
         assert_eq!(folder_image_count(&e, "/photos/2024"), 2);
+    }
+
+    // ── import ────────────────────────────────────────────────────────────────
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("raw-editor-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn collect_raw_files_is_sorted_and_skips_sidecars_and_other_files() {
+        let dir = scratch_dir("collect");
+        for name in ["b.NEF", "a.nef", "._a.nef", "notes.txt", "c.jpg", "sub/d.cr3"] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        let names: Vec<String> = collect_raw_files(&dir)
+            .iter()
+            .map(|p| p.strip_prefix(&dir).unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["a.nef", "b.NEF", "sub/d.cr3"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Re-importing a folder adds only what is new, and reports the rest as
+    /// skipped instead of failing on the UNIQUE path constraint.
+    #[test]
+    fn importing_twice_only_adds_new_files() {
+        let dir = scratch_dir("import");
+        let db = dir.join("catalogue.db");
+        drop(crate::database::library::Library::open_at(&db).unwrap());
+        std::fs::write(dir.join("a.nef"), b"x").unwrap();
+
+        let first = import_folder_blocking(&dir, &db).unwrap();
+        assert_eq!((first.imported_count, first.skipped_count), (1, 0));
+
+        std::fs::write(dir.join("b.nef"), b"x").unwrap();
+        let second = import_folder_blocking(&dir, &db).unwrap();
+        assert_eq!((second.imported_count, second.skipped_count), (1, 1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_reports_an_unopenable_catalogue_instead_of_panicking() {
+        let dir = scratch_dir("import-err");
+        let db = dir.join("no-such-dir").join("catalogue.db");
+        assert!(import_folder_blocking(&dir, &db).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

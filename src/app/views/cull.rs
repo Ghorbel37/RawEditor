@@ -76,11 +76,12 @@ fn view_overlay(editor: &RawEditor, id: i64) -> Element<'_, Message> {
     match editor.info_overlay {
         crate::app::state::InfoOverlayState::Hidden => container(column![]).into(),
         crate::app::state::InfoOverlayState::Metadata => {
-            container(column![
-                text(format!("{} {}", editor.current_metadata.as_ref().map(|m| m.make.clone()).unwrap_or_default(), editor.current_metadata.as_ref().map(|m| m.model.clone()).unwrap_or_default())).size(12).style(|_| text::Style { color: Some(Color::WHITE) }),
-                text(editor.current_metadata.as_ref().map(|m| m.lens.clone()).unwrap_or_default()).size(12).style(|_| text::Style { color: Some(Color::WHITE) }),
-                text(format!("ISO {}  {}  f/{}", editor.current_metadata.as_ref().map(|m| m.iso.to_string()).unwrap_or("---".to_string()), editor.current_metadata.as_ref().map(|m| m.shutter_speed.clone()).unwrap_or("---".to_string()), editor.current_metadata.as_ref().map(|m| m.aperture.to_string()).unwrap_or("---".to_string()))).size(12).style(|_| text::Style { color: Some(Color::WHITE) }),
-            ].spacing(2)).padding(10).style(|_| container::Style { background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.6))), border: iced::border::Border { radius: 5.0.into(), ..Default::default() }, ..Default::default() }).into()
+            let lines = super::develop::metadata_lines(editor)
+                .into_iter()
+                .fold(column![].spacing(2), |col, line| {
+                    col.push(text(line).size(12).style(|_| text::Style { color: Some(Color::WHITE) }))
+                });
+            container(lines).padding(10).style(|_| container::Style { background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.6))), border: iced::border::Border { radius: 5.0.into(), ..Default::default() }, ..Default::default() }).into()
         }
         crate::app::state::InfoOverlayState::CacheDebug => {
             let (before, after) = count_cached_neighbors(editor, id);
@@ -105,28 +106,19 @@ fn view_empty_state() -> Element<'static, Message> {
     ].padding(40).align_x(Alignment::Center)).width(Length::Fill).height(Length::Fill).center_x(Length::Fill).center_y(Length::Fill).into()
 }
 
-fn count_cached_neighbors(editor: &RawEditor, id: i64) -> (i32, i32) {
-    let mut before = 0;
-    let mut after = 0;
-    if let Some(current_idx) = editor.images.iter().position(|i| i.id == id) {
-        let total = editor.images.len() as isize;
-        let behind_limit = editor.preview_preload_behind;
-        let ahead_limit = editor.preview_preload_ahead;
-
-        for i in 1..=behind_limit {
-            let mut idx = current_idx as isize - i as isize;
-            if idx < 0 { idx += total; }
-            if let Some(img) = editor.images.get(idx as usize) {
-                if editor.preview_cache.contains(&img.id) { before += 1; }
-            }
-        }
-        for i in 1..=ahead_limit {
-            let mut idx = current_idx as isize + i as isize;
-            if idx >= total { idx -= total; }
-            if let Some(img) = editor.images.get(idx as usize) {
-                if editor.preview_cache.contains(&img.id) { after += 1; }
-            }
-        }
-    }
+/// Cached previews within the preload window, behind and ahead — in display
+/// order, the same order the preloader and the arrow keys use.
+fn count_cached_neighbors(editor: &RawEditor, id: i64) -> (usize, usize) {
+    let ids = editor.displayed_ids();
+    let Some(current) = ids.iter().position(|&i| i == id) else {
+        return (0, 0);
+    };
+    let n = ids.len();
+    let cached = |offset: usize, back: bool| {
+        let i = if back { (current + n - offset % n) % n } else { (current + offset) % n };
+        editor.preview_cache.contains(&ids[i])
+    };
+    let before = (1..=editor.preview_preload_behind.min(n - 1)).filter(|&o| cached(o, true)).count();
+    let after = (1..=editor.preview_preload_ahead.min(n - 1)).filter(|&o| cached(o, false)).count();
     (before, after)
 }

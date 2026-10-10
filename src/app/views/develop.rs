@@ -55,6 +55,8 @@ pub fn view_develop(editor: &RawEditor) -> Element<'_, Message> {
 }
 
 fn view_sidebar(editor: &RawEditor) -> iced::widget::Column<'_, Message> {
+    // Slider reset targets (Ctrl/Cmd+click).
+    let d = crate::core::types::EditParams::default();
     let histogram_toggle =
         checkbox("Show Histogram", editor.histogram_enabled).on_toggle(Message::HistogramToggled);
 
@@ -90,42 +92,42 @@ fn view_sidebar(editor: &RawEditor) -> iced::widget::Column<'_, Message> {
         .push(text("Tone").size(14))
         .push(slider_row(
             "Exposure",
-            editor.current_edit_params.exposure,
+            editor.current_edit_params.exposure, d.exposure,
             -5.0..=5.0,
             0.1,
             Message::ExposureChanged,
         ))
         .push(slider_row(
             "Contrast",
-            editor.current_edit_params.contrast,
+            editor.current_edit_params.contrast, d.contrast,
             -10.0..=10.0,
             0.005,
             Message::ContrastChanged,
         ))
         .push(slider_row(
             "Highlights",
-            editor.current_edit_params.highlights,
+            editor.current_edit_params.highlights, d.highlights,
             -1.0..=1.0,
             0.01,
             Message::HighlightsChanged,
         ))
         .push(slider_row(
             "Shadows",
-            editor.current_edit_params.shadows,
+            editor.current_edit_params.shadows, d.shadows,
             -1.0..=1.0,
             0.01,
             Message::ShadowsChanged,
         ))
         .push(slider_row(
             "Whites",
-            editor.current_edit_params.whites,
+            editor.current_edit_params.whites, d.whites,
             0.8..=1.2,
             0.01,
             Message::WhitesChanged,
         ))
         .push(slider_row(
             "Blacks",
-            editor.current_edit_params.blacks,
+            editor.current_edit_params.blacks, d.blacks,
             0.0..=0.2,
             0.005,
             Message::BlacksChanged,
@@ -163,7 +165,7 @@ fn view_sidebar(editor: &RawEditor) -> iced::widget::Column<'_, Message> {
             let kelvin = editor.current_edit_params.kelvin_from_anchor(as_k);
             slider_row_display(
                 "Temp",
-                editor.current_edit_params.temperature,
+                editor.current_edit_params.temperature, d.temperature,
                 -1.0..=1.0,
                 0.01,
                 format!("{:.0}K", kelvin),
@@ -175,7 +177,7 @@ fn view_sidebar(editor: &RawEditor) -> iced::widget::Column<'_, Message> {
             let tint = editor.current_edit_params.tint_from_anchor(as_t);
             slider_row_display(
                 "Tint",
-                editor.current_edit_params.tint,
+                editor.current_edit_params.tint, d.tint,
                 -1.0..=1.0,
                 0.01,
                 format!("{:+.0}", tint),
@@ -184,14 +186,14 @@ fn view_sidebar(editor: &RawEditor) -> iced::widget::Column<'_, Message> {
         })
         .push(slider_row(
             "Vibrance",
-            editor.current_edit_params.vibrance,
+            editor.current_edit_params.vibrance, d.vibrance,
             -1.0..=1.0,
             0.01,
             Message::VibranceChanged,
         ))
         .push(slider_row(
             "Saturation",
-            editor.current_edit_params.saturation,
+            editor.current_edit_params.saturation, d.saturation,
             -100.0..=100.0,
             1.0,
             Message::SaturationChanged,
@@ -199,28 +201,28 @@ fn view_sidebar(editor: &RawEditor) -> iced::widget::Column<'_, Message> {
         .push(text("Detail").size(14))
         .push(slider_row(
             "Luma Denoise",
-            editor.current_edit_params.luma_noise,
+            editor.current_edit_params.luma_noise, d.luma_noise,
             0.0..=2.0,
             0.01,
             Message::LumaNoiseChanged,
         ))
         .push(slider_row(
             "Color Denoise",
-            editor.current_edit_params.color_noise,
+            editor.current_edit_params.color_noise, d.color_noise,
             0.0..=2.0,
             0.01,
             Message::ColorNoiseChanged,
         ))
         .push(slider_row(
             "Sharpen",
-            editor.current_edit_params.sharpening,
+            editor.current_edit_params.sharpening, d.sharpening,
             0.0..=2.0,
             0.01,
             Message::SharpeningChanged,
         ))
         .push(slider_row(
             "Masking",
-            editor.current_edit_params.sharpen_masking,
+            editor.current_edit_params.sharpen_masking, d.sharpen_masking,
             0.0..=1.0,
             0.01,
             Message::SharpenMaskingChanged,
@@ -228,7 +230,7 @@ fn view_sidebar(editor: &RawEditor) -> iced::widget::Column<'_, Message> {
         .push(text("Geometry").size(14))
         .push(slider_row(
             "Rotate",
-            editor.current_edit_params.rotation,
+            editor.current_edit_params.rotation, d.rotation,
             -45.0..=45.0,
             0.1,
             Message::RotationChanged,
@@ -294,25 +296,9 @@ fn view_sidebar(editor: &RawEditor) -> iced::widget::Column<'_, Message> {
                 button(text("Reset").size(12))
                     .style(ui::styles::NeutralButton::style)
                     .on_press(Message::SetCrop([0.0, 0.0, 1.0, 1.0])),
-                button(text("1:1").size(12))
-                    .style(ui::styles::NeutralButton::style)
-                    .on_press_maybe(editor.image_resources.as_ref().map(|res| Message::SetCrop(RawEditor::calculate_center_crop(
-                        1.0, res.width, res.height,
-                    )))),
-                button(text("16:9").size(12))
-                    .style(ui::styles::NeutralButton::style)
-                    .on_press_maybe(editor.image_resources.as_ref().map(|res| Message::SetCrop(RawEditor::calculate_center_crop(
-                        16.0 / 9.0,
-                        res.width,
-                        res.height,
-                    )))),
-                button(text("2:3").size(12))
-                    .style(ui::styles::NeutralButton::style)
-                    .on_press_maybe(editor.image_resources.as_ref().map(|res| Message::SetCrop(RawEditor::calculate_center_crop(
-                        2.0 / 3.0,
-                        res.width,
-                        res.height,
-                    )))),
+                aspect_crop_button(editor, "1:1", 1.0),
+                aspect_crop_button(editor, "16:9", 16.0 / 9.0),
+                aspect_crop_button(editor, "2:3", 2.0 / 3.0),
             ]
             .spacing(5),
         );
@@ -351,7 +337,7 @@ fn view_sidebar(editor: &RawEditor) -> iced::widget::Column<'_, Message> {
                     editor.current_edit_params.black_offsets[0],
                     |v| Message::BlackOffsetChanged(0, v),
                 )
-                .step(0.1),
+                .step(0.1_f32),
             )
             .push(
                 text(format!(
@@ -366,7 +352,7 @@ fn view_sidebar(editor: &RawEditor) -> iced::widget::Column<'_, Message> {
                     editor.current_edit_params.black_offsets[1],
                     |v| Message::BlackOffsetChanged(1, v),
                 )
-                .step(0.1),
+                .step(0.1_f32),
             )
             .push(
                 text(format!(
@@ -381,7 +367,7 @@ fn view_sidebar(editor: &RawEditor) -> iced::widget::Column<'_, Message> {
                     editor.current_edit_params.black_offsets[2],
                     |v| Message::BlackOffsetChanged(2, v),
                 )
-                .step(0.1),
+                .step(0.1_f32),
             )
             .push(
                 text(format!(
@@ -396,7 +382,7 @@ fn view_sidebar(editor: &RawEditor) -> iced::widget::Column<'_, Message> {
                     editor.current_edit_params.black_offsets[3],
                     |v| Message::BlackOffsetChanged(3, v),
                 )
-                .step(0.1),
+                .step(0.1_f32),
             );
     }
 
@@ -417,6 +403,20 @@ fn view_sidebar(editor: &RawEditor) -> iced::widget::Column<'_, Message> {
         )
         .spacing(10)
         .padding(15)
+}
+
+/// A centred crop preset. The crop rectangle lives in display (EXIF-oriented)
+/// space, so the ratio must be solved against the oriented dimensions — the
+/// raw sensor dims are landscape even for a portrait shot, which turned
+/// "16:9" into a tall sliver on every vertical frame.
+fn aspect_crop_button<'a>(editor: &RawEditor, label: &'a str, ratio: f32) -> Element<'a, Message> {
+    button(text(label).size(12))
+        .style(ui::styles::NeutralButton::style)
+        .on_press_maybe(editor.image_resources.as_ref().map(|res| {
+            let (w, h) = res.oriented_dims();
+            Message::SetCrop(RawEditor::calculate_center_crop(ratio, w, h))
+        }))
+        .into()
 }
 
 /// `(has_pixels, overlay)`. The viewport is a wgpu shader fed from
@@ -700,76 +700,21 @@ fn view_main_content<'a>(
                 .into(),
             )
         }
-        crate::app::state::InfoOverlayState::Metadata => container(
-            column![
+        crate::app::state::InfoOverlayState::Metadata => {
+            let mut lines = column![
                 // 100% = one sensor pixel per screen pixel, not "fitted".
                 text(format!("Zoom {:.0}%", editor.zoom_percent()))
                     .size(12)
                     .style(|_| text::Style {
                         color: Some(Color::from_rgb(0.98, 0.45, 0.09))
                     }),
-                text(format!(
-                    "{} {}",
-                    editor
-                        .current_metadata
-                        .as_ref()
-                        .map(|m| m.make.clone())
-                        .unwrap_or_default(),
-                    editor
-                        .current_metadata
-                        .as_ref()
-                        .map(|m| m.model.clone())
-                        .unwrap_or_default()
-                ))
-                .size(12)
-                .style(|_| text::Style {
-                    color: Some(Color::WHITE)
-                }),
-                text(
-                    editor
-                        .current_metadata
-                        .as_ref()
-                        .map(|m| m.lens.clone())
-                        .unwrap_or_default()
-                )
-                .size(12)
-                .style(|_| text::Style {
-                    color: Some(Color::WHITE)
-                }),
-                text(format!(
-                    "ISO {}  {}  f/{}",
-                    editor
-                        .current_metadata
-                        .as_ref()
-                        .map(|m| m.iso.to_string())
-                        .unwrap_or("---".to_string()),
-                    editor
-                        .current_metadata
-                        .as_ref()
-                        .map(|m| m.shutter_speed.clone())
-                        .unwrap_or("---".to_string()),
-                    editor
-                        .current_metadata
-                        .as_ref()
-                        .map(|m| m.aperture.to_string())
-                        .unwrap_or("---".to_string())
-                ))
-                .size(12)
-                .style(|_| text::Style {
-                    color: Some(Color::WHITE)
-                }),
             ]
-            .spacing(2),
-        )
-        .padding(10)
-        .style(|_| container::Style {
-            background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.6))),
-            border: iced::border::Border {
-                radius: 5.0.into(),
-                ..Default::default()
-            },
-            ..Default::default()
-        }),
+            .spacing(2);
+            for line in metadata_lines(editor) {
+                lines = lines.push(info_line(line));
+            }
+            info_panel(lines.into())
+        }
     };
 
     let filename_overlay = container(
@@ -937,43 +882,43 @@ fn push_mask_section<'a>(
                         .size(16)
                         .text_size(13),
                 )
-                .push(slider_row("Exposure", m.exposure, -4.0..=4.0, 0.05, |v| {
+                .push(slider_row("Exposure", m.exposure, 0.0, -4.0..=4.0, 0.05, |v| {
                     Message::MaskAdjustmentChanged(MaskAdjustment::Exposure, v)
                 }))
-                .push(slider_row("Contrast", m.contrast, -1.0..=1.0, 0.01, |v| {
+                .push(slider_row("Contrast", m.contrast, 0.0, -1.0..=1.0, 0.01, |v| {
                     Message::MaskAdjustmentChanged(MaskAdjustment::Contrast, v)
                 }))
                 .push(slider_row(
                     "Highlights",
-                    m.highlights,
+                    m.highlights, 0.0,
                     -1.0..=1.0,
                     0.01,
                     |v| Message::MaskAdjustmentChanged(MaskAdjustment::Highlights, v),
                 ))
-                .push(slider_row("Shadows", m.shadows, -1.0..=1.0, 0.01, |v| {
+                .push(slider_row("Shadows", m.shadows, 0.0, -1.0..=1.0, 0.01, |v| {
                     Message::MaskAdjustmentChanged(MaskAdjustment::Shadows, v)
                 }))
                 .push(slider_row(
                     "Saturation",
-                    m.saturation,
+                    m.saturation, 0.0,
                     -1.0..=1.0,
                     0.01,
                     |v| Message::MaskAdjustmentChanged(MaskAdjustment::Saturation, v),
                 ))
-                .push(slider_row("Warmth", m.warmth, -1.0..=1.0, 0.01, |v| {
+                .push(slider_row("Warmth", m.warmth, 0.0, -1.0..=1.0, 0.01, |v| {
                     Message::MaskAdjustmentChanged(MaskAdjustment::Warmth, v)
                 }))
-                .push(slider_row("Tint", m.tint, -1.0..=1.0, 0.01, |v| {
+                .push(slider_row("Tint", m.tint, 0.0, -1.0..=1.0, 0.01, |v| {
                     Message::MaskAdjustmentChanged(MaskAdjustment::Tint, v)
                 }));
             if m.mask_type == 1 {
                 sidebar = sidebar
-                    .push(slider_row("Feather", m.feather, 0.0..=1.0, 0.01, |v| {
+                    .push(slider_row("Feather", m.feather, 0.5, 0.0..=1.0, 0.01, |v| {
                         Message::MaskAdjustmentChanged(MaskAdjustment::Feather, v)
                     }))
                     .push(slider_row_display(
                         "Rotation",
-                        m.rotation,
+                        m.rotation, 0.0,
                         -180.0..=180.0,
                         1.0,
                         format!("{:.0}°", m.rotation),
@@ -1050,26 +995,27 @@ fn tone_shape_controls(editor: &RawEditor) -> Element<'_, Message> {
     use crate::core::tonemap::ToneMapper;
 
     let p = &editor.current_edit_params;
+    let d = crate::core::types::EditParams::default();
     match p.tone_mapper {
         ToneMapper::Camera => column![slider_row(
             "Profile Curve",
-            p.profile_curve,
+            p.profile_curve, d.profile_curve,
             0.0..=1.0,
             0.01,
             Message::ProfileCurveChanged,
         )]
         .into(),
         ToneMapper::Gt => column![
-            slider_row("Contrast", p.gt.contrast, 0.1..=3.0, 0.01, |v| {
+            slider_row("Contrast", p.gt.contrast, d.gt.contrast, 0.1..=3.0, 0.01, |v| {
                 Message::GtParamChanged(GtParam::Contrast, v)
             }),
-            slider_row("Linear Start", p.gt.linear_start, 0.01..=0.9, 0.01, |v| {
+            slider_row("Linear Start", p.gt.linear_start, d.gt.linear_start, 0.01..=0.9, 0.01, |v| {
                 Message::GtParamChanged(GtParam::LinearStart, v)
             }),
-            slider_row("Linear Length", p.gt.linear_length, 0.0..=1.0, 0.01, |v| {
+            slider_row("Linear Length", p.gt.linear_length, d.gt.linear_length, 0.0..=1.0, 0.01, |v| {
                 Message::GtParamChanged(GtParam::LinearLength, v)
             }),
-            slider_row("Black Tight", p.gt.black_tightness, 0.5..=4.0, 0.01, |v| {
+            slider_row("Black Tight", p.gt.black_tightness, d.gt.black_tightness, 0.5..=4.0, 0.01, |v| {
                 Message::GtParamChanged(GtParam::BlackTightness, v)
             }),
         ]
@@ -1097,6 +1043,24 @@ fn info_panel<'a>(body: Element<'a, Message>) -> Container<'a, Message> {
         })
 }
 
+/// Camera / lens / exposure lines for the `I` overlay, shared with Cull.
+/// Placeholders rather than stale values when the held metadata belongs to a
+/// different image than the one on screen.
+pub(crate) fn metadata_lines(editor: &RawEditor) -> [String; 3] {
+    match editor.selected_metadata() {
+        Some(m) => [
+            format!("{} {}", m.make, m.model),
+            m.lens.clone(),
+            format!("ISO {}  {}  f/{}", m.iso, m.shutter_speed, m.aperture),
+        ],
+        None => [
+            "---".to_string(),
+            String::new(),
+            "ISO ---  ---  f/---".to_string(),
+        ],
+    }
+}
+
 fn info_line<'a>(s: String) -> Element<'a, Message> {
     text(s)
         .size(12)
@@ -1107,6 +1071,7 @@ fn info_line<'a>(s: String) -> Element<'a, Message> {
 fn slider_row<'a, F>(
     label: &'a str,
     value: f32,
+    default: f32,
     range: std::ops::RangeInclusive<f32>,
     step: f32,
     on_change: F,
@@ -1114,15 +1079,19 @@ fn slider_row<'a, F>(
 where
     F: Fn(f32) -> Message + 'a,
 {
-    slider_row_display(label, value, range, step, format!("{:.2}", value), on_change)
+    slider_row_display(label, value, default, range, step, format!("{:.2}", value), on_change)
 }
 
 /// Like `slider_row` but with an explicit value display string — used by the
 /// WB sliders to show real Kelvin / Adobe-tint units while the underlying
 /// slider stays a normalized offset around the as-shot anchor.
+///
+/// Ctrl/Cmd+click resets the slider to `default` (iced's built-in reset);
+/// `update` commits that click as an undo step of its own.
 fn slider_row_display<'a, F>(
     label: &'a str,
     value: f32,
+    default: f32,
     range: std::ops::RangeInclusive<f32>,
     step: f32,
     display: String,
@@ -1139,6 +1108,7 @@ where
                 color: Some(Color::from_rgb(0.7, 0.7, 0.7))
             }),
         slider(range, value, on_change)
+            .default(default)
             .step(step)
             .width(Length::Fill)
             .style(crate::ui::styles::ProSlider::style)
