@@ -28,9 +28,7 @@ use std::sync::Arc;
 
 /// `params` with UI-only state cleared, for "is this the same edit?" checks.
 pub fn edit_key(params: &EditParams) -> EditParams {
-    let mut key = *params;
-    key.is_cropping = 0;
-    key
+    params.without_tool_state()
 }
 
 /// Keep a fresh render's overview as `image_id`'s proxy.

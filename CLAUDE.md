@@ -30,23 +30,25 @@ There is no separate frontend build — this is a single native Rust binary (no 
 - `src/main.rs` — entry point / iced application bootstrap
 - `src/app/` — application state and update loop, split Elm-style:
   - `state.rs` / `message.rs` — `RawEditor` state struct and `Message` enum
-  - `update.rs` + `handlers/{delete,develop,export,library,loading,masks,navigation,scroll,window}.rs` — message handlers grouped by feature area
+  - `update.rs` + `handlers/{delete,develop,export,lens,library,loading,masks,navigation,scroll,window}.rs` — message handlers grouped by feature area
   - `views/{develop,library,cull,export,layout,modals}.rs` — iced view builders per tab/screen
   - `loader.rs` — async multi-tier image loading orchestration
 - `src/gpu/` — the wgpu rendering pipeline (see dual-pass system below):
-  `shaders.rs` (WGSL source), `shared.rs` (`SharedContext` + `ImageResources`:
+  `demosaic.rs` (Pass 1, RCD), `denoise.rs` (cached NR pre-pass), `brush.rs`
+  (mask stroke rasteriser), `shaders.rs` (Pass 2 WGSL), `shared.rs` (`SharedContext` + `ImageResources`:
   pipeline creation, textures, bind groups, uniform uploads), `params.rs`
   (uniform struct layout), `render_functions.rs` (render + readback entry points)
 - `src/raw/` — RAW decoding (`loader`), DCP profiles (`dcp`), embedded-JPEG extraction + cache tiers (`jpeg`, `processor`), EXIF carried into exports (`exif`). `RAW_EXTENSIONS` is the importable set — Bayer formats only, since the debayer pass assumes a 2×2 CFA (the loader rejects anything else with a reason)
 - `src/database/` — SQLite schema, queries, models (the image catalog)
-- `src/core/` — cross-cutting types, histogram computation, logging/tracing setup, profiler, user settings, and `viewport.rs` (see §D)
+- `src/core/` — cross-cutting types, histogram computation, logging/tracing setup, profiler, user settings, `viewport.rs` (see §D), and the CPU halves of the editing features: `noise` (per-image noise model), `curves` (point curves → LUT), `lens` (lensfun DB, lens/defringe params → shader block), `brush` (mask strokes) — see §G
 - `src/ui/` — reusable iced widgets (filmstrip, histogram view, icons, palette/styles, profiler graph), plus `preview_renderer.rs` + `viewport.wgsl` (the develop viewport shader widget and its crop/mask canvas overlay)
 - `src/color.rs` — color space math (matrices, conversions) shared by CPU and GPU paths
 
 ### A. The GPU Pipeline (`src/gpu/`)
 Dual-pass rendering to avoid wasting GPU cycles:
-- **Pass 1 (Debayering)** — runs only on image load or sensor-level data change. Reads raw `R16Uint` Bayer mosaic → outputs `Rgba16Float` intermediate texture.
-- **Pass 2 (Color Science)** — re-runs on every slider tweak. Reads the pre-debayered float texture, applies White Balance, Noise Reduction, the DCP Color Pipeline and local masks, and is read back to CPU bytes that the viewport shader widget then draws.
+- **Pass 1 (Demosaic, `demosaic.rs`)** — RCD as four fragment passes into transient textures, run once per image load. Reads raw `R16Uint` Bayer mosaic → outputs camera-native `Rgba16Float`. Demosaics in as-shot-WB space (ratio methods assume neutral = equal channels) and divides it back out, so WB sliders never re-run it. It has its own small uniform (`GpuDemosaicParams`), not `GpuEditParams`.
+- **Cached pre-pass stages** — denoise, the point-curve LUT and the brush-mask layers. `ImageResources::prepare_stages` (called by EVERY render entry point) re-runs a stage only when its own settings changed, keyed off the params last pushed by `update_uniforms`/`new`; export and proxies get them for free. A new expensive stage belongs here, not in Pass 2.
+- **Pass 2 (Color Science)** — re-runs on every slider tweak. Reads the demosaic (or the denoise output), applies lens correction, White Balance, the DCP Color Pipeline, defringe, sharpening and local masks, and is read back to CPU bytes that the viewport shader widget then draws.
 - Shader source lives in `src/gpu/shaders.rs`; pipeline/bind-group/uniform setup in `src/gpu/shared.rs`; uniform struct layout in `src/gpu/params.rs`; the render + readback entry points in `src/gpu/render_functions.rs`.
 - `SharedContext` holds two Pass-2 pipelines: `pipeline` (→ `Rgba8Unorm`, display) and `pipeline_16` (→ `Rgba16Float`, 16-bit TIFF export only). A wgpu `RenderPipeline`'s output format is baked in at creation, so the export path needs its own rather than swapping the target's format.
 - **Windowed rendering:** Pass 2 renders only `GpuEditParams.view_rect` — the `(u0, v0, du, dv)` slice of the displayed image that is actually on screen (see §D). The vertex shader maps the target across it, so `(0,0,1,1)` is the identity and covers the whole image.
@@ -76,7 +78,7 @@ an opinion about contrast). Only the second is swappable, and
   once. Any change here must keep exactly one of them active per path.
 - **Operators bake into the existing 1D LUT on the CPU**, so adding one costs a
   texture upload and *zero* per-pixel work. Only `tone_mapper: u32` reaches the
-  GPU (in a former pad slot — `GpuEditParams` is still 784 bytes), and the
+  GPU (in a former pad slot — no offset moved), and the
   shader reads it solely to decide Camera-vs-not. Consequence: operators must
   be scalar functions of one channel. Anything applying matrices around the
   curve (Hill's ACES fit, AgX) cannot be baked and is deliberately absent.
@@ -139,9 +141,15 @@ Each image's overview (§A) is kept as a small render of it *as edited*: the fil
 - **Invariant: a saved proxy always matches the saved edits.** Anything that changes an image's saved edits without rendering it must call `RawEditor::invalidate_proxies` — paste onto a selection does, and `flush_edits` does whenever the selected image isn't the one being rendered (undo/reset in Library). New write paths to `edits` must too.
 - Before GPU resources exist, `image_display_dims` returns the placeholder's own shape: a proxy is already cropped, the camera JPEG never is.
 
+### G. Editing Stages (`core::{noise,curves,lens,brush}`, `gpu::{denoise,brush}`)
+- **Denoise** (`gpu/denoise.rs`): NLM on luma + edge-avoiding à-trous on chroma, in an opponent space. Weights are computed in the variance-stabilised space of the image's own Poisson-Gaussian model (`core::noise::estimate`, measured on the mosaic AS UPLOADED, so a box-filtered preview gets its own lower noise); averages are taken of LINEAR values, which keeps it unbiased — averaging square-root-domain values darkens shadows. Chroma scale count follows the subsample stride so export matches the screen.
+- **Curves** apply in display-encoded space after tone mapping, baked on the CPU with a monotone (Fritsch–Carlson) spline; per-channel curves are pre-composed with the master in the LUT.
+- **Lens** (`core::lens`): lensfun XML read at runtime from the usual install paths or `~/.local/share/raw-editor/lensfun/` — never bundled (CC-BY-SA). Its coefficients use Hugin units: radius 1 = half the calibration sensor's SHORTER side for distortion/TCA, half its DIAGONAL for vignetting; the camera's crop factor comes from the lensfun camera DB before EXIF (whose 35 mm figure is rounded). Step 0 maps output → source exactly like lensfun (`r_d = r_u·f(r_u)`, TCA on the distorted coordinate). The vignetting gain rides the exposure multiplier, not the sample, or brightened corners trip Step 3's clip detection. Lens corrections reframe the image, so `before_reference` preserves them like the crop.
+- **Masks**: shape (linear/radial/brush/range) + signed brush layer (`clamp(shape + L, 0, 1)`), × luminance/colour range, then invert. Strokes are data in `EditParams::brush` (fixed capacity so `EditParams` stays `Copy`); deleting a mask must `BrushData::remove_mask` to renumber them. Colour range compares camera-native log-chromaticity (`MASK_CHROMA_EPS`, mirrored in WGSL), picked from the raw mosaic — exposure- and WB-invariant. `mask_overlay` is tool state exactly like `is_cropping`: `#[serde(skip)]`, set by `sync_tool_flags`, stripped by `EditParams::without_tool_state()` for every "same edit?" check and export, and it disqualifies a render from becoming the edited proxy.
+
 ## Strict Engineering Constraints (must follow)
 
-1. **Wgpu memory alignment (critical):** any struct sent to a wgpu uniform buffer (e.g. `GpuEditParams`) must be strictly 16-byte aligned. Add explicit padding fields (e.g. `_pad: [f32; 3]`) — misalignment causes GPU memory corruption, not just a panic. Field *offsets* are load-bearing too: `write_view_rect` patches `view_rect` by `offset_of!`, and the WGSL `EditParams` struct is duplicated in both the color and debayer shaders (they share one uniform buffer and must stay byte-identical). The size and offset assertions in `gpu/params.rs`'s tests are the guard — keep them passing rather than adjusting them to match a drift.
+1. **Wgpu memory alignment (critical):** any struct sent to a wgpu uniform buffer (e.g. `GpuEditParams`) must be strictly 16-byte aligned. Add explicit padding fields (e.g. `_pad: [f32; 3]`) — misalignment causes GPU memory corruption, not just a panic. Field *offsets* are load-bearing too: `write_view_rect` patches `view_rect` by `offset_of!`, and every Rust uniform struct is mirrored by a WGSL struct that must stay byte-identical (`GpuEditParams`/`GpuMasks` ↔ the colour shader; the demosaic, denoise and brush shaders have their own). The size and offset assertions in `gpu/params.rs`'s tests are the guard — keep them passing rather than adjusting them to match a drift; change them only together with a deliberate layout change in both languages. Every WGSL source has a naga validation test — add one for any new shader (it caught `target`, a reserved word that otherwise fails only at runtime, rendering nothing).
 2. **Never block the UI thread:** all disk reads, RAW decodes, EXIF parsing, and cubic spline calculations must run inside `tokio::task::spawn_blocking`. The iced `update` function must return immediately; results flow back in as `Message`s. This includes SQLite: never write from a per-mouse-move path (slider or handle drags). Call `mark_edits_dirty()` there and let `flush_edits()` persist at the commit points — `CommitEdit`, drag release, image switch, tab switch, window close. Missing a flush point loses the last gesture's edits.
 3. **Rendering params that aren't the user's edits:** never assign to
    `current_edit_params` to preview something (before/after peek, a proposed

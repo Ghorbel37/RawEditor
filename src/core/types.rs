@@ -88,6 +88,13 @@ pub struct EditParams {
     /// Luma (brightness) noise reduction strength (0.0 to 1.0)
     pub luma_noise: f32,
 
+    /// Luma noise reduction detail retention (0.0 to 1.0). Higher keeps
+    /// more fine texture: it narrows how far a non-local-means patch match may
+    /// differ from the centre before it stops contributing.
+    /// serde default keeps edits saved before this field existed loadable.
+    #[serde(default = "default_luma_detail")]
+    pub luma_detail: f32,
+
     /// Chroma (color) noise reduction strength (0.0 to 1.0)
     pub color_noise: f32,
 
@@ -128,6 +135,12 @@ pub struct EditParams {
     #[serde(skip)]
     pub is_cropping: u32,
 
+    /// Mask overlay (0 = off, i + 1 = tint mask i): tool state riding to the
+    /// shader exactly like `is_cropping` — never persisted, never copied,
+    /// cleared for export. See `without_tool_state`.
+    #[serde(skip)]
+    pub mask_overlay: u32,
+
     // ========== Color Profile ==========
     /// DCP profile tone-curve strength (0.0 to 1.0)
     /// - 1.0 = full ProfileToneCurve (profile's intended contrast)
@@ -160,6 +173,22 @@ pub struct EditParams {
     #[serde(default)]
     pub gt: crate::core::tonemap::GtParams,
 
+    /// Point curves (RGB master + R/G/B), applied in display space after tone
+    /// mapping. Identity by default; serde default keeps old edits loadable.
+    #[serde(default)]
+    pub curves: crate::core::curves::ToneCurves,
+
+    // ========== Lens ==========
+    /// Profile and manual lens corrections (distortion, vignetting, lateral
+    /// CA). serde default keeps old edits loadable — and uncorrected: the
+    /// profile is opt-in, so no saved image changes on upgrade.
+    #[serde(default)]
+    pub lens: crate::core::lens::LensParams,
+
+    /// Purple/green fringe removal (axial CA). serde default: off.
+    #[serde(default)]
+    pub defringe: crate::core::lens::DefringeParams,
+
     // ========== Local Adjustment Masks ==========
     /// Fixed-size mask slots; only the first `mask_count` are meaningful.
     /// Fixed array (not Vec) keeps EditParams `Copy` for the undo stack and
@@ -170,14 +199,40 @@ pub struct EditParams {
     /// Number of active masks (0..=MAX_MASKS)
     #[serde(default)]
     pub mask_count: u32,
+
+    /// Brush strokes for all masks (each stroke names its mask).
+    #[serde(default)]
+    pub brush: crate::core::brush::BrushData,
 }
 
 /// Maximum number of local adjustment masks per image.
 /// Mirrored in the WGSL shaders' `masks: array<Mask, 8>` — keep in sync.
 pub const MAX_MASKS: usize = 8;
 
+/// `MaskParams::mask_type` values. Mirrored in the colour shader.
+pub const MASK_LINEAR: u32 = 0;
+pub const MASK_RADIAL: u32 = 1;
+pub const MASK_BRUSH: u32 = 2;
+pub const MASK_RANGE: u32 = 3;
+
+/// Epsilon in a colour-range mask's log-chromaticity, `ln((r+ε)/(g+ε))`:
+/// keeps near-black pixels (whose chromaticity is noise) from scattering.
+/// MIRRORED in the colour shader.
+pub const MASK_CHROMA_EPS: f32 = 0.004;
+
+/// Colour-range target for a camera-native (black-subtracted, unit-range)
+/// colour — the same quantity the shader computes per pixel.
+pub fn mask_chroma(rgb: [f32; 3]) -> [f32; 2] {
+    let c = rgb.map(|v| v.max(0.0) + MASK_CHROMA_EPS);
+    [(c[0] / c[1]).ln(), (c[2] / c[1]).ln()]
+}
+
 fn default_profile_curve() -> f32 {
     0.33
+}
+
+fn default_luma_detail() -> f32 {
+    0.5
 }
 
 /// One local adjustment mask. Geometry is stored in full-image oriented
@@ -226,13 +281,56 @@ pub struct MaskParams {
     /// serde default keeps masks saved before this field existed loadable.
     #[serde(default)]
     pub rotation: f32,
+
+    // Fields below arrived with brush/range masking; serde defaults keep
+    // every mask saved before them loadable, with the refinements off.
+
+    /// Local hue rotation (-1.0 to +1.0 = ±30°), about the grey axis so
+    /// luminance is untouched.
+    #[serde(default)]
+    pub hue: f32,
+    /// 1 = restrict the mask to a luminance band.
+    #[serde(default)]
+    pub luma_range: u32,
+    /// Band edges in display (gamma-encoded) luminance, 0..1, and the width
+    /// of the soft fade at each edge.
+    #[serde(default)]
+    pub luma_lo: f32,
+    #[serde(default)]
+    pub luma_hi: f32,
+    #[serde(default)]
+    pub luma_smooth: f32,
+    /// 1 = restrict the mask to colours near `color_target`.
+    #[serde(default)]
+    pub color_range: u32,
+    /// Picked colour as camera-native log-chromaticity (ln r/g, ln b/g):
+    /// independent of exposure and of the white-balance sliders, so a pick
+    /// stays valid while either is edited afterwards.
+    #[serde(default)]
+    pub color_target: [f32; 2],
+    /// 0..1 — how far from the picked colour still counts.
+    #[serde(default)]
+    pub color_tolerance: f32,
+}
+
+impl MaskParams {
+    /// Turn the luminance refinement on with a band that does nothing yet,
+    /// so enabling it never changes the image by itself.
+    pub fn enable_luma_range(&mut self) {
+        if self.luma_hi <= self.luma_lo {
+            self.luma_lo = 0.0;
+            self.luma_hi = 1.0;
+            self.luma_smooth = 0.1;
+        }
+        self.luma_range = 1;
+    }
 }
 
 impl MaskParams {
     /// New enabled linear gradient: weight 1 at (ax, ay) falling to 0 at (bx, by).
     pub fn new_linear(ax: f32, ay: f32, bx: f32, by: f32) -> Self {
         Self {
-            mask_type: 0,
+            mask_type: MASK_LINEAR,
             enabled: 1,
             ax,
             ay,
@@ -242,10 +340,23 @@ impl MaskParams {
         }
     }
 
+    /// New enabled brush mask: no shape of its own, only what is painted.
+    pub fn new_brush() -> Self {
+        Self { mask_type: MASK_BRUSH, enabled: 1, ..Self::default() }
+    }
+
+    /// New enabled range mask: the whole frame, narrowed by its luminance
+    /// and colour refinements (luminance starts on, at the full range).
+    pub fn new_range() -> Self {
+        let mut m = Self { mask_type: MASK_RANGE, enabled: 1, ..Self::default() };
+        m.enable_luma_range();
+        m
+    }
+
     /// New enabled radial ellipse centered at (cx, cy) with radii (rx, ry).
     pub fn new_radial(cx: f32, cy: f32, rx: f32, ry: f32) -> Self {
         Self {
-            mask_type: 1,
+            mask_type: MASK_RADIAL,
             enabled: 1,
             feather: 0.5,
             ax: cx,
@@ -276,17 +387,23 @@ impl Default for EditParams {
             temperature: 0.0,           // Phase 140: As-shot (maps to ~5000K for DCP)
             tint: 0.0,                  // Phase 18: Manual white balance (as-shot)
             luma_noise: 0.0,            // Phase 133: No luma noise reduction by default
+            luma_detail: 0.5,           // Mid detail retention (only acts with luma_noise > 0)
             color_noise: 0.3,           // Phase 133: Default color noise reduction to eliminate speckles
             sharpening: 0.0,            // Phase 50: No sharpening by default
             sharpen_masking: 0.0,       // Phase 51: No masking by default
             rotation: 0.0,              // Phase 52: No rotation by default
             crop: [0.0, 0.0, 1.0, 1.0], // Phase 66: Full image by default
             is_cropping: 0,             // Phase 135: Not cropping by default
+            mask_overlay: 0,
             profile_curve: 0.33,        // 1/3 DCP tone curve (matches in-camera JPEG contrast)
             tone_mapper: crate::core::tonemap::ToneMapper::Camera, // calibrated path
             gt: crate::core::tonemap::GtParams::default(),         // inert unless Gt selected
+            curves: crate::core::curves::ToneCurves::default(),    // identity
+            lens: crate::core::lens::LensParams::default(),        // no correction
+            defringe: crate::core::lens::DefringeParams::default(), // off
             masks: [MaskParams::default(); MAX_MASKS], // No local masks by default
             mask_count: 0,
+            brush: crate::core::brush::BrushData::default(),
         }
     }
 }
@@ -311,6 +428,15 @@ impl EditParams {
             params.temperature = ((params.temperature - 5000.0) / 5000.0).clamp(-1.0, 1.0);
         }
         Ok(params)
+    }
+
+    /// These params with the UI tool flags (`is_cropping`, `mask_overlay`)
+    /// cleared — the edit itself. Use for every "is this the same edit?"
+    /// comparison and before exporting.
+    pub fn without_tool_state(mut self) -> Self {
+        self.is_cropping = 0;
+        self.mask_overlay = 0;
+        self
     }
 
     /// Check if this represents an unedited image (all values at default)
@@ -373,6 +499,9 @@ impl EditParams {
         Self {
             crop: self.crop,
             rotation: self.rotation,
+            // Lens corrections reframe the image (distortion, constrain zoom),
+            // so they are geometry for this purpose.
+            lens: self.lens,
             is_cropping: self.is_cropping,
             black_offsets: self.black_offsets,
             black_phase_x: self.black_phase_x,
@@ -387,6 +516,10 @@ impl EditParams {
 /// Stored ALONGSIDE the copied `EditParams` rather than being applied at copy
 /// time — see [`EditClipboard`] for why that distinction matters.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+// Per-field defaults: a preferences file saved before a category existed
+// (e.g. `lens`) must still parse — otherwise the whole settings file fails
+// and every preference resets.
+#[serde(default)]
 pub struct CopyCategories {
     pub tone: bool,
     pub color: bool,
@@ -396,6 +529,8 @@ pub struct CopyCategories {
     pub geometry: bool,
     pub profile: bool,
     pub masks: bool,
+    /// Lens corrections and defringe.
+    pub lens: bool,
     /// Per-channel black level offsets. Sensor calibration rather than a look,
     /// and camera-specific — off by default, and only offered in the UI when
     /// `debug::SHOW_SENSOR_CORRECTION` is on, matching the develop sidebar.
@@ -417,6 +552,7 @@ impl Default for CopyCategories {
             geometry: false,
             profile: true,
             masks: false,
+            lens: true,
             black_levels: false,
         }
     }
@@ -434,6 +570,7 @@ impl CopyCategories {
             geometry: true,
             profile: true,
             masks: true,
+            lens: true,
             black_levels: true,
         }
     }
@@ -448,6 +585,7 @@ impl CopyCategories {
             geometry: false,
             profile: false,
             masks: false,
+            lens: false,
             black_levels: false,
         }
     }
@@ -489,6 +627,7 @@ pub fn apply_categories(dst: &mut EditParams, src: &EditParams, cats: CopyCatego
         dst.shadows = src.shadows;
         dst.whites = src.whites;
         dst.blacks = src.blacks;
+        dst.curves = src.curves;
     }
     if cats.color {
         dst.vibrance = src.vibrance;
@@ -500,6 +639,7 @@ pub fn apply_categories(dst: &mut EditParams, src: &EditParams, cats: CopyCatego
     }
     if cats.noise {
         dst.luma_noise = src.luma_noise;
+        dst.luma_detail = src.luma_detail;
         dst.color_noise = src.color_noise;
     }
     if cats.detail {
@@ -520,6 +660,12 @@ pub fn apply_categories(dst: &mut EditParams, src: &EditParams, cats: CopyCatego
         // leaves the render evaluating slots the user never placed.
         dst.masks = src.masks;
         dst.mask_count = src.mask_count;
+        // Strokes index into `masks`; they travel with them.
+        dst.brush = src.brush;
+    }
+    if cats.lens {
+        dst.lens = src.lens;
+        dst.defringe = src.defringe;
     }
     if cats.black_levels {
         dst.black_offsets = src.black_offsets;
@@ -625,6 +771,7 @@ mod tests {
         p.temperature = 0.5;
         p.tint = -0.25;
         p.luma_noise = 0.4;
+        p.luma_detail = 0.8;
         p.color_noise = 0.7;
         p.sharpening = 0.8;
         p.sharpen_masking = 0.6;
@@ -633,9 +780,16 @@ mod tests {
         p.profile_curve = 0.9;
         p.tone_mapper = crate::core::tonemap::ToneMapper::Gt;
         p.gt = crate::core::tonemap::GtParams { contrast: 1.7, ..Default::default() };
+        p.curves.master.insert(0.5, 0.6);
+        p.lens.profile = true;
+        p.lens.distortion = 0.3;
+        p.defringe.purple_amount = 0.5;
         p.masks[0] = MaskParams::new_radial(0.4, 0.4, 0.2, 0.15);
         p.masks[0].exposure = -1.0;
+        p.masks[0].enable_luma_range();
         p.mask_count = 1;
+        p.brush.begin(0, false, 0.05, 0.5, 1.0);
+        p.brush.extend([0.2, 0.2], 1.5);
         p
     }
 
@@ -647,6 +801,7 @@ mod tests {
         let b = p.before_reference();
         assert_eq!(b.crop, p.crop);
         assert_eq!(b.rotation, p.rotation);
+        assert_eq!(b.lens, p.lens, "lens corrections reframe the image");
         assert_eq!(b.is_cropping, p.is_cropping);
         assert_eq!(b.black_offsets, p.black_offsets);
         assert_eq!(b.black_phase_x, p.black_phase_x);
@@ -673,6 +828,9 @@ mod tests {
         assert_eq!(b.profile_curve, d.profile_curve);
         assert_eq!(b.tone_mapper, d.tone_mapper);
         assert_eq!(b.mask_count, 0, "masks must not apply to the before view");
+        assert_eq!(b.curves, d.curves);
+        assert_eq!(b.defringe, d.defringe);
+        assert_eq!(b.luma_detail, d.luma_detail);
     }
 
     // ── copy categories ──────────────────────────────────────────────────────
@@ -687,8 +845,9 @@ mod tests {
         let src = fully_edited();
         let mut dst = EditParams::default();
         apply_categories(&mut dst, &src, CopyCategories::all());
-        // is_cropping is the one deliberate exclusion (transient UI state).
+        // The tool flags are the deliberate exclusions (transient UI state).
         dst.is_cropping = src.is_cropping;
+        dst.mask_overlay = src.mask_overlay;
         assert_eq!(
             dst, src,
             "a field is missing from apply_categories' category mapping"
@@ -774,12 +933,20 @@ mod tests {
     #[test]
     fn copy_categories_default_is_a_look_not_a_frame() {
         let d = CopyCategories::default();
-        assert!(d.tone && d.color && d.white_balance && d.profile);
+        assert!(d.tone && d.color && d.white_balance && d.profile && d.lens);
         assert!(!d.geometry, "a crop is composed for one specific frame");
         assert!(!d.black_levels, "sensor calibration is camera-specific");
         assert!(!d.is_empty());
         assert!(CopyCategories::none().is_empty());
         assert!(!CopyCategories::all().is_empty());
+    }
+
+    #[test]
+    fn copy_categories_saved_before_a_category_existed_still_load() {
+        let json = r#"{"tone":false,"color":true,"white_balance":true,"noise":true,"detail":true,"geometry":false,"profile":true,"masks":false,"black_levels":false}"#;
+        let c: CopyCategories = serde_json::from_str(json).expect("legacy prefs must parse");
+        assert!(!c.tone, "existing choices survive");
+        assert!(c.lens, "the new category takes its default");
     }
 
     #[test]

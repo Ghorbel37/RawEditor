@@ -71,6 +71,7 @@ fn encode_color_pass(
     width: u32,
     height: u32,
 ) -> (wgpu::CommandBuffer, Readback) {
+    let bindings = resources.prepare_stages(context);
     let output_texture = context.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("Output Texture"),
         size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
@@ -104,7 +105,8 @@ fn encode_color_pass(
             occlusion_query_set: None,
         });
         render_pass.set_pipeline(&context.pipeline);
-        render_pass.set_bind_group(0, &resources.bind_group, &[]);
+        render_pass.set_bind_group(0, &bindings.main, &[]);
+        render_pass.set_bind_group(1, &bindings.masks, &[]);
         render_pass.draw(0..3, 0..1);
     }
 
@@ -340,6 +342,7 @@ pub async fn render_to_bytes_16bit(
     // windowed `view_rect` behind that would otherwise silently export only
     // the region that happened to be on screen.
     write_view_rect(context, resources, super::params::FULL_VIEW_RECT);
+    let bindings = resources.prepare_stages(context);
 
     let output_texture = context.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("Output Texture 16-bit"),
@@ -381,7 +384,8 @@ pub async fn render_to_bytes_16bit(
             occlusion_query_set: None,
         });
         render_pass.set_pipeline(&context.pipeline_16);
-        render_pass.set_bind_group(0, &resources.bind_group, &[]);
+        render_pass.set_bind_group(0, &bindings.main, &[]);
+        render_pass.set_bind_group(1, &bindings.masks, &[]);
         render_pass.draw(0..3, 0..1);
     }
 
@@ -580,9 +584,7 @@ mod tests {
                 // Full resolution, not the 1280px preview: the develop
                 // preview's box-filter downsample averages isolated clipped
                 // pixels away, leaving too few to measure.
-                None, raw.orientation,
-            )
-            .expect("image resources");
+                None, raw.orientation, raw.lens_context.clone()).expect("image resources");
 
             let (w, h) = res.oriented_dims();
 
@@ -671,9 +673,7 @@ mod tests {
                 &ctx, 1, &raw.data, raw.width, raw.height, &base,
                 raw.wb_multipliers, forward_matrix, raw.cfa_pattern,
                 raw.black_levels, raw.white_level, dcp.as_ref(),
-                Some(1280), raw.orientation,
-            )
-            .expect("image resources");
+                Some(1280), raw.orientation, raw.lens_context.clone()).expect("image resources");
             let (w, h) = res.oriented_dims();
 
             let a = render_at(&ctx, &res, &raw, 0.0, w, h).await;
@@ -738,9 +738,7 @@ mod tests {
             let res = ImageResources::new(
                 &ctx, 1, &raw.data, raw.width, raw.height, &base,
                 raw.wb_multipliers, fm, raw.cfa_pattern, raw.black_levels,
-                raw.white_level, dcp.as_ref(), Some(1280), raw.orientation,
-            )
-            .expect("image resources");
+                raw.white_level, dcp.as_ref(), Some(1280), raw.orientation, raw.lens_context.clone()).expect("image resources");
             let (w, h) = res.oriented_dims();
 
             // Render one frame per operator, re-resolving the DCP each time so
@@ -857,7 +855,7 @@ mod tests {
             let fm = dcp.as_ref().map(|i| i.camera_to_prophoto).unwrap();
             let res = ImageResources::new(&ctx, 1, &raw.data, raw.width, raw.height, &base,
                 raw.wb_multipliers, fm, raw.cfa_pattern, raw.black_levels, raw.white_level,
-                dcp.as_ref(), Some(1280), raw.orientation).unwrap();
+                dcp.as_ref(), Some(1280), raw.orientation, raw.lens_context.clone()).unwrap();
             let (w, h) = res.oriented_dims();
             let bytes = render_at(&ctx, &res, &raw, 0.0, w, h).await;
 
@@ -925,9 +923,7 @@ mod tests {
                 &ctx, 1, &raw.data, raw.width, raw.height, &base,
                 raw.wb_multipliers, forward_matrix, raw.cfa_pattern,
                 raw.black_levels, raw.white_level, dcp.as_ref(),
-                Some(1280), raw.orientation,
-            )
-            .expect("image resources");
+                Some(1280), raw.orientation, raw.lens_context.clone()).expect("image resources");
 
             let mean = |rgba: &[u8]| {
                 let n = (rgba.len() / 4).max(1) as f64;
@@ -951,6 +947,237 @@ mod tests {
                 means.push(overview);
             }
             assert!(means[1] < means[0] - 20.0, "overview did not follow a -2 EV edit: {means:?}");
+        });
+    }
+
+    /// Visual-inspection harness: render a RAW with given edits and write PNG
+    /// crops, for judging demosaic / denoise / lens work by eye.
+    ///
+    /// ```text
+    /// DUMP_DIR=/tmp/out DUMP_TAG=rcd DUMP_CROPS="2900,1900,600,400;100,100,600,400" \
+    ///   [DUMP_PARAMS='{"luma_noise":0.5,...}'] [DUMP_PREVIEW=1280] \
+    ///   cargo test --release dump_render_crops -- --ignored --nocapture
+    /// ```
+    /// Crops are in oriented full-resolution pixels. Also writes a ~1600px
+    /// downscale of the whole frame.
+    #[test]
+    #[ignore]
+    fn dump_render_crops() {
+        let Ok(dir) = std::env::var("DUMP_DIR") else {
+            eprintln!("DUMP_DIR not set, skipping");
+            return;
+        };
+        let test_raw = test_raw_path();
+        let tag = std::env::var("DUMP_TAG").unwrap_or_else(|_| "render".into());
+        let crops: Vec<[u32; 4]> = std::env::var("DUMP_CROPS")
+            .unwrap_or_default()
+            .split(';')
+            .filter_map(|c| {
+                let v: Vec<u32> = c.split(',').filter_map(|n| n.trim().parse().ok()).collect();
+                (v.len() == 4).then(|| [v[0], v[1], v[2], v[3]])
+            })
+            .collect();
+        let preview: Option<u32> = std::env::var("DUMP_PREVIEW").ok().and_then(|v| v.parse().ok());
+
+        // GPU validation errors only reach `tracing`; surface them here.
+        let _ = tracing_subscriber::fmt().with_writer(std::io::stderr).with_env_filter("warn").try_init();
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).build().unwrap();
+        rt.block_on(async {
+            let ctx = SharedContext::new().await.unwrap();
+            let raw = crate::raw::loader::load_raw_data(test_raw.clone()).await.unwrap();
+            eprintln!("lens: {:?}", raw.lens_context);
+            let params: EditParams = std::env::var("DUMP_PARAMS")
+                .ok()
+                .map(|j| {
+                    let mut v: serde_json::Value = serde_json::to_value(EditParams::default()).unwrap();
+                    let patch: serde_json::Value = serde_json::from_str(&j).expect("DUMP_PARAMS json");
+                    for (k, val) in patch.as_object().unwrap() {
+                        v[k] = val.clone();
+                    }
+                    serde_json::from_value(v).unwrap()
+                })
+                .unwrap_or_default();
+            let as_shot = crate::color::as_shot_kelvin_tint(&raw);
+            let (kelvin, _t, wb) =
+                crate::color::solve_wb(&params, as_shot, raw.dcp_profile.as_deref(), raw.color_matrix);
+            let dcp = raw.dcp_profile.as_ref().map(|d| {
+                crate::raw::dcp::interpolate_at_temperature(d, kelvin, crate::core::tonemap::ToneSettings::from_params(&params))
+            });
+            let fm = dcp.as_ref().map(|i| i.camera_to_prophoto).unwrap_or_else(|| {
+                crate::color::calculate_cam_to_srgb(raw.color_matrix, raw.wb_multipliers, raw.color_matrix_is_d65)
+            });
+            let res = ImageResources::new(&ctx, 1, &raw.data, raw.width, raw.height, &params,
+                raw.wb_multipliers, fm, raw.cfa_pattern, raw.black_levels, raw.white_level,
+                dcp.as_ref(), preview, raw.orientation, raw.lens_context.clone()).unwrap();
+            res.update_uniforms(&ctx, &params, dcp.as_ref(), wb);
+            let (w, h) = res.oriented_dims();
+            let t = std::time::Instant::now();
+            let (bytes, _, ms) = render_to_bytes(&ctx, &res, w, h, FULL_VIEW_RECT).await;
+            eprintln!("rendered {w}x{h} in {ms:.1} ms (wall {:.1} ms)", t.elapsed().as_secs_f32() * 1000.0);
+            let img = image::RgbaImage::from_raw(w, h, bytes.to_vec()).unwrap();
+            let dir = std::path::Path::new(&dir);
+            std::fs::create_dir_all(dir).unwrap();
+            let small = image::imageops::resize(&img, 1600, 1600 * h / w, image::imageops::FilterType::Triangle);
+            small.save(dir.join(format!("{tag}_full.png"))).unwrap();
+            for (i, c) in crops.iter().enumerate() {
+                let sub = image::imageops::crop_imm(&img, c[0], c[1], c[2], c[3]).to_image();
+                sub.save(dir.join(format!("{tag}_crop{i}.png"))).unwrap();
+            }
+            eprintln!("wrote {} crops to {}", crops.len(), dir.display());
+        });
+    }
+
+    /// Render `params` the way the app does (WB/DCP resolved from them) at
+    /// the develop preview resolution. Returns RGBA and its size.
+    async fn render_params(
+        ctx: &SharedContext,
+        raw: &crate::raw::loader::RawDataResult,
+        params: &EditParams,
+    ) -> (Vec<u8>, u32, u32) {
+        let as_shot = crate::color::as_shot_kelvin_tint(raw);
+        let (kelvin, _t, wb) =
+            crate::color::solve_wb(params, as_shot, raw.dcp_profile.as_deref(), raw.color_matrix);
+        let dcp = raw.dcp_profile.as_ref().map(|d| {
+            crate::raw::dcp::interpolate_at_temperature(d, kelvin, crate::core::tonemap::ToneSettings::from_params(params))
+        });
+        let fm = dcp.as_ref().map(|i| i.camera_to_prophoto).unwrap_or_else(|| {
+            crate::color::calculate_cam_to_srgb(raw.color_matrix, raw.wb_multipliers, raw.color_matrix_is_d65)
+        });
+        let res = ImageResources::new(ctx, 1, &raw.data, raw.width, raw.height, params,
+            raw.wb_multipliers, fm, raw.cfa_pattern, raw.black_levels, raw.white_level,
+            dcp.as_ref(), Some(1280), raw.orientation, raw.lens_context.clone()).expect("image resources");
+        res.update_uniforms(ctx, params, dcp.as_ref(), wb);
+        let (w, h) = res.oriented_dims();
+        let (bytes, _, _) = render_to_bytes(ctx, &res, w, h, FULL_VIEW_RECT).await;
+        (bytes.to_vec(), w, h)
+    }
+
+    fn luma(p: &[u8]) -> f64 {
+        0.2126 * p[0] as f64 + 0.7152 * p[1] as f64 + 0.0722 * p[2] as f64
+    }
+
+    /// Mean luma of the pixels of `rgba` (w×h) inside the UV rect.
+    fn region_mean(rgba: &[u8], w: u32, h: u32, (u0, v0, u1, v1): (f32, f32, f32, f32)) -> f64 {
+        let (mut sum, mut n) = (0.0, 0usize);
+        for y in (v0 * h as f32) as u32..(v1 * h as f32) as u32 {
+            for x in (u0 * w as f32) as u32..(u1 * w as f32) as u32 {
+                sum += luma(&rgba[((y * w + x) * 4) as usize..]);
+                n += 1;
+            }
+        }
+        sum / n.max(1) as f64
+    }
+
+    /// Brush strokes, erase strokes and a luminance-range mask must each land
+    /// where they should and nowhere else. A brush pipeline that fails to
+    /// build (it once did, over a reserved WGSL word) renders NOTHING — no
+    /// panic, no log in a release build — which only a check like this sees.
+    ///
+    /// Run with `cargo test --release masks_hit_only -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn masks_hit_only_their_regions() {
+        use crate::core::types::MaskParams;
+        let test_raw = test_raw_path();
+        if !std::path::Path::new(&test_raw).exists() {
+            return;
+        }
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).build().unwrap();
+        rt.block_on(async {
+            let ctx = SharedContext::new().await.unwrap();
+            let raw = crate::raw::loader::load_raw_data(test_raw.clone()).await.unwrap();
+            let base = EditParams::default();
+            let (plain, w, h) = render_params(&ctx, &raw, &base).await;
+
+            // Mask 0: brush, −2.5 EV, a horizontal band at v = 0.5, with an
+            // erase stroke crossing it at u = 0.5.
+            let mut p = base;
+            p.masks[0] = MaskParams::new_brush();
+            p.masks[0].exposure = -2.5;
+            p.mask_count = 1;
+            p.brush.begin(0, false, 0.03, 0.0, 1.0).unwrap();
+            p.brush.extend([0.1, 0.5], 1.0);
+            p.brush.extend([0.9, 0.5], 1.0);
+            p.brush.begin(0, true, 0.03, 0.0, 1.0).unwrap();
+            p.brush.extend([0.5, 0.4], 1.0);
+            p.brush.extend([0.5, 0.6], 1.0);
+            let (painted, _, _) = render_params(&ctx, &raw, &p).await;
+
+            let band = (0.2, 0.49, 0.4, 0.51);
+            let erased = (0.495, 0.49, 0.505, 0.51);
+            let outside = (0.2, 0.7, 0.4, 0.8);
+            let (b0, b1) = (region_mean(&plain, w, h, band), region_mean(&painted, w, h, band));
+            let (e0, e1) = (region_mean(&plain, w, h, erased), region_mean(&painted, w, h, erased));
+            let (o0, o1) = (region_mean(&plain, w, h, outside), region_mean(&painted, w, h, outside));
+            eprintln!("band {b0:.1} → {b1:.1}, erased {e0:.1} → {e1:.1}, outside {o0:.1} → {o1:.1}");
+            assert!(b1 < b0 * 0.6, "brush stroke did not darken its band");
+            assert!((e1 - e0).abs() < 1.0, "erase stroke did not restore the band");
+            assert!((o1 - o0).abs() < 0.5, "brush leaked outside its stroke");
+
+            // Mask 0 again as a luminance range: −1.5 EV above 0.6 display.
+            let mut r = base;
+            r.masks[0] = MaskParams::new_range();
+            r.masks[0].luma_lo = 0.6;
+            r.masks[0].luma_smooth = 0.02;
+            r.masks[0].exposure = -1.5;
+            r.mask_count = 1;
+            let (ranged, _, _) = render_params(&ctx, &raw, &r).await;
+            let (mut dark_shift, mut dark_n, mut bright_shift, mut bright_n) = (0.0, 0, 0.0, 0);
+            for (a, b) in plain.as_chunks::<4>().0.iter().zip(ranged.as_chunks::<4>().0) {
+                let (la, lb) = (luma(a), luma(b));
+                if la < 120.0 {
+                    dark_shift += (lb - la).abs();
+                    dark_n += 1;
+                } else if la > 190.0 {
+                    bright_shift += la - lb;
+                    bright_n += 1;
+                }
+            }
+            let (dark, bright) = (dark_shift / dark_n.max(1) as f64, bright_shift / bright_n.max(1) as f64);
+            eprintln!("range mask: dark pixels moved {dark:.2}, bright pixels darkened {bright:.1}");
+            assert!(dark < 0.5, "range mask touched the shadows");
+            assert!(bright > 20.0, "range mask did not darken the highlights");
+        });
+    }
+
+    /// Denoising must cut noise without moving tone: averaging is done on
+    /// linear values exactly so that it cannot darken the shadows.
+    ///
+    /// Run with `cargo test --release denoise_reduces -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn denoise_reduces_noise_without_shifting_tone() {
+        let test_raw = std::env::var("RAWEDITOR_TEST_RAW_NOISY").unwrap_or_else(|_| {
+            "/home/hsf001/Pictures/Photography/TESTFiles/RAW/_DSC0200.NEF".to_string()
+        });
+        if !std::path::Path::new(&test_raw).exists() {
+            return;
+        }
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).build().unwrap();
+        rt.block_on(async {
+            let ctx = SharedContext::new().await.unwrap();
+            let raw = crate::raw::loader::load_raw_data(test_raw.clone()).await.unwrap();
+            let off = EditParams { color_noise: 0.0, ..EditParams::default() };
+            let on = EditParams { luma_noise: 0.6, color_noise: 0.6, ..EditParams::default() };
+            let (a, w, h) = render_params(&ctx, &raw, &off).await;
+            let (b, _, _) = render_params(&ctx, &raw, &on).await;
+            // Pixel-to-pixel luma differences: dominated by noise in flat areas.
+            let roughness = |img: &[u8]| {
+                let mut s = 0.0;
+                for y in 0..h {
+                    for x in 0..w - 1 {
+                        let i = ((y * w + x) * 4) as usize;
+                        s += (luma(&img[i..]) - luma(&img[i + 4..])).abs();
+                    }
+                }
+                s / (h * (w - 1)) as f64
+            };
+            let mean = |img: &[u8]| img.as_chunks::<4>().0.iter().map(|p| luma(p)).sum::<f64>() / (w * h) as f64;
+            let (ra, rb) = (roughness(&a), roughness(&b));
+            let (ma, mb) = (mean(&a), mean(&b));
+            eprintln!("roughness {ra:.3} → {rb:.3}, mean luma {ma:.2} → {mb:.2}");
+            assert!(rb < ra * 0.8, "denoise did not reduce pixel-level noise");
+            assert!((mb - ma).abs() < 0.5, "denoise shifted overall tone");
         });
     }
 }

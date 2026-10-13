@@ -41,6 +41,11 @@ pub struct RawDataResult {
     // Phase 140: DNG Camera Profile
     pub dcp_profile: Option<std::sync::Arc<crate::raw::dcp::DcpProfile>>,
 
+    /// Lens identity, shot focal length/aperture and the matched correction
+    /// profile (if a lensfun database is installed). Resolved here, in the
+    /// blocking loader, because matching reads the database from disk.
+    pub lens_context: std::sync::Arc<crate::core::lens::LensContext>,
+
     /// Normalised EXIF orientation: 1 (normal), 3 (180°), 6 (90° CW), 8 (270° CW).
     /// Read via kamadak-exif — rawler 0.7.2 hardcodes Orientation::Normal.
     pub orientation: u32,
@@ -61,9 +66,18 @@ fn load_raw_data_blocking(path: &str) -> Result<RawDataResult, String> {
         return Err(format!("File not found: {}", path.display()));
     }
 
-    // Phase 119: rawler::decode_file replaces RawLoader::new().decode_file()
-    let mut raw_image = rawler::decode_file(path)
+    // One RawSource for both the image and its metadata: rawler only resolves
+    // the lens (from maker notes — NEFs carry no standard LensModel tag)
+    // through the decoder's `raw_metadata`, which `decode_file` discards.
+    let source = rawler::rawsource::RawSource::new(path)
+        .map_err(|e| format!("Failed to open RAW: {e}"))?;
+    let params = rawler::decoders::RawDecodeParams::default();
+    let mut raw_image = rawler::decode(&source, &params)
         .map_err(|e| format!("Failed to decode RAW: {:?}", e))?;
+    let lens_desc = rawler::get_decoder(&source)
+        .and_then(|d| d.raw_metadata(&source, &params))
+        .ok()
+        .and_then(|m| m.lens);
 
     // The debayer pass reads one sample per photosite from a 2×2 CFA.
     // Anything else — X-Trans's 6×6 pattern, linear DNGs with three samples
@@ -292,9 +306,27 @@ fn load_raw_data_blocking(path: &str) -> Result<RawDataResult, String> {
     // );
 
     // Phase 119: EXIF metadata via kamadak-exif (rawler's Exif is internal to its decoders)
-    let (iso, shutter_speed, aperture, lens, exif_orientation) =
-        extract_metadata_kamadak(path.to_str().unwrap_or_default());
-    let orientation = normalize_orientation(exif_orientation);
+    let exif = extract_metadata_kamadak(path.to_str().unwrap_or_default());
+    let orientation = normalize_orientation(exif.orientation);
+    let (iso, shutter_speed, aperture) = (exif.iso, exif.shutter, exif.aperture);
+
+    // Lens: EXIF LensModel where the camera writes one, else the maker-note
+    // identification rawler resolved.
+    let (lens_make, lens_model) = match (&exif.lens_model, &lens_desc) {
+        (Some(m), _) => (exif.lens_make.clone(), Some(m.clone())),
+        (None, Some(d)) => (Some(d.lens_make.clone()), Some(d.lens_model.clone())),
+        _ => (None, None),
+    };
+    let lens_context = std::sync::Arc::new(crate::core::lens::resolve_context(
+        &raw_image.make,
+        &raw_image.model,
+        lens_make.as_deref(),
+        lens_model.as_deref(),
+        exif.focal,
+        exif.focal_35mm,
+        exif.fnumber,
+    ));
+    let lens = lens_context.lens_name.clone().unwrap_or_else(|| "---".to_string());
 
     // Phase 140: Load DCP profile if available (parsed once, then shared)
     let dcp_profile = crate::raw::dcp::load_profile_for_camera(&raw_image.make, &raw_image.model);
@@ -320,6 +352,7 @@ fn load_raw_data_blocking(path: &str) -> Result<RawDataResult, String> {
         aperture,
         lens,
         dcp_profile,
+        lens_context,
         orientation,
     })
 }
@@ -358,40 +391,82 @@ fn crop_in_place(
     (data, rows)
 }
 
+/// What the loader reads from EXIF via kamadak-exif.
+struct ExifInfo {
+    iso: String,
+    shutter: String,
+    aperture: String,
+    lens_make: Option<String>,
+    lens_model: Option<String>,
+    orientation: u32,
+    focal: Option<f32>,
+    focal_35mm: Option<f32>,
+    fnumber: Option<f32>,
+}
+
 /// Phase 119: EXIF extraction via kamadak-exif only (rexif removed)
-fn extract_metadata_kamadak(path: &str) -> (String, String, String, String, u32) {
-    let mut iso = "---".to_string();
-    let mut shutter = "---".to_string();
-    let mut aperture = "---".to_string();
-    let mut lens = "---".to_string();
-    let mut orientation: u32 = 1;
+fn extract_metadata_kamadak(path: &str) -> ExifInfo {
+    let mut info = ExifInfo {
+        iso: "---".to_string(),
+        shutter: "---".to_string(),
+        aperture: "---".to_string(),
+        lens_make: None,
+        lens_model: None,
+        orientation: 1,
+        focal: None,
+        focal_35mm: None,
+        fnumber: None,
+    };
+    let number = |field: &exif::Field| -> Option<f32> {
+        match &field.value {
+            exif::Value::Rational(v) => v.first().map(|r| r.to_f64() as f32),
+            exif::Value::SRational(v) => v.first().map(|r| r.to_f64() as f32),
+            other => other.get_uint(0).map(|u| u as f32),
+        }
+        .filter(|v| v.is_finite() && *v > 0.0)
+    };
+    let text = |field: &exif::Field| -> Option<String> {
+        let s = field.display_value().to_string().trim_matches('"').trim().to_string();
+        (!s.is_empty()).then_some(s)
+    };
 
     if let Ok(file) = std::fs::File::open(path) {
         let mut bufreader = std::io::BufReader::new(&file);
         let reader = exif::Reader::new();
 
         if let Ok(exif_data) = reader.read_from_container(&mut bufreader) {
-            if let Some(field) = exif_data.get_field(exif::Tag::PhotographicSensitivity, exif::In::PRIMARY) {
-                iso = field.display_value().to_string();
+            let get = |tag| exif_data.get_field(tag, exif::In::PRIMARY);
+            if let Some(field) = get(exif::Tag::PhotographicSensitivity) {
+                info.iso = field.display_value().to_string();
             }
-            if let Some(field) = exif_data.get_field(exif::Tag::ExposureTime, exif::In::PRIMARY) {
-                shutter = field.display_value().to_string().replace(" s", "");
+            if let Some(field) = get(exif::Tag::ExposureTime) {
+                info.shutter = field.display_value().to_string().replace(" s", "");
             }
-            if let Some(field) = exif_data.get_field(exif::Tag::FNumber, exif::In::PRIMARY) {
-                aperture = field.display_value().to_string().replace("f/", "");
+            if let Some(field) = get(exif::Tag::FNumber) {
+                info.aperture = field.display_value().to_string().replace("f/", "");
+                info.fnumber = number(field);
             }
-            if let Some(field) = exif_data.get_field(exif::Tag::LensModel, exif::In::PRIMARY) {
-                lens = field.display_value().to_string().trim_matches('"').to_string();
+            if let Some(field) = get(exif::Tag::LensModel) {
+                info.lens_model = text(field);
             }
-            if let Some(field) = exif_data.get_field(exif::Tag::Orientation, exif::In::PRIMARY) {
+            if let Some(field) = get(exif::Tag::LensMake) {
+                info.lens_make = text(field);
+            }
+            if let Some(field) = get(exif::Tag::FocalLength) {
+                info.focal = number(field);
+            }
+            if let Some(field) = get(exif::Tag::FocalLengthIn35mmFilm) {
+                info.focal_35mm = number(field);
+            }
+            if let Some(field) = get(exif::Tag::Orientation) {
                 if let Some(v) = field.value.get_uint(0) {
-                    orientation = v;
+                    info.orientation = v;
                 }
             }
         }
     }
 
-    (iso, shutter, aperture, lens, orientation)
+    info
 }
 
 /// Normalise an EXIF orientation (1–8) to the subset the pipeline renders:

@@ -33,6 +33,23 @@ pub enum DragMode {
     MaskHandle(MaskHandle),
 }
 
+/// Brush tool settings (UI state, remembered across masks).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BrushSettings {
+    /// Radius as a fraction of the image height.
+    pub size: f32,
+    pub feather: f32,
+    pub flow: f32,
+    /// Erase instead of paint (Alt inverts it while held).
+    pub erase: bool,
+}
+
+impl Default for BrushSettings {
+    fn default() -> Self {
+        Self { size: 0.05, feather: 0.6, flow: 1.0, erase: false }
+    }
+}
+
 /// Local adjustment mask tool mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MaskTool {
@@ -403,6 +420,20 @@ pub struct RawEditor {
     /// Index into current_edit_params.masks of the mask being edited
     /// (overlay handles + sidebar sliders). None = no mask selected.
     pub selected_mask: Option<usize>,
+    /// Brush tool settings for painting masks (UI state).
+    pub brush_settings: BrushSettings,
+    /// Painting into the selected mask is armed (always on for brush masks).
+    pub brush_armed: bool,
+    /// A stroke is in progress.
+    pub is_painting: bool,
+    /// Tint the selected mask's coverage over the render.
+    pub show_mask_overlay: bool,
+    /// The colour-range eyedropper is armed for this mask.
+    pub color_picking_mask: Option<usize>,
+    /// Collapsed Develop sidebar sections (UI state).
+    pub collapsed_sections: HashSet<crate::app::message::SidebarSection>,
+    /// Which point curve the curve editor is showing (UI state, not an edit).
+    pub curve_channel: crate::core::curves::CurveChannel,
     /// Phase 67: Drag mode for interaction
     pub drag_mode: DragMode,
     /// Phase 78: Async Task Deduplication (track pending preview loads)
@@ -646,6 +677,20 @@ impl RawEditor {
                 is_wb_picking: false,
                 mask_tool: MaskTool::Inactive,
                 selected_mask: None,
+                curve_channel: crate::core::curves::CurveChannel::Master,
+                brush_settings: BrushSettings::default(),
+                brush_armed: false,
+                is_painting: false,
+                show_mask_overlay: false,
+                color_picking_mask: None,
+                // Lens and defringe start folded: they are set-once tools, and
+                // the sidebar is long enough without them open.
+                collapsed_sections: [
+                    crate::app::message::SidebarSection::Lens,
+                    crate::app::message::SidebarSection::Defringe,
+                ]
+                .into_iter()
+                .collect(),
                 drag_mode: DragMode::None,
                 pending_loads: HashSet::new(),
                 queued_loads: Vec::new(),
@@ -689,13 +734,9 @@ impl RawEditor {
             // dragging, grabbing a crop handle and letting go — must not add a
             // step, or the next Undo visibly does nothing. `is_cropping` is
             // tool state, so entering crop mode alone isn't an edit either.
-            let unchanged = stack.get(*index).is_some_and(|top| {
-                let mut a = *top;
-                let mut b = params_to_push;
-                a.is_cropping = 0;
-                b.is_cropping = 0;
-                a == b
-            });
+            let unchanged = stack
+                .get(*index)
+                .is_some_and(|top| top.without_tool_state() == params_to_push.without_tool_state());
             if unchanged {
                 return;
             }
@@ -723,6 +764,16 @@ impl RawEditor {
     /// the crop overlay disagreeing about whether crop mode is on.
     pub fn sync_tool_flags(&mut self) {
         self.current_edit_params.is_cropping = u32::from(self.is_cropping);
+        // The mask overlay shows while the user asks for it, or while a
+        // stroke is being painted (you need to see what you are painting).
+        self.current_edit_params.mask_overlay = match self.selected_mask {
+            Some(i) if (self.show_mask_overlay || self.is_painting)
+                && i < self.current_edit_params.mask_count as usize =>
+            {
+                i as u32 + 1
+            }
+            _ => 0,
+        };
     }
 
     /// True while the mask tool wants the preview canvas (placement mode or a

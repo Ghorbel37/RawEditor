@@ -82,10 +82,17 @@ lookup table on the CPU.
 
 ![Alt text](./docs/screenshots/tone-mapping.png)
 
-**Local adjustments.** Up to eight linear or radial masks per image, evaluated
-analytically on the GPU. Radial masks rotate for faces and other off-axis
-subjects. Each carries its own exposure, contrast, saturation, warmth, tint,
-highlights and shadows.
+**Point curves.** An RGB curve plus separate red, green and blue curves,
+edited directly over the histogram. Monotone interpolation, so a steep curve
+never overshoots into a tonal reversal.
+
+**Local adjustments.** Up to eight masks per image: linear and radial
+gradients, brush masks, and range masks that select by luminance or by a
+picked colour. Any mask can be refined with the brush (paint to add, Alt to
+erase) and narrowed by luminance and colour ranges; a red overlay shows its
+coverage. Radial masks rotate for faces and other off-axis subjects. Each mask
+carries its own exposure, contrast, highlights, shadows, saturation, hue,
+warmth and tint.
 
 ![Alt text](./docs/screenshots/masks.png)
 
@@ -93,12 +100,23 @@ highlights and shadows.
 reveals the full sensor area with the discarded region dimmed, so you can
 recompose against everything the camera captured.
 
-**Detail.** Luminance and colour noise reduction, and edge-masked unsharp
-sharpening.
+**Detail.** Noise reduction measures each image's own sensor noise and works
+relative to it, so a slider position means the same at ISO 100 and ISO 3200:
+non-local means for luminance grain, multi-scale edge-aware smoothing for
+colour blotches. Plus edge-masked unsharp sharpening.
+
+**Lens corrections.** Distortion, vignetting and lateral chromatic aberration
+from [lensfun](https://lensfun.github.io/) profiles, matched automatically
+(including lenses identified only in maker notes), with manual controls that
+work without a profile and an automatic zoom that keeps empty borders out of
+the frame. Purple and green fringe removal handles the axial aberration no
+profile can. Profiles are read from an installed lensfun database (the
+`lensfun` package, or XML files in `~/.local/share/raw-editor/lensfun/`) —
+none is bundled.
 
 **History and copying.** Full undo/redo per image. Settings can be copied
 between images by category — tone, colour, white balance, noise, detail,
-geometry, profile, and local masks — so you can push a white balance across a
+geometry, profile, lens corrections, and local masks — so you can push a white balance across a
 shoot without disturbing anything else.
 
 ![Alt text](./docs/screenshots/copy-settings.png)
@@ -140,9 +158,11 @@ and re-uploading roughly 24 million pixels to show about two million. Panning
 re-projects the existing texture and does not re-render at all until you leave
 a pre-rendered margin.
 
-**Debayering happens once.** The pipeline is split in two: a debayer pass that
-runs only when the sensor data changes, and a colour pass that reruns as you
-drag a slider. Moving Exposure does not re-debayer 24 megapixels.
+**Debayering happens once.** The pipeline is split: an RCD demosaic that runs
+only when the image loads, cached stages (noise reduction, curves, brush
+masks) that rerun only when their own settings change, and a colour pass that
+reruns as you drag a slider. Moving Exposure does not re-demosaic or re-denoise
+24 megapixels.
 
 **One matrix multiply per pixel.** The camera→XYZ→ProPhoto conversion is
 composed on the CPU once per frame into a single matrix, so the shader never
@@ -270,7 +290,9 @@ cargo clippy            # lints
 
 Working and in use, but young. Known gaps:
 
-- Noise reduction and sharpening do not yet match Lightroom's quality.
+- Sharpening is a basic edge-masked unsharp mask. Noise reduction has been
+  tuned on Nikon files only, and at 100% zoom on a large sensor each move of a
+  noise slider costs a few hundred milliseconds.
 - Keyboard shortcuts are not user-configurable.
 - Camera profiles are read for their colour matrices, hue/saturation map and
   tone curve, but the optional look table is not applied. Profiles that put

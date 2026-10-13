@@ -1,6 +1,10 @@
+pub mod brush;
+pub mod curves;
 pub mod histogram;
+pub mod lens;
 pub mod logging;
 pub mod memory;
+pub mod noise;
 pub mod profiler;
 pub mod settings;
 pub mod tonemap;

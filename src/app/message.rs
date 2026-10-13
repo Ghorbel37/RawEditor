@@ -16,6 +16,27 @@ pub enum MaskAdjustment {
     Feather,
     Tint,
     Rotation,
+    Hue,
+    LumaLo,
+    LumaHi,
+    LumaSmooth,
+    ColorTolerance,
+}
+
+/// Brush tool settings (see `BrushSettingChanged`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrushSetting {
+    Size,
+    Feather,
+    Flow,
+}
+
+/// One phase of a brush stroke on the preview, in full-image display UV.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StrokeEvent {
+    Begin(f32, f32),
+    Move(f32, f32),
+    End,
 }
 
 /// Which GT (Uchimura) shape parameter a slider targets. Mirrors the
@@ -29,6 +50,42 @@ pub enum GtParam {
     BlackTightness,
 }
 
+/// Which lens-correction slider changed (see `LensParamChanged`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LensParam {
+    ProfileDistortion,
+    ProfileVignetting,
+    Distortion,
+    Vignetting,
+    CaRed,
+    CaBlue,
+}
+
+/// Which lens-correction checkbox changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LensToggle {
+    Profile,
+    ProfileCa,
+    Constrain,
+}
+
+/// Which defringe slider changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefringeParam {
+    PurpleAmount,
+    PurpleHue,
+    GreenAmount,
+    GreenHue,
+}
+
+/// Collapsible Develop sidebar sections (UI state only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SidebarSection {
+    ToneCurve,
+    Lens,
+    Defringe,
+}
+
 /// Which group of adjustments a Copy Settings checkbox targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CopyCategory {
@@ -40,6 +97,7 @@ pub enum CopyCategory {
     Geometry,
     Profile,
     Masks,
+    Lens,
     BlackLevels,
 }
 
@@ -134,6 +192,22 @@ pub enum Message {
     VibranceChanged(f32),
     /// User changed DCP profile tone-curve strength (0.0..=1.0)
     ProfileCurveChanged(f32),
+    /// A point curve was edited in the curve editor: (channel, new curve,
+    /// commit an undo step now). Drags send `false` per move and commit on
+    /// release via `CommitEdit`; discrete edits (delete) send `true`.
+    CurveChanged(crate::core::curves::CurveChannel, crate::core::curves::Curve, bool),
+    /// Show another channel's curve in the editor.
+    SetCurveChannel(crate::core::curves::CurveChannel),
+    /// Reset the curve of the channel being shown.
+    ResetCurve,
+    /// A lens-correction slider moved.
+    LensParamChanged(LensParam, f32),
+    /// A lens-correction checkbox toggled.
+    LensToggled(LensToggle, bool),
+    /// A defringe slider moved.
+    DefringeChanged(DefringeParam, f32),
+    /// Expand/collapse a Develop sidebar section.
+    ToggleSection(SidebarSection),
     /// Select the tone mapping operator (see `core::tonemap`).
     ToneMapperChanged(crate::core::tonemap::ToneMapper),
     /// Adjust one of the GT curve's shape parameters.
@@ -151,6 +225,8 @@ pub enum Message {
     TintChanged(f32),
     /// User changed noise reduction slider (Phase 49)
     LumaNoiseChanged(f32),
+    /// Luminance NR detail retention
+    LumaDetailChanged(f32),
     ColorNoiseChanged(f32),
     /// User changed sharpening slider (Phase 50)
     SharpeningChanged(f32),
@@ -223,6 +299,27 @@ pub enum Message {
     MaskPlacementStarted(f32, f32),
     /// User grabbed a handle of the selected mask on the canvas
     MaskHandleGrabbed(MaskHandle, Rectangle),
+    /// Arm/disarm painting into the selected mask.
+    ToggleBrushArmed,
+    /// Paint (false) or erase (true).
+    SetBrushErase(bool),
+    BrushSettingChanged(BrushSetting, f32),
+    /// Painting on the preview.
+    BrushStroke(StrokeEvent),
+    /// Remove every stroke of the selected mask.
+    ClearMaskBrush,
+    /// Show the selected mask's coverage as a red overlay.
+    ToggleMaskOverlay(bool),
+    /// Luminance-range refinement on/off for the selected mask.
+    ToggleMaskLumaRange(bool),
+    /// Colour-range refinement on/off for the selected mask. Turning it on
+    /// arms the eyedropper.
+    ToggleMaskColorRange(bool),
+    /// Re-arm the colour-range eyedropper.
+    PickMaskColor,
+    /// Eyedropper click: display-space UV within the rendered image, like
+    /// `WbPicked`.
+    MaskColorPicked(f32, f32),
     /// Phase 67: Delete Image — opens the confirm modal, or (if every
     /// targeted image is already marked) instantly toggles the mark off.
     DeleteImage,

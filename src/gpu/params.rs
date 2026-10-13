@@ -5,12 +5,12 @@ use crate::core::types::{EditParams, MaskParams, MAX_MASKS};
 /// whole-image regardless of where the display pass is looking.
 pub const FULL_VIEW_RECT: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
 
-/// GPU-friendly local adjustment mask: four vec4s (64 bytes), so the WGSL
+/// GPU-friendly local adjustment mask: seven vec4s (112 bytes), so the WGSL
 /// uniform array stride is a multiple of 16 and Pod has no padding holes.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuMask {
-    /// x: type (0 linear / 1 radial), y: enabled, z: invert, w: feather
+    /// x: type (MASK_*), y: enabled, z: invert, w: feather
     pub info: [f32; 4],
     /// linear: (ax, ay, bx, by); radial: (cx, cy, rx, ry)
     pub geom: [f32; 4],
@@ -18,15 +18,47 @@ pub struct GpuMask {
     pub adj0: [f32; 4],
     /// highlights, shadows, tint, rotation (radians)
     pub adj1: [f32; 4],
+    /// hue (radians), has brush strokes, luma range on, colour range on
+    pub adj2: [f32; 4],
+    /// luma lo, luma hi, luma smooth, colour tolerance
+    pub range: [f32; 4],
+    /// colour target (ln r/g, ln b/g), unused ×2
+    pub color: [f32; 4],
 }
 
-impl From<&MaskParams> for GpuMask {
-    fn from(m: &MaskParams) -> Self {
+/// Largest hue rotation of the local Hue slider at ±1.
+pub const MASK_HUE_RANGE_DEG: f32 = 30.0;
+
+impl GpuMask {
+    pub fn new(m: &MaskParams, has_brush: bool) -> Self {
         Self {
             info: [m.mask_type as f32, m.enabled as f32, m.invert as f32, m.feather],
             geom: [m.ax, m.ay, m.bx, m.by],
             adj0: [m.exposure, m.contrast, m.saturation, m.warmth],
             adj1: [m.highlights, m.shadows, m.tint, m.rotation.to_radians()],
+            adj2: [
+                (m.hue.clamp(-1.0, 1.0) * MASK_HUE_RANGE_DEG).to_radians(),
+                if has_brush { 1.0 } else { 0.0 },
+                m.luma_range as f32,
+                m.color_range as f32,
+            ],
+            range: [m.luma_lo, m.luma_hi, m.luma_smooth.max(1e-3), m.color_tolerance],
+            color: [m.color_target[0], m.color_target[1], 0.0, 0.0],
+        }
+    }
+}
+
+/// The mask uniform buffer (colour pass, group 1).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuMasks {
+    pub masks: [GpuMask; MAX_MASKS],
+}
+
+impl GpuMasks {
+    pub fn from_params(p: &EditParams) -> Self {
+        Self {
+            masks: std::array::from_fn(|i| GpuMask::new(&p.masks[i], p.brush.has_strokes_for(i))),
         }
     }
 }
@@ -116,10 +148,48 @@ pub struct GpuEditParams {
     /// Claims one of three dead pad slots, so nothing moved and the struct is
     /// still 784 bytes — asserted below.
     pub tone_mapper: u32,
-    _pad_masks_2: u32,
-    _pad_masks_3: u32,
-    /// Local adjustment masks; only the first `mask_count` are evaluated.
-    pub masks: [GpuMask; MAX_MASKS],
+    /// 1 when any point curve is non-identity: the shader then samples the
+    /// baked curve LUT (binding 6). Another former pad slot — no offsets moved.
+    pub curve_active: u32,
+    /// Mask overlay: 0 = off, i + 1 = tint mask i red over the render so its
+    /// coverage is visible while painting or tuning ranges. Former pad slot.
+    pub mask_overlay: u32,
+    /// Lens correction (`core::lens::GpuLens`), evaluated in the shader's
+    /// Step 0. Packed as vec4s so every field sits on a 16-byte boundary:
+    /// dist = (p0, p1, p2, p3)
+    pub lens_dist: [f32; 4],
+    /// (p4, scale.x, scale.y, active 0/1)
+    pub lens_misc: [f32; 4],
+    /// red TCA (v, c, b), vignetting radius ratio
+    pub lens_tca_r: [f32; 4],
+    /// blue TCA (v, c, b), manual vignetting amount
+    pub lens_tca_b: [f32; 4],
+    /// PA vignetting (k1, k2, k3), 1 / output corner radius
+    pub lens_vig: [f32; 4],
+    /// Defringe: purple amount, purple hue°, green amount, green hue°
+    pub defringe: [f32; 4],
+    /// Defringe: active 0/1, edge search radius in texels, unused ×2
+    pub defringe_misc: [f32; 4],
+    // The masks themselves live in their own uniform buffer (`GpuMasks`,
+    // bind group 1) next to the brush layers they sample.
+}
+
+impl GpuEditParams {
+    /// Fill the lens block from a resolved `GpuLens`.
+    pub fn set_lens(&mut self, g: &crate::core::lens::GpuLens) {
+        self.lens_dist = [g.dist[0], g.dist[1], g.dist[2], g.dist[3]];
+        self.lens_misc = [g.dist[4], g.scale[0], g.scale[1], if g.active { 1.0 } else { 0.0 }];
+        self.lens_tca_r = [g.tca_r[0], g.tca_r[1], g.tca_r[2], g.vig_ratio];
+        self.lens_tca_b = [g.tca_b[0], g.tca_b[1], g.tca_b[2], g.manual_vig];
+        self.lens_vig = [g.vig[0], g.vig[1], g.vig[2], g.inv_corner];
+    }
+
+    /// Defringe's edge search radius, in texels of the working texture.
+    /// Fringes are a few SENSOR pixels wide, so a subsampled preview needs a
+    /// proportionally smaller radius.
+    pub fn set_defringe_radius(&mut self, stride: f32) {
+        self.defringe_misc[1] = (3.0 / stride.max(1.0)).round().clamp(1.0, 3.0);
+    }
 }
 
 impl From<&EditParams> for GpuEditParams {
@@ -172,9 +242,20 @@ impl From<&EditParams> for GpuEditParams {
             orientation: 1,
             mask_count: params.mask_count.min(MAX_MASKS as u32),
             tone_mapper: params.tone_mapper.shader_id(),
-            _pad_masks_2: 0,
-            _pad_masks_3: 0,
-            masks: std::array::from_fn(|i| GpuMask::from(&params.masks[i])),
+            curve_active: u32::from(!params.curves.is_identity()),
+            mask_overlay: params.mask_overlay.min(MAX_MASKS as u32),
+            lens_dist: [1.0, 0.0, 0.0, 0.0],
+            lens_misc: [0.0, 1.0, 1.0, 0.0],
+            lens_tca_r: [1.0, 0.0, 0.0, 1.0],
+            lens_tca_b: [1.0, 0.0, 0.0, 0.0],
+            lens_vig: [0.0, 0.0, 0.0, 1.0],
+            defringe: [
+                params.defringe.purple_amount.clamp(0.0, 1.0),
+                params.defringe.purple_hue,
+                params.defringe.green_amount.clamp(0.0, 1.0),
+                params.defringe.green_hue,
+            ],
+            defringe_misc: [if params.defringe.is_active() { 1.0 } else { 0.0 }, 2.0, 0.0, 0.0],
         }
     }
 }
@@ -187,21 +268,24 @@ mod tests {
     /// one shared uniform buffer — a size drift here corrupts GPU memory.
     #[test]
     fn gpu_struct_sizes_match_wgsl_layout() {
-        assert_eq!(std::mem::size_of::<GpuMask>(), 64);
-        // 256 (base) + 16 (mask_count + tone_mapper + pad) + 8 × 64 (masks)
-        assert_eq!(std::mem::size_of::<GpuEditParams>(), 784);
+        assert_eq!(std::mem::size_of::<GpuMask>(), 112);
+        assert_eq!(std::mem::size_of::<GpuMasks>(), 8 * 112);
+        // 256 (base) + 16 (mask_count, tone_mapper, curve_active, overlay)
+        // + 7 × 16 (lens + defringe)
+        assert_eq!(std::mem::size_of::<GpuEditParams>(), 384);
+        assert_eq!(std::mem::offset_of!(GpuEditParams, lens_dist), 272);
     }
 
     /// `tone_mapper` claimed a dead pad slot specifically so nothing moved.
     /// If it ever displaces `masks`, every mask reads garbage.
     #[test]
-    fn tone_mapper_did_not_disturb_the_mask_array() {
+    fn tone_mapper_sits_beside_mask_count() {
         assert_eq!(
             std::mem::offset_of!(GpuEditParams, tone_mapper),
             std::mem::offset_of!(GpuEditParams, mask_count) + 4
         );
-        // masks is a vec4-aligned array; it must stay on its 16-byte boundary.
-        assert_eq!(std::mem::offset_of!(GpuEditParams, masks) % 16, 0);
+        // The lens block is vec4s; it must start on a 16-byte boundary.
+        assert_eq!(std::mem::offset_of!(GpuEditParams, lens_dist) % 16, 0);
     }
 
     #[test]
@@ -246,7 +330,7 @@ mod tests {
         m.invert = 1;
         m.tint = 0.4;
         m.rotation = 90.0;
-        let g = GpuMask::from(&m);
+        let g = GpuMask::new(&m, false);
         assert_eq!(g.info, [1.0, 1.0, 1.0, 0.5]);
         assert_eq!(g.geom, [0.5, 0.4, 0.3, 0.2]);
         assert_eq!(g.adj0[0], -1.5);

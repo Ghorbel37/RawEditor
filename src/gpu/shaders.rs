@@ -7,7 +7,7 @@
 ///   1.  Debayer          – camera-native linear RGB
 ///   2.  White Balance    – camera-space per-channel multipliers
 ///   3.  Color Matrix     – camera → sRGB linear (Bradford D50→D65 adapted)
-///   4.  Noise Reduction  – chroma denoising with Rec.709 luma (valid in sRGB)
+///   4.  (Noise reduction runs before this pass — see gpu/denoise.rs)
 ///   5.  Sharpening       – unsharp mask in sRGB linear
 ///   6.  Temperature/Tint – blue-yellow and green-magenta axes in sRGB space
 ///   7.  Highlight clamp  – neutralise near-clipping channels before exposure
@@ -181,21 +181,49 @@ struct EditParams {
     // the operator's shape arrives baked into the tone curve LUT. Occupies a
     // formerly-dead pad slot, so no offset moved. See gpu/params.rs.
     tone_mapper: u32,
-    pad_masks_2: u32,
-    pad_masks_3: u32,
-    masks: array<Mask, 8>,
+    // 1 = sample the baked point-curve LUT (binding 6) in display space.
+    curve_active: u32,
+    // 0 = off, i + 1 = tint mask i's coverage red (see the end of fs_main).
+    mask_overlay: u32,
+    // Lens correction — see core::lens and Step 0. Mirrors gpu/params.rs.
+    lens_dist: vec4<f32>,      // r_d/r_u polynomial p0..p3
+    lens_misc: vec4<f32>,      // p4, scale.x, scale.y, active
+    lens_tca_r: vec4<f32>,     // red (v, c, b), vignetting radius ratio
+    lens_tca_b: vec4<f32>,     // blue (v, c, b), manual vignetting amount
+    lens_vig: vec4<f32>,       // PA k1..k3, 1 / output corner radius
+    defringe: vec4<f32>,       // purple amount, purple hue°, green amount, green hue°
+    defringe_misc: vec4<f32>,  // active, edge radius (texels), -, -
 }
 
-// One local adjustment mask (64 bytes — uniform array stride must be ×16).
-// Geometry lives in full-image display UV, the same space as params.crop, so
-// masks stay glued to image content when the crop changes. Like the crop
-// rectangle, masks do not follow the straighten rotation.
+// One local adjustment mask (112 bytes — uniform array stride must be ×16).
+// Mirrors gpu/params.rs GpuMask. Geometry lives in full-image display UV, the
+// same space as params.crop, so masks stay glued to image content when the
+// crop changes. Like the crop rectangle, masks do not follow the straighten
+// rotation.
 struct Mask {
-    info: vec4<f32>,  // x: type (0 linear / 1 radial), y: enabled, z: invert, w: feather
+    info: vec4<f32>,  // x: type (0 linear / 1 radial / 2 brush / 3 range), y: enabled, z: invert, w: feather
     geom: vec4<f32>,  // linear: ax, ay, bx, by;  radial: cx, cy, rx, ry
     adj0: vec4<f32>,  // exposure (EV), contrast, saturation, warmth
     adj1: vec4<f32>,  // highlights, shadows, tint, rotation (radians)
+    adj2: vec4<f32>,  // hue (radians), has brush layer, luma range on, colour range on
+    range: vec4<f32>, // luma lo, luma hi, luma smooth, colour tolerance
+    color: vec4<f32>, // colour target (ln r/g, ln b/g), -, -
 }
+
+struct MaskBlock {
+    masks: array<Mask, 8>,
+}
+
+// Group 1: local masks and the brush layers they paint into (gpu/brush.rs).
+@group(1) @binding(0)
+var brush_layers: texture_2d_array<f32>;
+
+@group(1) @binding(1)
+var<uniform> mask_block: MaskBlock;
+
+// Log-chromaticity epsilon for colour-range masks. MIRRORED from
+// core::types::MASK_CHROMA_EPS — `shader_mask_constants_match_rust` checks.
+const MASK_CHROMA_EPS: f32 = 0.004;
 
 // Phase 128: Pass 2 now reads the debayered Rgba16Float intermediate texture.
 @group(0) @binding(0)
@@ -216,6 +244,16 @@ var tone_curve: texture_1d<f32>;
 
 @group(0) @binding(5)
 var lut_sampler: sampler;
+
+// Point curves, baked on the CPU (core::curves): rgb = R∘M, G∘M, B∘M.
+@group(0) @binding(6)
+var curve_lut: texture_1d<f32>;
+
+fn sample_curve(x: f32) -> vec4<f32> {
+    let n = f32(textureDimensions(curve_lut));
+    let c = (clamp(x, 0.0, 1.0) * (n - 1.0) + 0.5) / n;
+    return textureSampleLevel(curve_lut, lut_sampler, c, 0.0);
+}
 
 // Phase 128: Debayer functions removed — Pass 2 reads pre-debayered float texture.
 // Neighbour helper for NR / sharpening.  One texture read per neighbour
@@ -251,9 +289,15 @@ fn get_cam_luma(coords: vec2<i32>, dimensions: vec2<u32>) -> f32 {
 // isn't square-pixel, so the radial branch's rotation must un-distort to an
 // isotropic frame before rotating, or a rotated ellipse would come out
 // sheared instead of rotated on any non-square image.
-fn mask_weight(m: Mask, p: vec2<f32>, aspect: f32) -> f32 {
+fn mask_shape(m: Mask, p: vec2<f32>, aspect: f32) -> f32 {
     var w: f32;
-    if (m.info.x < 0.5) {
+    if (m.info.x > 2.5) {
+        // Range mask: the whole frame, narrowed only by its refinements.
+        w = 1.0;
+    } else if (m.info.x > 1.5) {
+        // Brush mask: nothing but what is painted.
+        w = 0.0;
+    } else if (m.info.x < 0.5) {
         // Linear gradient: weight 1 at A falling smoothly to 0 at B.
         // Iso-lines are perpendicular to B−A in UV space.
         let d = m.geom.zw - m.geom.xy;
@@ -280,10 +324,46 @@ fn mask_weight(m: Mask, p: vec2<f32>, aspect: f32) -> f32 {
         let inner = 1.0 - clamp(m.info.w, 0.0, 0.999);
         w = 1.0 - smoothstep(inner, 1.0, r);
     }
+    return w;
+}
+
+// Full weight of mask `idx` at `p`: shape, plus its brush layer (signed:
+// painting adds, erasing subtracts), times its range refinements, then
+// inverted if asked. `color0` is the pixel as it entered the mask stage
+// (linear sRGB) and `cam0` its camera-native value, for the luminance and
+// colour ranges respectively.
+fn mask_weight(m: Mask, idx: u32, p: vec2<f32>, aspect: f32, color0: vec3<f32>, cam0: vec3<f32>) -> f32 {
+    var w = mask_shape(m, p, aspect);
+    if (m.adj2.y > 0.5) {
+        w = w + textureSampleLevel(brush_layers, lut_sampler, p, i32(idx), 0.0).r;
+    }
+    w = clamp(w, 0.0, 1.0);
+    if (m.adj2.z > 0.5) {
+        // Luminance band in display terms, where a photographer reads it.
+        let lum = linear_to_srgb(max(dot(color0, vec3<f32>(0.2126, 0.7152, 0.0722)), 0.0));
+        let s = m.range.z;
+        w = w * smoothstep(m.range.x - s, m.range.x, lum) * (1.0 - smoothstep(m.range.y, m.range.y + s, lum));
+    }
+    if (m.adj2.w > 0.5) {
+        // Exposure-invariant chromaticity of the camera-native colour.
+        let c = max(cam0, vec3<f32>(0.0)) + vec3<f32>(MASK_CHROMA_EPS);
+        let lc = vec2<f32>(log(c.r / c.g), log(c.b / c.g));
+        let d = distance(lc, m.color.xy);
+        let tol = 0.04 + 0.5 * m.range.w;
+        w = w * (1.0 - smoothstep(tol, tol * 1.5 + 0.03, d));
+    }
     if (m.info.z > 0.5) {
         w = 1.0 - w;
     }
     return w;
+}
+
+// Rotate a colour about the grey axis (Rodrigues): changes hue, keeps the
+// channel mean.
+fn hue_rotate(c: vec3<f32>, a: f32) -> vec3<f32> {
+    let k = vec3<f32>(0.57735027);
+    let ca = cos(a);
+    return c * ca + cross(k, c) * sin(a) + k * dot(k, c) * (1.0 - ca);
 }
 
 // Top of the scene-linear domain the tone LUT covers.
@@ -478,15 +558,69 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 
     let dimensions = textureDimensions(input_texture);
 
+    // ── Step 0: Lens correction ──────────────────────────────────────────────
+    // `tex_coords` is now this OUTPUT pixel's position in sensor UV. Map it to
+    // the SOURCE position it comes from (core::lens): geometry first, then
+    // per-channel lateral CA on the distorted coordinate, exactly as lensfun's
+    // models are defined. `lens_misc.yz` takes a UV offset from centre into
+    // the profile's calibration units (constrain zoom folded in).
+    var uv_r = tex_coords;
+    var uv_b = tex_coords;
+    var lens_gain = 1.0;
+    let lens_on = params.lens_misc.w > 0.5;
+    if (lens_on) {
+        let lscale = params.lens_misc.yz;
+        let p = (tex_coords - vec2<f32>(0.5)) * lscale;
+        let ru = length(p);
+        let dc = params.lens_dist;
+        let f = dc.x + ru * (dc.y + ru * (dc.z + ru * (dc.w + ru * params.lens_misc.x)));
+        let pd = p * f;
+        let rd = length(pd);
+        let fr = params.lens_tca_r.x + rd * (params.lens_tca_r.y + rd * params.lens_tca_r.z);
+        let fb = params.lens_tca_b.x + rd * (params.lens_tca_b.y + rd * params.lens_tca_b.z);
+        tex_coords = pd / lscale + vec2<f32>(0.5);
+        uv_r = pd * fr / lscale + vec2<f32>(0.5);
+        uv_b = pd * fb / lscale + vec2<f32>(0.5);
+
+        // Profile vignetting (PA model) at the SOURCE radius, which lensfun
+        // normalises to the half-diagonal.
+        let rv = rd * params.lens_tca_r.w;
+        let rv2 = rv * rv;
+        let k = params.lens_vig.xyz;
+        lens_gain = 1.0 / max(1.0 + rv2 * (k.x + rv2 * (k.y + rv2 * k.z)), 0.05);
+        // Manual vignetting on the OUTPUT frame: ±1 = ±1 stop at the corner.
+        let rn = ru * params.lens_vig.w;
+        let rn2 = rn * rn;
+        lens_gain *= exp2(params.lens_tca_b.w * (0.5 * rn2 + 0.5 * rn2 * rn2));
+
+        if (tex_coords.x < 0.0 || tex_coords.x > 1.0 || tex_coords.y < 0.0 || tex_coords.y > 1.0) {
+            return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+        }
+    }
+
     let pixel_coords = vec2<i32>(
         i32(tex_coords.x * f32(dimensions.x)),
         i32(tex_coords.y * f32(dimensions.y))
     );
 
     // ── Step 1: Read debayered camera-native linear RGB from intermediate ────
-    // var color = textureLoad(input_texture, pixel_coords, 0).rgb;
-    // Phase 135: Use textureSample with Linear Filtering for smooth downscaling
-    var color = textureSample(input_texture, texture_sampler, tex_coords).rgb;
+    // Phase 135: textureSample with linear filtering for smooth downscaling.
+    // With lens correction on, red and blue come from their own CA-shifted
+    // positions (explicit LOD: these coordinates are not a smooth function of
+    // the screen, so implicit derivatives would be meaningless).
+    var color: vec3<f32>;
+    if (lens_on) {
+        color = vec3<f32>(
+            textureSampleLevel(input_texture, texture_sampler, uv_r, 0.0).r,
+            textureSampleLevel(input_texture, texture_sampler, tex_coords, 0.0).g,
+            textureSampleLevel(input_texture, texture_sampler, uv_b, 0.0).b,
+        );
+    } else {
+        color = textureSample(input_texture, texture_sampler, tex_coords).rgb;
+    }
+    // Camera-native colour, for colour-range masks (exposure- and
+    // WB-independent by construction).
+    let cam0 = color;
 
     // Phase 135: Non-destructive dimming
     // If we are in crop mode, dim the area outside the current crop rectangle.
@@ -507,15 +641,14 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // ── Step 2: White Balance ─────────────────────────────────────────────────
     color = color * params.wb_multipliers.rgb;
 
-    // Pre-fetch the 8 nearest camera-space neighbours (WB-scaled).
-    // Both Phase 133 (NR) and Phase 132 (sharpening) need this ring — fetching
-    // it once here saves 8 textureLoad calls when both controls are active.
-    // The branch is uniform across the warp (params are constants), so no divergence.
+    // Pre-fetch the 8 nearest camera-space neighbours (WB-scaled) for the
+    // sharpening ring. The branch is uniform across the warp (params are
+    // constants), so no divergence.
     var nb_n  = vec3<f32>(0.0); var nb_s  = vec3<f32>(0.0);
     var nb_e  = vec3<f32>(0.0); var nb_w  = vec3<f32>(0.0);
     var nb_ne = vec3<f32>(0.0); var nb_nw = vec3<f32>(0.0);
     var nb_se = vec3<f32>(0.0); var nb_sw = vec3<f32>(0.0);
-    if (params.luma_noise > 0.0 || params.color_noise > 0.0 || params.sharpening > 0.0) {
+    if (params.sharpening > 0.0) {
         let wb3  = params.wb_multipliers.rgb;
         let dmax = vec2<i32>(dimensions) - vec2<i32>(1);
         nb_n  = textureLoad(input_texture, clamp(pixel_coords + vec2<i32>( 0, -1), vec2<i32>(0), dmax), 0).rgb * wb3;
@@ -528,69 +661,9 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         nb_sw = textureLoad(input_texture, clamp(pixel_coords + vec2<i32>(-1,  1), vec2<i32>(0), dmax), 0).rgb * wb3;
     }
 
-    // ── Phase 133: Split Luma & Chroma Noise Reduction ───────────────────────
-    if (params.luma_noise > 0.0 || params.color_noise > 0.0) {
-        // Green-dominant weights: green pixels are ~2× denser in a Bayer pattern
-        // and carry the most spatial detail. Equal weights (0.333) under-weight green,
-        // causing the bilateral to treat green/red (or green/blue) brightness
-        // differences as edges rather than noise.
-        let cam_luma_weights = vec3<f32>(0.25, 0.60, 0.15);
-
-        let c_Y = dot(color, cam_luma_weights);
-        let c_C = color - vec3<f32>(c_Y);
-
-        var sum_Y = c_Y;
-        var weight_Y = 1.0;
-        var sum_C = c_C;
-        var weight_C = 1.0;
-
-        // Bilateral sigma: range sensitivity derived from noise strength.
-        // sigma_r ≈ 0.05 at luma_noise=1 — blends neighbours within ~5% brightness.
-        let sigma_r_sq = (0.05 * params.luma_noise) * (0.05 * params.luma_noise);
-
-        // 3×3 bilateral luma NR + first pass of chroma accumulation.
-        // Uses the pre-fetched nb_* ring above — no extra texture reads here.
-        // Must be `var` (function address space) so dynamic indexing via `i` is valid.
-        var ring3 = array<vec3<f32>, 8>(nb_n, nb_s, nb_e, nb_w, nb_ne, nb_nw, nb_se, nb_sw);
-        for (var i: u32 = 0u; i < 8u; i++) {
-            let n_color = ring3[i];
-            let n_Y = dot(n_color, cam_luma_weights);
-            let n_C = n_color - vec3<f32>(n_Y);
-
-            if (params.luma_noise > 0.0) {
-                let diff_sq = (c_Y - n_Y) * (c_Y - n_Y);
-                let w_Y = exp(-diff_sq / (sigma_r_sq + 0.0001));
-                sum_Y += n_Y * w_Y;
-                weight_Y += w_Y;
-            }
-
-            if (params.color_noise > 0.0) {
-                sum_C += n_C * params.color_noise;
-                weight_C += params.color_noise;
-            }
-        }
-
-        // Extend chroma blur to 5×5: human vision has low chroma acuity so a larger
-        // kernel removes colour mottling without visible hue smearing.
-        // (The 3×3 ring is already accumulated above; here we add the outer ring only.)
-        if (params.color_noise > 0.0) {
-            for (var x: i32 = -2; x <= 2; x++) {
-                for (var y: i32 = -2; y <= 2; y++) {
-                    if (abs(x) <= 1 && abs(y) <= 1) { continue; }
-                    let clamped_coords = clamp(pixel_coords + vec2<i32>(x, y), vec2<i32>(0), vec2<i32>(dimensions) - vec2<i32>(1));
-                    let n_color = textureLoad(input_texture, clamped_coords, 0).rgb * params.wb_multipliers.rgb;
-                    let n_Y = dot(n_color, cam_luma_weights);
-                    let n_C = n_color - vec3<f32>(n_Y);
-                    sum_C += n_C * params.color_noise;
-                    weight_C += params.color_noise;
-                }
-            }
-        }
-
-        let final_Y = sum_Y / weight_Y;
-        let final_C = sum_C / weight_C;
-        color = vec3<f32>(final_Y) + final_C;
-    }
+    // (Noise reduction is no longer done here: it runs once per change in the
+    // cached denoise pre-pass — gpu/denoise.rs — and this pass samples its
+    // output. luma_noise / color_noise are vestigial in this struct.)
 
     // ── Step 3: Highlight neutralisation (camera space, per-channel) ──────────
     // When a raw sensor channel clips (hits digital saturation at raw = 1.0), its
@@ -640,7 +713,10 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     // ── Step 4: Exposure ──────────────────────────────────────────────────────
-    let exposure_multiplier = pow(2.0, params.exposure);
+    // The lens vignetting gain rides here rather than at sampling: applied
+    // before Step 3 it would push brightened corners past the clip thresholds
+    // and trigger false highlight reconstruction.
+    let exposure_multiplier = pow(2.0, params.exposure) * lens_gain;
     color = color * exposure_multiplier;
 
     // ── Step 5: Camera RGB → sRGB (DCP Pipeline vs Fallback) ────────────────
@@ -788,6 +864,52 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     }
     // Safety net for degenerate cases (all channels negative).
     color = max(color, vec3<f32>(0.0));
+
+    // ── Step 6b: Defringe (axial CA) ─────────────────────────────────────────
+    // Purple/green fringes sit beside high-contrast edges and are a property of
+    // the lens's focus, not its geometry, so Step 0 cannot remove them.
+    // Desaturate pixels whose hue falls in a fringe band AND that sit near a
+    // strong local luma edge; flat coloured areas are left alone.
+    if (params.defringe_misc.x > 0.5) {
+        let rad = i32(params.defringe_misc.y);
+        var lmax = get_cam_luma(pixel_coords, dimensions);
+        var lmin = lmax;
+        for (var dy = -1; dy <= 1; dy++) {
+            for (var dx = -1; dx <= 1; dx++) {
+                if (dx == 0 && dy == 0) { continue; }
+                let l = get_cam_luma(pixel_coords + vec2<i32>(dx, dy) * rad, dimensions);
+                lmax = max(lmax, l);
+                lmin = min(lmin, l);
+            }
+        }
+        let edge = smoothstep(0.15, 0.5, (lmax - lmin) / (lmax + 0.02));
+        let cmax = max(color.r, max(color.g, color.b));
+        let cmin = min(color.r, min(color.g, color.b));
+        let chroma = cmax - cmin;
+        if (edge > 0.0 && chroma > 1e-5) {
+            var hue: f32;
+            if (cmax == color.r) {
+                hue = (color.g - color.b) / chroma;
+            } else if (cmax == color.g) {
+                hue = (color.b - color.r) / chroma + 2.0;
+            } else {
+                hue = (color.r - color.g) / chroma + 4.0;
+            }
+            hue = fract(hue / 6.0 + 1.0) * 360.0;
+            let sat_w = smoothstep(0.08, 0.25, chroma / max(cmax, 1e-5));
+            let dp = abs(fract((hue - params.defringe.y) / 360.0 + 0.5) - 0.5) * 360.0;
+            let dg = abs(fract((hue - params.defringe.w) / 360.0 + 0.5) - 0.5) * 360.0;
+            // Purple fringes run from blue-violet to magenta, hence the wider
+            // band; green fringes are narrower in hue.
+            let band = max(
+                params.defringe.x * (1.0 - smoothstep(30.0, 60.0, dp)),
+                params.defringe.z * (1.0 - smoothstep(25.0, 50.0, dg)),
+            );
+            let w = clamp(band * edge * sat_w, 0.0, 1.0);
+            let lum = dot(color, vec3<f32>(0.2126, 0.7152, 0.0722));
+            color = mix(color, vec3<f32>(lum), w);
+        }
+    }
 
     // ── Phase 132: 5×5 Perceptual USM with Edge-Aware Masking ──────────────
     // All reads use get_cam_luma (WB + dot, no color matrix), which is ~5×
@@ -937,14 +1059,26 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     if (params.orientation == 6u || params.orientation == 8u) {
         mask_aspect = 1.0 / mask_aspect;
     }
+    // Every mask's luminance range keys off the pixel as it ENTERED this
+    // stage, so masks don't shift each other's selections.
+    let color0 = color;
+    var overlay_w = 0.0;
     for (var mi = 0u; mi < min(params.mask_count, 8u); mi = mi + 1u) {
-        let m = params.masks[mi];
+        let m = mask_block.masks[mi];
         if (m.info.y < 0.5) {
             continue;
         }
-        let w = mask_weight(m, input.tex_coords, mask_aspect);
+        let w = mask_weight(m, mi, input.tex_coords, mask_aspect, color0, cam0);
+        if (params.mask_overlay == mi + 1u) {
+            overlay_w = w;
+        }
         if (w < 0.001) {
             continue;
+        }
+
+        // Hue: rotate about the grey axis (±30° at ±1).
+        if (m.adj2.x != 0.0) {
+            color = mix(color, hue_rotate(color, m.adj2.x), w);
         }
 
         // Adjustment ranges: exposure ±4 EV; all others −1..1 (same units as
@@ -1112,286 +1246,19 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // ── Step 16: Clamp to display range ──────────────────────────────────────
     color = clamp(color, vec3<f32>(0.0), vec3<f32>(1.0));
 
+    // ── Step 17: Point curves (display-encoded, like every curve tool) ──────
+    // Per channel: the LUT already composes each channel's curve after the
+    // master, so this is three fetches, not six.
+    if (params.curve_active == 1u) {
+        color = vec3<f32>(sample_curve(color.r).r, sample_curve(color.g).g, sample_curve(color.b).b);
+    }
+
+    // Mask overlay: show the selected mask's coverage while editing it.
+    if (params.mask_overlay > 0u) {
+        color = mix(color, vec3<f32>(1.0, 0.18, 0.12), overlay_w * 0.55);
+    }
+
     return vec4<f32>(color, 1.0);
-}
-"#;
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Phase 128: DEBAYER SHADER (Pass 1)
-// Reads the R16Uint raw sensor texture and writes debayered camera-native
-// linear RGB to an Rgba16Float intermediate texture.  No color science,
-// no WB, no exposure — just geometry.
-// ═══════════════════════════════════════════════════════════════════════════
-
-pub const DEBAYER_SHADER: &str = r#"
-struct VertexOutput {
-    @builtin(position) clip_position: vec4<f32>,
-    @location(0) tex_coords: vec2<f32>,
-}
-
-// Simple full-screen triangle — no zoom, pan, or crop.  1:1 mapping to the
-// intermediate texture at full sensor resolution.
-@vertex
-fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
-    var output: VertexOutput;
-    let x = f32(i32(vertex_index & 1u) * 4 - 1);
-    let y = f32(i32(vertex_index >> 1u) * 4 - 1);
-    output.clip_position = vec4<f32>(x, -y, 0.0, 1.0);
-    output.tex_coords = vec2<f32>((x + 1.0) * 0.5, (y + 1.0) * 0.5);
-    return output;
-}
-
-// ── EditParams struct (must match Rust GpuEditParams layout exactly) ─────
-struct EditParams {
-    exposure: f32,
-    contrast: f32,
-    highlights: f32,
-    shadows: f32,
-    whites: f32,
-    blacks: f32,
-    vibrance: f32,
-    saturation: f32,
-    temperature: f32,
-    tint: f32,
-    padding1: f32,
-    padding2: f32,
-    wb_multipliers: vec4<f32>,
-    forward_matrix_0: vec3<f32>,
-    padding3: f32,
-    forward_matrix_1: vec3<f32>,
-    padding4: f32,
-    forward_matrix_2: vec3<f32>,
-    padding5: f32,
-    zoom: f32,
-    pan_x: f32,
-    pan_y: f32,
-    cfa_pattern: u32,
-    // Layout-matching only; the debayer pass never reads the display window.
-    view_rect: vec4<f32>,
-    black_levels: vec4<u32>,
-    white_level: u32,
-    pad_end_1: f32,
-    pad_end_2: f32,
-    pad_end_3: f32,
-    black_offsets: vec4<f32>,
-    black_phase_x: u32,
-    black_phase_y: u32,
-    luma_noise: f32,
-    color_noise: f32,
-    sharpening: f32,
-    sharpen_masking: f32,
-    rotation: f32,
-    pad_phase_1: f32,
-    // Phase 66: Crop (vec4 alignment = 16 bytes)
-    crop: vec4<f32>,
-
-    // Phase 135: Non-destructive crop visibility
-    is_cropping: u32,
-
-    // Padding to reach 256 bytes
-    has_dcp: u32,
-    dcp_has_curve: u32,
-    orientation: u32, // unused in the debayer pass (sensor space throughout)
-
-    // Local adjustment masks — unused in the debayer pass, but the layout must
-    // stay byte-identical to the color shader's EditParams (shared buffer).
-    mask_count: u32,
-    // Selected tone mapping operator. Only Camera (0) vs non-Camera is read;
-    // the operator's shape arrives baked into the tone curve LUT. Occupies a
-    // formerly-dead pad slot, so no offset moved. See gpu/params.rs.
-    tone_mapper: u32,
-    pad_masks_2: u32,
-    pad_masks_3: u32,
-    masks: array<Mask, 8>,
-}
-
-// Mirror of the color shader's Mask struct (layout only; not evaluated here).
-struct Mask {
-    info: vec4<f32>,
-    geom: vec4<f32>,
-    adj0: vec4<f32>,
-    adj1: vec4<f32>,  // highlights, shadows, tint, rotation (radians)
-}
-
-@group(0) @binding(0)
-var input_texture: texture_2d<u32>;
-
-@group(0) @binding(1)
-var texture_sampler: sampler;
-
-@group(0) @binding(2)
-var<uniform> params: EditParams;
-
-// ── Debayer helpers (identical to the ones in the old single-pass shader) ─
-
-fn get_neighbor(coords: vec2<i32>, dimensions: vec2<u32>) -> f32 {
-    let clamped = vec2<i32>(
-        clamp(coords.x, 0, i32(dimensions.x) - 1),
-        clamp(coords.y, 0, i32(dimensions.y) - 1)
-    );
-    let raw_value = textureLoad(input_texture, clamped, 0).r;
-    let x = u32(clamped.x);
-    let y = u32(clamped.y);
-    let is_even_row = (y & 1u) == 0u;
-    let is_even_col = (x & 1u) == 0u;
-    var bl_index: u32;
-    if (params.cfa_pattern == 0u) {
-        if (is_even_row && is_even_col) { bl_index = 0u; }
-        else if (is_even_row && !is_even_col) { bl_index = 1u; }
-        else if (!is_even_row && is_even_col) { bl_index = 2u; }
-        else { bl_index = 3u; }
-    } else if (params.cfa_pattern == 1u) {
-        if (is_even_row && is_even_col) { bl_index = 1u; }
-        else if (is_even_row && !is_even_col) { bl_index = 0u; }
-        else if (!is_even_row && is_even_col) { bl_index = 3u; }
-        else { bl_index = 2u; }
-    } else if (params.cfa_pattern == 2u) {
-        if (is_even_row && is_even_col) { bl_index = 1u; }
-        else if (is_even_row && !is_even_col) { bl_index = 3u; }
-        else if (!is_even_row && is_even_col) { bl_index = 0u; }
-        else { bl_index = 2u; }
-    } else {
-        if (is_even_row && is_even_col) { bl_index = 3u; }
-        else if (is_even_row && !is_even_col) { bl_index = 1u; }
-        else if (!is_even_row && is_even_col) { bl_index = 2u; }
-        else { bl_index = 0u; }
-    }
-    let black = f32(params.black_levels[bl_index]) + params.black_offsets[bl_index];
-    let white = f32(params.white_level);
-    let corrected = max(0.0, f32(raw_value) - black);
-    let range = max(1.0, white - black);
-    return corrected / range;
-}
-
-fn debayer(coords: vec2<i32>, dimensions: vec2<u32>) -> vec3<f32> {
-    let raw_value = textureLoad(input_texture, coords, 0).r;
-    let x = u32(coords.x);
-    let y = u32(coords.y);
-    let is_even_row = (y & 1u) == 0u;
-    let is_even_col = (x & 1u) == 0u;
-    var bl_index: u32;
-    if (params.cfa_pattern == 0u) {
-        if (is_even_row && is_even_col) { bl_index = 0u; }
-        else if (is_even_row && !is_even_col) { bl_index = 1u; }
-        else if (!is_even_row && is_even_col) { bl_index = 2u; }
-        else { bl_index = 3u; }
-    } else if (params.cfa_pattern == 1u) {
-        if (is_even_row && is_even_col) { bl_index = 1u; }
-        else if (is_even_row && !is_even_col) { bl_index = 0u; }
-        else if (!is_even_row && is_even_col) { bl_index = 3u; }
-        else { bl_index = 2u; }
-    } else if (params.cfa_pattern == 2u) {
-        if (is_even_row && is_even_col) { bl_index = 1u; }
-        else if (is_even_row && !is_even_col) { bl_index = 3u; }
-        else if (!is_even_row && is_even_col) { bl_index = 0u; }
-        else { bl_index = 2u; }
-    } else {
-        if (is_even_row && is_even_col) { bl_index = 3u; }
-        else if (is_even_row && !is_even_col) { bl_index = 1u; }
-        else if (!is_even_row && is_even_col) { bl_index = 2u; }
-        else { bl_index = 0u; }
-    }
-    let black = f32(params.black_levels[bl_index]) + params.black_offsets[bl_index];
-    let white = f32(params.white_level);
-    let corrected = max(0.0, f32(raw_value) - black);
-    let range = max(1.0, white - black);
-    let normalized = corrected / range;
-    var is_red = false;
-    var is_green = false;
-    var is_blue = false;
-    if (params.cfa_pattern == 0u) {
-        if (is_even_row && is_even_col) { is_red = true; }
-        else if (is_even_row && !is_even_col) { is_green = true; }
-        else if (!is_even_row && is_even_col) { is_green = true; }
-        else { is_blue = true; }
-    } else if (params.cfa_pattern == 1u) {
-        if (is_even_row && is_even_col) { is_green = true; }
-        else if (is_even_row && !is_even_col) { is_red = true; }
-        else if (!is_even_row && is_even_col) { is_blue = true; }
-        else { is_green = true; }
-    } else if (params.cfa_pattern == 2u) {
-        if (is_even_row && is_even_col) { is_green = true; }
-        else if (is_even_row && !is_even_col) { is_blue = true; }
-        else if (!is_even_row && is_even_col) { is_red = true; }
-        else { is_green = true; }
-    } else {
-        if (is_even_row && is_even_col) { is_blue = true; }
-        else if (is_even_row && !is_even_col) { is_green = true; }
-        else if (!is_even_row && is_even_col) { is_green = true; }
-        else { is_red = true; }
-    }
-    let n  = get_neighbor(coords + vec2<i32>( 0, -1), dimensions);
-    let s  = get_neighbor(coords + vec2<i32>( 0,  1), dimensions);
-    let w  = get_neighbor(coords + vec2<i32>(-1,  0), dimensions);
-    let e  = get_neighbor(coords + vec2<i32>( 1,  0), dimensions);
-    let nw = get_neighbor(coords + vec2<i32>(-1, -1), dimensions);
-    let ne = get_neighbor(coords + vec2<i32>( 1, -1), dimensions);
-    let sw = get_neighbor(coords + vec2<i32>(-1,  1), dimensions);
-    let se = get_neighbor(coords + vec2<i32>( 1,  1), dimensions);
-    var rgb: vec3<f32>;
-    if (is_red) {
-        let r = normalized;
-        let grad_v = abs(n - s); let grad_h = abs(e - w);
-        var g: f32;
-        if (grad_v < grad_h) { g = (n + s) * 0.5; }
-        else if (grad_h < grad_v) { g = (e + w) * 0.5; }
-        else { g = (n + s + e + w) * 0.25; }
-        let grad_nesw = abs(ne - sw); let grad_nwse = abs(nw - se);
-        var b: f32;
-        if (grad_nesw < grad_nwse) { b = (ne + sw) * 0.5; }
-        else if (grad_nwse < grad_nesw) { b = (nw + se) * 0.5; }
-        else { b = (ne + sw + nw + se) * 0.25; }
-        rgb = vec3<f32>(r, g, b);
-    } else if (is_even_row && !is_even_col) {
-        // Gr pixel: R from axis neighbors, B from cross-axis neighbors.
-        // All 4 diagonals (nw/ne/sw/se) are Gb sites → raw values are Green.
-        // Color-correlation correction: assume the local R/G (and B/G) ratio
-        // changes slowly, so correct interpolated R/B by the local green gradient.
-        // This removes the 0.5-pixel green bias that causes color fringing.
-        let g = normalized;
-        let g_diag = (nw + ne + sw + se) * 0.25;
-        let g_corr = (g - g_diag) * 0.5;
-        let r = (w + e) * 0.5 + g_corr;
-        let b = (n + s) * 0.5 + g_corr;
-        rgb = vec3<f32>(r, g, b);
-    } else if (!is_even_row && is_even_col) {
-        // Gb pixel: R from cross-axis, B from axis neighbors.
-        // All 4 diagonals are Gr sites → raw values are Green. Same correction.
-        let g = normalized;
-        let g_diag = (nw + ne + sw + se) * 0.25;
-        let g_corr = (g - g_diag) * 0.5;
-        let r = (n + s) * 0.5 + g_corr;
-        let b = (w + e) * 0.5 + g_corr;
-        rgb = vec3<f32>(r, g, b);
-    } else {
-        let b = normalized;
-        let grad_v = abs(n - s); let grad_h = abs(e - w);
-        var g: f32;
-        if (grad_v < grad_h) { g = (n + s) * 0.5; }
-        else if (grad_h < grad_v) { g = (e + w) * 0.5; }
-        else { g = (n + s + e + w) * 0.25; }
-        let grad_nesw = abs(ne - sw); let grad_nwse = abs(nw - se);
-        var r: f32;
-        if (grad_nesw < grad_nwse) { r = (ne + sw) * 0.5; }
-        else if (grad_nwse < grad_nesw) { r = (nw + se) * 0.5; }
-        else { r = (ne + sw + nw + se) * 0.25; }
-        rgb = vec3<f32>(r, g, b);
-    }
-    return rgb;
-}
-
-@fragment
-fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    let dimensions = textureDimensions(input_texture);
-    let pixel_coords = vec2<i32>(
-        i32(input.tex_coords.x * f32(dimensions.x)),
-        i32(input.tex_coords.y * f32(dimensions.y))
-    );
-    let color = debayer(pixel_coords, dimensions);
-    // Alpha stores the per-Bayer-site normalised raw value for smooth clip detection
-    // in the passthrough shader.  get_neighbor returns the same black/white corrected
-    // value that debayer() uses for `normalized`, so the two are consistent.
-    return vec4<f32>(color, get_neighbor(pixel_coords, dimensions));
 }
 "#;
 
@@ -1400,10 +1267,6 @@ pub fn get_color_shader() -> &'static str {
     PASSTHROUGH_SHADER
 }
 
-/// Get the debayer shader (Pass 1 — reads R16Uint raw data)
-pub fn get_debayer_shader() -> &'static str {
-    DEBAYER_SHADER
-}
 
 #[cfg(test)]
 mod tests {
@@ -1426,8 +1289,12 @@ mod tests {
     }
 
     #[test]
-    fn debayer_shader_is_valid_wgsl() {
-        validate_wgsl(DEBAYER_SHADER, "DEBAYER_SHADER");
+    fn shader_mask_constants_match_rust() {
+        let expected = format!(
+            "const MASK_CHROMA_EPS: f32 = {};",
+            crate::core::types::MASK_CHROMA_EPS
+        );
+        assert!(PASSTHROUGH_SHADER.contains(&expected), "missing `{expected}`");
     }
 
     /// The tone LUT's domain is encoded on the CPU (at bake time) and decoded
@@ -1446,11 +1313,4 @@ mod tests {
         );
     }
 
-    /// The two WGSL `EditParams` structs alias ONE uniform buffer, so a field
-    /// added to only one of them silently misreads every field after it.
-    #[test]
-    fn both_shaders_declare_the_tone_mapper_field() {
-        assert!(PASSTHROUGH_SHADER.contains("tone_mapper: u32,"));
-        assert!(DEBAYER_SHADER.contains("tone_mapper: u32,"));
-    }
 }

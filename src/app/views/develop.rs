@@ -4,7 +4,7 @@ use iced::widget::{
 };
 use iced::{Alignment, Background, Border, Color, Element, Length, Theme};
 
-use crate::app::message::Message;
+use crate::app::message::{DefringeParam, LensParam, LensToggle, Message, SidebarSection};
 use crate::app::state::{EditorReadiness, RawEditor};
 use crate::database::models::Image as ImageData;
 use crate::ui;
@@ -132,6 +132,8 @@ fn view_sidebar(editor: &RawEditor) -> iced::widget::Column<'_, Message> {
             0.005,
             Message::BlacksChanged,
         ))
+        .push(section_header(editor, "Tone Curve", SidebarSection::ToneCurve))
+        .push_maybe(expanded(editor, SidebarSection::ToneCurve).then(|| curve_section(editor)))
         .push(text("Tone Mapping").size(14))
         .push(tone_mapper_selector(editor))
         .push(tone_mapper_hint(editor))
@@ -198,21 +200,29 @@ fn view_sidebar(editor: &RawEditor) -> iced::widget::Column<'_, Message> {
             1.0,
             Message::SaturationChanged,
         ))
-        .push(text("Detail").size(14))
+        .push(text("Noise Reduction").size(14))
         .push(slider_row(
-            "Luma Denoise",
+            "Luminance",
             editor.current_edit_params.luma_noise, d.luma_noise,
-            0.0..=2.0,
+            0.0..=1.0,
             0.01,
             Message::LumaNoiseChanged,
         ))
         .push(slider_row(
-            "Color Denoise",
+            "Detail",
+            editor.current_edit_params.luma_detail, d.luma_detail,
+            0.0..=1.0,
+            0.01,
+            Message::LumaDetailChanged,
+        ))
+        .push(slider_row(
+            "Color",
             editor.current_edit_params.color_noise, d.color_noise,
-            0.0..=2.0,
+            0.0..=1.0,
             0.01,
             Message::ColorNoiseChanged,
         ))
+        .push(text("Detail").size(14))
         .push(slider_row(
             "Sharpen",
             editor.current_edit_params.sharpening, d.sharpening,
@@ -302,6 +312,12 @@ fn view_sidebar(editor: &RawEditor) -> iced::widget::Column<'_, Message> {
             ]
             .spacing(5),
         );
+
+    sidebar = sidebar
+        .push(section_header(editor, "Lens Corrections", SidebarSection::Lens))
+        .push_maybe(expanded(editor, SidebarSection::Lens).then(|| lens_section(editor)))
+        .push(section_header(editor, "Defringe", SidebarSection::Defringe))
+        .push_maybe(expanded(editor, SidebarSection::Defringe).then(|| defringe_section(editor)));
 
     sidebar = push_mask_section(sidebar, editor);
 
@@ -590,6 +606,9 @@ fn view_main_content<'a>(
                                 .then(|| editor.current_edit_params.masks[i])
                         })
                     },
+                    brush: (!peeking && editor.brush_armed && editor.selected_mask.is_some())
+                        .then_some((editor.brush_settings.size, editor.brush_settings.feather)),
+                    is_color_picking: !peeking && editor.color_picking_mask.is_some(),
                 })
                 .width(Length::Fill)
                 .height(Length::Fill)
@@ -796,9 +815,9 @@ fn push_mask_section<'a>(
     mut sidebar: iced::widget::Column<'a, Message>,
     editor: &'a RawEditor,
 ) -> iced::widget::Column<'a, Message> {
-    use crate::app::message::MaskAdjustment;
+    use crate::app::message::{BrushSetting, MaskAdjustment};
     use crate::app::state::MaskTool;
-    use crate::core::types::MAX_MASKS;
+    use crate::core::types::{MASK_BRUSH, MASK_LINEAR, MASK_RADIAL, MASK_RANGE, MAX_MASKS};
 
     let params = &editor.current_edit_params;
     let count = params.mask_count as usize;
@@ -808,46 +827,48 @@ fn push_mask_section<'a>(
         ..Default::default()
     }));
 
-    // Add-mask buttons: toggle placement mode (next click-drag on the preview
-    // places the mask). Disabled at the mask limit, except to cancel a mode.
+    // Add-mask buttons. Linear/radial toggle placement mode (the next
+    // click-drag on the preview places the mask); brush and range masks have
+    // no geometry and are created straight away. Disabled at the mask limit,
+    // except to cancel a mode.
     let can_add = count < MAX_MASKS;
     let linear_active = editor.mask_tool == MaskTool::PlacingLinear;
     let radial_active = editor.mask_tool == MaskTool::PlacingRadial;
-    sidebar = sidebar.push(
-        row![
-            button(text(if linear_active { "Click image…" } else { "+ Linear" }).size(12))
-                .style(if linear_active {
-                    ui::styles::AccentButton::style
-                } else {
-                    ui::styles::NeutralButton::style
-                })
-                .on_press_maybe(
-                    (can_add || linear_active).then_some(Message::ToggleMaskPlacement(0)),
-                )
-                .width(Length::Fill),
-            button(text(if radial_active { "Click image…" } else { "+ Radial" }).size(12))
-                .style(if radial_active {
-                    ui::styles::AccentButton::style
-                } else {
-                    ui::styles::NeutralButton::style
-                })
-                .on_press_maybe(
-                    (can_add || radial_active).then_some(Message::ToggleMaskPlacement(1)),
-                )
-                .width(Length::Fill),
-        ]
-        .spacing(5),
-    );
+    let add_button = |label: &'static str, active: bool, kind: u32| {
+        button(text(if active { "Click image…" } else { label }).size(12))
+            .style(if active {
+                ui::styles::AccentButton::style
+            } else {
+                ui::styles::NeutralButton::style
+            })
+            .on_press_maybe((can_add || active).then_some(Message::ToggleMaskPlacement(kind)))
+            .width(Length::Fill)
+    };
+    sidebar = sidebar
+        .push(row![add_button("+ Linear", linear_active, 0), add_button("+ Radial", radial_active, 1)].spacing(5))
+        .push(row![add_button("+ Brush", false, MASK_BRUSH), add_button("+ Range", false, MASK_RANGE)].spacing(5));
 
     // Mask list: select / enable / delete
     for i in 0..count {
         let m = params.masks[i];
         let selected = editor.selected_mask == Some(i);
-        let label = format!(
-            "{} {}",
-            if m.mask_type == 0 { "Linear" } else { "Radial" },
-            i + 1
-        );
+        let kind = match m.mask_type {
+            MASK_LINEAR => "Linear",
+            MASK_RADIAL => "Radial",
+            MASK_BRUSH => "Brush",
+            _ => "Range",
+        };
+        let mut extras = String::new();
+        if m.mask_type != MASK_BRUSH && params.brush.has_strokes_for(i) {
+            extras.push_str(" +brush");
+        }
+        if m.luma_range != 0 {
+            extras.push_str(" ·L");
+        }
+        if m.color_range != 0 {
+            extras.push_str(" ·C");
+        }
+        let label = format!("{kind} {}{extras}", i + 1);
         sidebar = sidebar.push(
             row![
                 button(text(label).size(12))
@@ -871,64 +892,311 @@ fn push_mask_section<'a>(
         );
     }
 
-    // Per-mask adjustments for the selected mask
-    if let Some(i) = editor.selected_mask {
-        if i < count {
-            let m = params.masks[i];
-            sidebar = sidebar
-                .push(
-                    checkbox("Invert", m.invert != 0)
-                        .on_toggle(Message::ToggleMaskInvert)
-                        .size(16)
-                        .text_size(13),
-                )
-                .push(slider_row("Exposure", m.exposure, 0.0, -4.0..=4.0, 0.05, |v| {
-                    Message::MaskAdjustmentChanged(MaskAdjustment::Exposure, v)
-                }))
-                .push(slider_row("Contrast", m.contrast, 0.0, -1.0..=1.0, 0.01, |v| {
-                    Message::MaskAdjustmentChanged(MaskAdjustment::Contrast, v)
-                }))
-                .push(slider_row(
-                    "Highlights",
-                    m.highlights, 0.0,
-                    -1.0..=1.0,
-                    0.01,
-                    |v| Message::MaskAdjustmentChanged(MaskAdjustment::Highlights, v),
-                ))
-                .push(slider_row("Shadows", m.shadows, 0.0, -1.0..=1.0, 0.01, |v| {
-                    Message::MaskAdjustmentChanged(MaskAdjustment::Shadows, v)
-                }))
-                .push(slider_row(
-                    "Saturation",
-                    m.saturation, 0.0,
-                    -1.0..=1.0,
-                    0.01,
-                    |v| Message::MaskAdjustmentChanged(MaskAdjustment::Saturation, v),
-                ))
-                .push(slider_row("Warmth", m.warmth, 0.0, -1.0..=1.0, 0.01, |v| {
-                    Message::MaskAdjustmentChanged(MaskAdjustment::Warmth, v)
-                }))
-                .push(slider_row("Tint", m.tint, 0.0, -1.0..=1.0, 0.01, |v| {
-                    Message::MaskAdjustmentChanged(MaskAdjustment::Tint, v)
-                }));
-            if m.mask_type == 1 {
-                sidebar = sidebar
-                    .push(slider_row("Feather", m.feather, 0.5, 0.0..=1.0, 0.01, |v| {
-                        Message::MaskAdjustmentChanged(MaskAdjustment::Feather, v)
-                    }))
-                    .push(slider_row_display(
-                        "Rotation",
-                        m.rotation, 0.0,
-                        -180.0..=180.0,
-                        1.0,
-                        format!("{:.0}°", m.rotation),
-                        |v| Message::MaskAdjustmentChanged(MaskAdjustment::Rotation, v),
-                    ));
-            }
+    // Per-mask controls for the selected mask
+    let Some(i) = editor.selected_mask.filter(|&i| i < count) else {
+        return sidebar;
+    };
+    let m = params.masks[i];
+    let small = |label: &'a str, on: bool| {
+        checkbox(label, on).size(16).text_size(13)
+    };
+    sidebar = sidebar.push(
+        row![
+            small("Invert", m.invert != 0).on_toggle(Message::ToggleMaskInvert),
+            small("Show overlay", editor.show_mask_overlay).on_toggle(Message::ToggleMaskOverlay),
+        ]
+        .spacing(12),
+    );
+
+    // Brush: painting is the whole of a brush mask, and a refinement
+    // (add / erase) for any other.
+    let b = editor.brush_settings;
+    let is_brush = m.mask_type == MASK_BRUSH;
+    let mut brush_row = row![].spacing(4).align_y(Alignment::Center);
+    if !is_brush {
+        brush_row = brush_row.push(
+            button(text(if editor.brush_armed { "Brushing" } else { "Brush" }).size(11))
+                .style(if editor.brush_armed {
+                    ui::styles::AccentButton::style
+                } else {
+                    ui::styles::NeutralButton::style
+                })
+                .on_press(Message::ToggleBrushArmed),
+        );
+    }
+    if editor.brush_armed {
+        for (label, erase) in [("Paint", false), ("Erase", true)] {
+            brush_row = brush_row.push(
+                button(text(label).size(11))
+                    .style(if b.erase == erase {
+                        ui::styles::AccentButton::style
+                    } else {
+                        ui::styles::NeutralButton::style
+                    })
+                    .on_press(Message::SetBrushErase(erase)),
+            );
         }
+    }
+    brush_row = brush_row.push(iced::widget::Space::with_width(Length::Fill));
+    if params.brush.has_strokes_for(i) {
+        brush_row = brush_row.push(
+            button(text("Clear brush").size(11))
+                .style(ui::styles::NeutralButton::style)
+                .on_press(Message::ClearMaskBrush),
+        );
+    }
+    sidebar = sidebar.push(brush_row);
+    if editor.brush_armed {
+        sidebar = sidebar
+            .push(slider_row_plain("Size", b.size, 0.002..=0.3, 0.001, format!("{:.1}%", b.size * 100.0), |v| {
+                Message::BrushSettingChanged(BrushSetting::Size, v)
+            }))
+            .push(slider_row_plain("Feather", b.feather, 0.0..=1.0, 0.01, format!("{:.2}", b.feather), |v| {
+                Message::BrushSettingChanged(BrushSetting::Feather, v)
+            }))
+            .push(slider_row_plain("Flow", b.flow, 0.01..=1.0, 0.01, format!("{:.2}", b.flow), |v| {
+                Message::BrushSettingChanged(BrushSetting::Flow, v)
+            }))
+            .push(hint("Alt while painting swaps paint / erase".to_string()));
+    }
+
+    // Range refinements.
+    sidebar = sidebar.push(small("Luminance range", m.luma_range != 0).on_toggle(Message::ToggleMaskLumaRange));
+    if m.luma_range != 0 {
+        sidebar = sidebar
+            .push(slider_row("Low", m.luma_lo, 0.0, 0.0..=1.0, 0.01, |v| {
+                Message::MaskAdjustmentChanged(MaskAdjustment::LumaLo, v)
+            }))
+            .push(slider_row("High", m.luma_hi, 1.0, 0.0..=1.0, 0.01, |v| {
+                Message::MaskAdjustmentChanged(MaskAdjustment::LumaHi, v)
+            }))
+            .push(slider_row("Smooth", m.luma_smooth, 0.1, 0.0..=0.5, 0.01, |v| {
+                Message::MaskAdjustmentChanged(MaskAdjustment::LumaSmooth, v)
+            }));
+    }
+    let picking = editor.color_picking_mask == Some(i);
+    sidebar = sidebar.push(
+        row![
+            small("Color range", m.color_range != 0 || picking).on_toggle(Message::ToggleMaskColorRange),
+            iced::widget::Space::with_width(Length::Fill),
+            button(text(if picking { "Picking…" } else { "Pick color" }).size(11))
+                .style(if picking { ui::styles::AccentButton::style } else { ui::styles::NeutralButton::style })
+                .on_press(Message::PickMaskColor),
+        ]
+        .align_y(Alignment::Center),
+    );
+    if m.color_range != 0 {
+        sidebar = sidebar.push(slider_row("Tolerance", m.color_tolerance, 0.3, 0.0..=1.0, 0.01, |v| {
+            Message::MaskAdjustmentChanged(MaskAdjustment::ColorTolerance, v)
+        }));
+    }
+
+    // Adjustments.
+    sidebar = sidebar
+        .push(text("Adjustments").size(12))
+        .push(slider_row("Exposure", m.exposure, 0.0, -4.0..=4.0, 0.05, |v| {
+            Message::MaskAdjustmentChanged(MaskAdjustment::Exposure, v)
+        }))
+        .push(slider_row("Contrast", m.contrast, 0.0, -1.0..=1.0, 0.01, |v| {
+            Message::MaskAdjustmentChanged(MaskAdjustment::Contrast, v)
+        }))
+        .push(slider_row("Highlights", m.highlights, 0.0, -1.0..=1.0, 0.01, |v| {
+            Message::MaskAdjustmentChanged(MaskAdjustment::Highlights, v)
+        }))
+        .push(slider_row("Shadows", m.shadows, 0.0, -1.0..=1.0, 0.01, |v| {
+            Message::MaskAdjustmentChanged(MaskAdjustment::Shadows, v)
+        }))
+        .push(slider_row("Saturation", m.saturation, 0.0, -1.0..=1.0, 0.01, |v| {
+            Message::MaskAdjustmentChanged(MaskAdjustment::Saturation, v)
+        }))
+        .push(slider_row_display(
+            "Hue",
+            m.hue, 0.0,
+            -1.0..=1.0,
+            0.01,
+            format!("{:+.0}°", m.hue * crate::gpu::params::MASK_HUE_RANGE_DEG),
+            |v| Message::MaskAdjustmentChanged(MaskAdjustment::Hue, v),
+        ))
+        .push(slider_row("Warmth", m.warmth, 0.0, -1.0..=1.0, 0.01, |v| {
+            Message::MaskAdjustmentChanged(MaskAdjustment::Warmth, v)
+        }))
+        .push(slider_row("Tint", m.tint, 0.0, -1.0..=1.0, 0.01, |v| {
+            Message::MaskAdjustmentChanged(MaskAdjustment::Tint, v)
+        }));
+    if m.mask_type == MASK_RADIAL {
+        sidebar = sidebar
+            .push(slider_row("Feather", m.feather, 0.5, 0.0..=1.0, 0.01, |v| {
+                Message::MaskAdjustmentChanged(MaskAdjustment::Feather, v)
+            }))
+            .push(slider_row_display(
+                "Rotation",
+                m.rotation, 0.0,
+                -180.0..=180.0,
+                1.0,
+                format!("{:.0}°", m.rotation),
+                |v| Message::MaskAdjustmentChanged(MaskAdjustment::Rotation, v),
+            ));
     }
 
     sidebar
+}
+
+fn expanded(editor: &RawEditor, section: SidebarSection) -> bool {
+    !editor.collapsed_sections.contains(&section)
+}
+
+/// A clickable section title with a disclosure arrow.
+fn section_header<'a>(editor: &RawEditor, title: &'a str, section: SidebarSection) -> Element<'a, Message> {
+    let arrow = if expanded(editor, section) { "▾" } else { "▸" };
+    button(
+        row![text(arrow).size(12), text(title).size(14)]
+            .spacing(6)
+            .align_y(Alignment::Center),
+    )
+    .padding([2, 0])
+    .width(Length::Fill)
+    .style(|_theme, _status| button::Style {
+        background: None,
+        text_color: Color::WHITE,
+        ..Default::default()
+    })
+    .on_press(Message::ToggleSection(section))
+    .into()
+}
+
+fn hint<'a>(s: String) -> Element<'a, Message> {
+    text(s)
+        .size(10)
+        .style(|_theme| text::Style { color: Some(Color::from_rgb(0.45, 0.45, 0.45)) })
+        .into()
+}
+
+/// Profile toggles (with what was matched, or why nothing was) and the
+/// manual sliders.
+fn lens_section(editor: &RawEditor) -> Element<'_, Message> {
+    let l = editor.current_edit_params.lens;
+    let d = crate::core::lens::LensParams::default();
+    let ctx = editor.current_metadata.as_ref().map(|m| m.lens_context.clone());
+    let lens_name = ctx
+        .as_ref()
+        .and_then(|c| c.lens_name.clone())
+        .unwrap_or_else(|| "Unknown lens".to_string());
+    let has_profile = ctx.as_ref().is_some_and(|c| c.profile.is_some());
+    let status = match (has_profile, crate::core::lens::LensDb::loaded_count()) {
+        (true, _) => format!(
+            "Profile: {}",
+            ctx.as_ref().and_then(|c| c.profile.as_ref()).map(|p| p.lens_name.as_str()).unwrap_or("")
+        ),
+        (false, Some(0)) => "No lensfun database found — install `lensfun`, or put its XML files in ~/.local/share/raw-editor/lensfun".to_string(),
+        (false, _) => "No profile for this lens in the lensfun database".to_string(),
+    };
+
+    let mut col = column![
+        text(lens_name).size(12),
+        hint(status),
+        checkbox("Enable profile corrections", l.profile)
+            .on_toggle_maybe(has_profile.then_some(|on| Message::LensToggled(LensToggle::Profile, on)))
+            .size(16)
+            .text_size(13),
+        checkbox("Remove chromatic aberration", l.profile_ca)
+            .on_toggle_maybe(has_profile.then_some(|on| Message::LensToggled(LensToggle::ProfileCa, on)))
+            .size(16)
+            .text_size(13),
+    ]
+    .spacing(6);
+    if l.profile && has_profile {
+        col = col
+            .push(slider_row_display(
+                "Distortion",
+                l.profile_distortion, d.profile_distortion,
+                0.0..=2.0,
+                0.01,
+                format!("{:.0}%", l.profile_distortion * 100.0),
+                |v| Message::LensParamChanged(LensParam::ProfileDistortion, v),
+            ))
+            .push(slider_row_display(
+                "Vignetting",
+                l.profile_vignetting, d.profile_vignetting,
+                0.0..=2.0,
+                0.01,
+                format!("{:.0}%", l.profile_vignetting * 100.0),
+                |v| Message::LensParamChanged(LensParam::ProfileVignetting, v),
+            ));
+    }
+    col.push(text("Manual").size(12))
+        .push(slider_row("Distortion", l.distortion, d.distortion, -1.0..=1.0, 0.01, |v| {
+            Message::LensParamChanged(LensParam::Distortion, v)
+        }))
+        .push(slider_row("Vignetting", l.vignetting, d.vignetting, -1.0..=1.0, 0.01, |v| {
+            Message::LensParamChanged(LensParam::Vignetting, v)
+        }))
+        .push(slider_row("Red / Cyan", l.ca_red, d.ca_red, -1.0..=1.0, 0.01, |v| {
+            Message::LensParamChanged(LensParam::CaRed, v)
+        }))
+        .push(slider_row("Blue / Yellow", l.ca_blue, d.ca_blue, -1.0..=1.0, 0.01, |v| {
+            Message::LensParamChanged(LensParam::CaBlue, v)
+        }))
+        .push(
+            checkbox("Constrain (no empty borders)", l.constrain)
+                .on_toggle(|on| Message::LensToggled(LensToggle::Constrain, on))
+                .size(16)
+                .text_size(13),
+        )
+        .into()
+}
+
+fn defringe_section(editor: &RawEditor) -> Element<'_, Message> {
+    let f = editor.current_edit_params.defringe;
+    let d = crate::core::lens::DefringeParams::default();
+    column![
+        slider_row("Purple", f.purple_amount, d.purple_amount, 0.0..=1.0, 0.01, |v| {
+            Message::DefringeChanged(DefringeParam::PurpleAmount, v)
+        }),
+        slider_row_display("Purple Hue", f.purple_hue, d.purple_hue, 200.0..=360.0, 1.0, format!("{:.0}°", f.purple_hue), |v| {
+            Message::DefringeChanged(DefringeParam::PurpleHue, v)
+        }),
+        slider_row("Green", f.green_amount, d.green_amount, 0.0..=1.0, 0.01, |v| {
+            Message::DefringeChanged(DefringeParam::GreenAmount, v)
+        }),
+        slider_row_display("Green Hue", f.green_hue, d.green_hue, 40.0..=180.0, 1.0, format!("{:.0}°", f.green_hue), |v| {
+            Message::DefringeChanged(DefringeParam::GreenHue, v)
+        }),
+    ]
+    .spacing(6)
+    .into()
+}
+
+/// Channel tabs, the curve canvas and a reset for the shown channel.
+fn curve_section(editor: &RawEditor) -> Element<'_, Message> {
+    use crate::core::curves::CurveChannel;
+    let mut tabs = row![].spacing(4).align_y(Alignment::Center);
+    for ch in CurveChannel::ALL {
+        let edited = !editor.current_edit_params.curves.get(ch).is_identity();
+        let label = if edited { format!("{}•", ch.label()) } else { ch.label().to_string() };
+        tabs = tabs.push(
+            button(text(label).size(11))
+                .width(Length::Fill)
+                .style(if editor.curve_channel == ch {
+                    ui::styles::AccentButton::style
+                } else {
+                    ui::styles::NeutralButton::style
+                })
+                .on_press(Message::SetCurveChannel(ch)),
+        );
+    }
+    tabs = tabs.push(
+        button(text(ui::icons::RESET).font(ICON_FONT).size(11))
+            .style(ui::styles::NeutralButton::style)
+            .on_press(Message::ResetCurve),
+    );
+    let canvas = iced::widget::canvas::Canvas::new(crate::ui::curve_editor::CurveEditor {
+        curves: editor.current_edit_params.curves,
+        channel: editor.curve_channel,
+        histogram: *editor.histogram_data.borrow(),
+    })
+    .width(Length::Fill)
+    .height(Length::Fixed(230.0));
+    column![tabs, canvas].spacing(6).into()
 }
 
 /// Operator picker: two rows of small buttons, the active one accented.
@@ -1082,6 +1350,39 @@ where
     slider_row_display(label, value, default, range, step, format!("{:.2}", value), on_change)
 }
 
+/// A slider for UI state rather than an edit (brush settings): no default
+/// reset and no undo commit on release.
+fn slider_row_plain<'a, F>(
+    label: &'a str,
+    value: f32,
+    range: std::ops::RangeInclusive<f32>,
+    step: f32,
+    display: String,
+    on_change: F,
+) -> Element<'a, Message>
+where
+    F: Fn(f32) -> Message + 'a,
+{
+    row![
+        text(label)
+            .width(Length::Fixed(90.0))
+            .size(13)
+            .style(|_theme| text::Style { color: Some(Color::from_rgb(0.7, 0.7, 0.7)) }),
+        slider(range, value, on_change)
+            .step(step)
+            .width(Length::Fill)
+            .style(crate::ui::styles::ProSlider::style),
+        text(display)
+            .width(Length::Fixed(48.0))
+            .size(13)
+            .align_x(iced::alignment::Horizontal::Right)
+            .style(|_theme| text::Style { color: Some(Color::from_rgb(0.7, 0.7, 0.7)) }),
+    ]
+    .spacing(10)
+    .align_y(iced::Alignment::Center)
+    .into()
+}
+
 /// Like `slider_row` but with an explicit value display string — used by the
 /// WB sliders to show real Kelvin / Adobe-tint units while the underlying
 /// slider stays a normalized offset around the as-shot anchor.
@@ -1124,4 +1425,37 @@ where
     .spacing(10)
     .align_y(iced::Alignment::Center)
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::update::update;
+    use crate::core::types::{MASK_BRUSH, MASK_RANGE};
+
+    /// Building the sidebar in every new state must not panic (iced asserts
+    /// on some widget arguments, e.g. slider ranges).
+    #[test]
+    fn develop_view_builds_in_every_tool_state() {
+        let mut e = RawEditor::new().0;
+        e.selected_image_id = Some(1);
+        e.editor_readiness = EditorReadiness::Ready(1);
+        e.collapsed_sections.clear();
+        let _ = view_develop(&e);
+
+        for kind in [0u32, 1, MASK_BRUSH, MASK_RANGE] {
+            let _ = update(&mut e, Message::ToggleMaskPlacement(kind));
+            if kind < 2 {
+                let _ = update(&mut e, Message::MaskPlacementStarted(0.5, 0.5));
+            }
+            let _ = view_develop(&e);
+            let _ = update(&mut e, Message::ToggleBrushArmed);
+            let _ = update(&mut e, Message::ToggleMaskLumaRange(true));
+            let _ = update(&mut e, Message::PickMaskColor);
+            let _ = view_develop(&e);
+        }
+        e.current_edit_params.lens.profile = true;
+        e.current_edit_params.curves.master.insert(0.3, 0.2);
+        let _ = view_develop(&e);
+    }
 }

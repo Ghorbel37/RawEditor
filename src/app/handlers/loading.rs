@@ -130,6 +130,7 @@ pub fn prepare_image_resources_from_raw(
                 interpolated_dcp.as_ref(),
                 Some(1280), // develop preview: subsample for fast load
                 raw.orientation,
+                raw.lens_context.clone(),
             ) {
                 Ok(resources) => Ok((ctx, std::sync::Arc::new(resources))),
                 Err(e) => Err(e),
@@ -245,6 +246,7 @@ pub fn trigger_full_res_upgrade(editor: &mut RawEditor) -> Task<Message> {
                 interpolated_dcp.as_ref(),
                 None, // full resolution
                 raw.orientation,
+                raw.lens_context.clone(),
             ) {
                 Ok(resources) => Ok((ctx, Arc::new(resources))),
                 Err(e) => Err(e),
@@ -280,6 +282,7 @@ fn metadata_snapshot(raw: &raw::loader::RawDataResult) -> raw::loader::RawDataRe
         shutter_speed: raw.shutter_speed.clone(),
         aperture: raw.aperture.clone(),
         lens: raw.lens.clone(),
+        lens_context: raw.lens_context.clone(),
         orientation: raw.orientation,
     }
 }

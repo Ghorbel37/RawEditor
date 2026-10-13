@@ -820,13 +820,14 @@ pub fn view_copy_settings_modal(editor: &RawEditor) -> Element<'_, Message> {
 
     // label, description, current value, which category
     let mut rows: Vec<(&str, String, bool, CopyCategory)> = vec![
-        ("Tone", "Exposure, contrast, highlights, shadows, whites, blacks".into(), cats.tone, CopyCategory::Tone),
+        ("Tone", "Exposure, contrast, highlights, shadows, whites, blacks, curves".into(), cats.tone, CopyCategory::Tone),
         ("Color", "Vibrance, saturation".into(), cats.color, CopyCategory::Color),
         ("White Balance", "Temperature, tint".into(), cats.white_balance, CopyCategory::WhiteBalance),
-        ("Noise Reduction", "Luma and color noise".into(), cats.noise, CopyCategory::Noise),
+        ("Noise Reduction", "Luminance, detail and color noise".into(), cats.noise, CopyCategory::Noise),
         ("Detail", "Sharpening and masking".into(), cats.detail, CopyCategory::Detail),
         ("Geometry & Crop", "Straighten angle and crop rectangle".into(), cats.geometry, CopyCategory::Geometry),
         ("Profile & Tone Mapping", "Profile curve, tone mapper, GT shape".into(), cats.profile, CopyCategory::Profile),
+        ("Lens Corrections", "Profile, distortion, vignetting, CA, defringe".into(), cats.lens, CopyCategory::Lens),
     ];
 
     rows.push((

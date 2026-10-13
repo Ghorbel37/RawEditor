@@ -62,6 +62,20 @@ pub fn handle_profile_curve_changed(editor: &mut RawEditor, v: f32) -> Task<Mess
     update_pipeline(editor)
 }
 
+pub fn handle_curve_changed(
+    editor: &mut RawEditor,
+    channel: crate::core::curves::CurveChannel,
+    curve: crate::core::curves::Curve,
+    commit: bool,
+) -> Task<Message> {
+    *editor.current_edit_params.curves.get_mut(channel) = curve;
+    let task = update_pipeline(editor);
+    if commit {
+        editor.commit_current_state();
+    }
+    task
+}
+
 /// Switch the tone rendering operator.
 ///
 /// Commits immediately rather than waiting for a `CommitEdit`: this is a
@@ -120,6 +134,11 @@ pub fn handle_luma_noise_changed(editor: &mut RawEditor, v: f32) -> Task<Message
     update_pipeline(editor)
 }
 
+pub fn handle_luma_detail_changed(editor: &mut RawEditor, v: f32) -> Task<Message> {
+    editor.current_edit_params.luma_detail = v;
+    update_pipeline(editor)
+}
+
 pub fn handle_color_noise_changed(editor: &mut RawEditor, v: f32) -> Task<Message> {
     editor.current_edit_params.color_noise = v;
     update_pipeline(editor)
@@ -160,6 +179,8 @@ pub fn handle_toggle_crop(editor: &mut RawEditor) -> Task<Message> {
     editor.is_wb_picking = false; // tools are mutually exclusive
     editor.mask_tool = crate::app::state::MaskTool::Inactive;
     editor.selected_mask = None;
+    editor.brush_armed = false;
+    editor.color_picking_mask = None;
     editor.is_cropping = !editor.is_cropping;
     if editor.is_cropping {
         editor.drag_mode = DragMode::Crop;
@@ -320,6 +341,7 @@ fn describe_categories(c: &crate::core::types::CopyCategories) -> String {
     if c.geometry { parts.push("crop"); }
     if c.profile { parts.push("profile"); }
     if c.masks { parts.push("masks"); }
+    if c.lens { parts.push("lens"); }
     if c.black_levels { parts.push("black levels"); }
     if parts.is_empty() {
         "nothing".to_string()
@@ -344,6 +366,7 @@ pub fn handle_toggle_copy_category(
         CopyCategory::Geometry => c.geometry = value,
         CopyCategory::Profile => c.profile = value,
         CopyCategory::Masks => c.masks = value,
+        CopyCategory::Lens => c.lens = value,
         CopyCategory::BlackLevels => c.black_levels = value,
     }
     editor.save_preferences();
@@ -576,7 +599,10 @@ pub fn trigger_async_render(editor: &mut RawEditor) -> Task<Message> {
         // whole sensor with the discarded area dimmed. The uniforms hold
         // `current_edit_params` whenever neither is active — every change to
         // them is pushed to the GPU as it happens.
-        let edit = (!editor.before_peek && !editor.is_cropping)
+        // The mask overlay tints the render, so it disqualifies too.
+        let edit = (!editor.before_peek
+            && !editor.is_cropping
+            && editor.current_edit_params.mask_overlay == 0)
             .then_some(editor.current_edit_params);
 
         return Task::perform(
@@ -634,6 +660,8 @@ pub fn handle_toggle_wb_picker(editor: &mut RawEditor) -> Task<Message> {
         }
         editor.mask_tool = crate::app::state::MaskTool::Inactive;
         editor.selected_mask = None;
+        editor.brush_armed = false;
+        editor.color_picking_mask = None;
         editor.status = "WB picker: click a neutral grey/white area".to_string();
     } else {
         editor.status.clear();
@@ -641,27 +669,31 @@ pub fn handle_toggle_wb_picker(editor: &mut RawEditor) -> Task<Message> {
     update_pipeline(editor)
 }
 
-/// WB eyedropper: `(u, v)` is the display-space UV of the click within the
-/// rendered image. Samples the raw Bayer mosaic around that point, derives the
-/// neutral's WB multipliers, converts to Kelvin/tint, and sets the sliders.
-pub fn handle_wb_picked(editor: &mut RawEditor, u: f32, v: f32) -> Task<Message> {
-    // On a failed pick (clipped/dark area) the tool stays active so the user
-    // can simply click elsewhere; it exits on success or on missing data.
-    let Some(image_id) = editor.selected_image_id else {
-        editor.is_wb_picking = false;
-        return Task::none();
-    };
-    let Some(raw) = editor.raw_cache.get(&image_id).cloned() else {
-        editor.is_wb_picking = false;
-        editor.status = "WB picker: raw data not in memory (reopen the image)".to_string();
-        return Task::none();
+/// Why a raw sample could not be taken.
+pub(crate) enum RawSampleError {
+    /// No usable raw data (not in memory, or too small).
+    Missing(&'static str),
+}
+
+/// Mean black-subtracted camera (R, G, B) of the raw mosaic in a 16×16
+/// window at `(u, v)` — display-space UV within the rendered (cropped) image,
+/// as the overlay's eyedroppers report it — plus whether any site clipped.
+///
+/// Shared by the WB picker and the colour-range mask picker. The UV goes
+/// through the same crop remap and EXIF orientation as the fragment shader.
+pub(crate) fn sample_raw_rgb(
+    editor: &RawEditor,
+    image_id: i64,
+    u: f32,
+    v: f32,
+) -> Result<([f32; 3], bool, std::sync::Arc<crate::raw::loader::RawDataResult>), RawSampleError> {
+    let Some(raw) = editor.raw_cache.peek(&image_id).cloned() else {
+        return Err(RawSampleError::Missing("raw data not in memory (reopen the image)"));
     };
     // The 16×16 sample window below needs room on both sides; `clamp(8, w-9)`
     // panics outright on anything narrower.
     if raw.data.is_empty() || raw.width < 17 || raw.height < 17 {
-        editor.is_wb_picking = false;
-        editor.status = "WB picker: no raw pixels available".to_string();
-        return Task::none();
+        return Err(RawSampleError::Missing("no raw pixels available"));
     }
 
     // Display UV → sensor UV: undo the crop remap (the vertex shader shows the
@@ -684,13 +716,11 @@ pub fn handle_wb_picked(editor: &mut RawEditor, u: f32, v: f32) -> Task<Message>
 
     let mut sums = [0.0f64; 3]; // R, G, B
     let mut counts = [0u32; 3];
+    let mut clipped = false;
     for y in (cy - 8)..(cy + 8) {
         for x in (cx - 8)..(cx + 8) {
             let value = raw.data[(y * w + x) as usize];
-            if value >= clip_threshold {
-                editor.status = "WB picker: area is clipped — pick a darker neutral".to_string();
-                return Task::none();
-            }
+            clipped |= value >= clip_threshold;
             // CFA channel for (x%2, y%2) per pattern: 0=RGGB 1=GRBG 2=GBRG 3=BGGR
             let (px, py) = ((x % 2) as u32, (y % 2) as u32);
             let channel = match (raw.cfa_pattern, py, px) {
@@ -702,12 +732,33 @@ pub fn handle_wb_picked(editor: &mut RawEditor, u: f32, v: f32) -> Task<Message>
             counts[channel] += 1;
         }
     }
-    if counts.contains(&0) {
+    let mean = |c: usize| (sums[c] / counts[c].max(1) as f64) as f32;
+    Ok(([mean(0), mean(1), mean(2)], clipped, raw))
+}
+
+/// WB eyedropper: `(u, v)` is the display-space UV of the click within the
+/// rendered image. Samples the raw Bayer mosaic around that point, derives the
+/// neutral's WB multipliers, converts to Kelvin/tint, and sets the sliders.
+pub fn handle_wb_picked(editor: &mut RawEditor, u: f32, v: f32) -> Task<Message> {
+    // On a failed pick (clipped/dark area) the tool stays active so the user
+    // can simply click elsewhere; it exits on success or on missing data.
+    let Some(image_id) = editor.selected_image_id else {
+        editor.is_wb_picking = false;
+        return Task::none();
+    };
+    let (rgb, clipped, raw) = match sample_raw_rgb(editor, image_id, u, v) {
+        Ok(sample) => sample,
+        Err(RawSampleError::Missing(msg)) => {
+            editor.is_wb_picking = false;
+            editor.status = format!("WB picker: {msg}");
+            return Task::none();
+        }
+    };
+    if clipped {
+        editor.status = "WB picker: area is clipped — pick a darker neutral".to_string();
         return Task::none();
     }
-    let r = (sums[0] / counts[0] as f64) as f32;
-    let g = (sums[1] / counts[1] as f64) as f32;
-    let b = (sums[2] / counts[2] as f64) as f32;
+    let [r, g, b] = rgb;
     if r < 1.0 || g < 1.0 || b < 1.0 {
         editor.status = "WB picker: area too dark for a reliable neutral".to_string();
         return Task::none();

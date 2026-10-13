@@ -27,10 +27,14 @@ pub struct SharedContext {
     /// swapping the render target's format on the existing one.
     pub pipeline_16: wgpu::RenderPipeline,
     pub bind_group_layout: wgpu::BindGroupLayout,
-    /// Phase 128: Debayer pipeline (Pass 1 — reads R16Uint, writes Rgba16Float)
-    pub debayer_pipeline: wgpu::RenderPipeline,
-    pub debayer_bind_group_layout: wgpu::BindGroupLayout,
-    pub sampler: wgpu::Sampler,
+    /// Colour pass group 1: brush layers + mask uniforms.
+    pub mask_bind_group_layout: wgpu::BindGroupLayout,
+    /// Rasterises brush strokes into mask layers (see `gpu::brush`).
+    pub brush: super::brush::BrushRaster,
+    /// Pass 1: RCD demosaic (reads R16Uint, writes Rgba16Float).
+    pub demosaic: super::demosaic::Demosaic,
+    /// Cached noise-reduction pre-pass (see `gpu::denoise`).
+    pub denoise: super::denoise::Denoise,
     pub sampler_linear: wgpu::Sampler,
 }
 
@@ -97,45 +101,6 @@ impl SharedContext {
             source: wgpu::ShaderSource::Wgsl(color_shader_source.into()),
         });
 
-        let debayer_shader_source = shaders::get_debayer_shader();
-        let debayer_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Debayer Shader (Pass 1)"),
-            source: wgpu::ShaderSource::Wgsl(debayer_shader_source.into()),
-        });
-
-        // Phase 128: Debayer bind group layout (reads R16Uint)
-        let debayer_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Debayer Bind Group Layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Uint,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
-
         // Phase 128: Color bind group layout (reads Rgba16Float = Float texture)
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Color Bind Group Layout"),
@@ -195,46 +160,53 @@ impl SharedContext {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                // Point-curve LUT (core::curves)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D1,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
-        // Phase 128: Debayer pipeline (Pass 1 → Rgba16Float)
-        let debayer_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Debayer Pipeline Layout"),
-            bind_group_layouts: &[&debayer_bind_group_layout],
-            push_constant_ranges: &[],
+        let mask_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Mask Bind Group Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
         });
-
-        let debayer_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Debayer Render Pipeline (Pass 1)"),
-            layout: Some(&debayer_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &debayer_shader,
-                entry_point: "vs_main",
-                buffers: &[],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &debayer_shader,
-                entry_point: "fs_main",
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba16Float,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-        });
+        let brush = super::brush::BrushRaster::new(&device);
+        let demosaic = super::demosaic::Demosaic::new(&device);
+        let denoise = super::denoise::Denoise::new(&device);
 
         // Color pipeline (Pass 2 → Rgba8Unorm canvas)
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Color Pipeline Layout"),
-            bind_group_layouts: &[&bind_group_layout],
+            bind_group_layouts: &[&bind_group_layout, &mask_bind_group_layout],
             push_constant_ranges: &[],
         });
 
@@ -292,16 +264,7 @@ impl SharedContext {
             multiview: None,
         });
 
-        // Create samplers
-        // 1. Nearest sampler (NonFiltering — for Pass 1 RAW u16 integer texture)
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("RAW Nearest Sampler"),
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
-        });
-
-        // 2. Linear sampler (Filtering — for Pass 2 smooth preview downscaling)
+        // Linear sampler (Filtering — for Pass 2 smooth preview downscaling)
         let sampler_linear = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("RAW Linear Sampler"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -317,9 +280,10 @@ impl SharedContext {
             pipeline,
             pipeline_16,
             bind_group_layout,
-            debayer_pipeline,
-            debayer_bind_group_layout,
-            sampler,
+            mask_bind_group_layout,
+            brush,
+            demosaic,
+            denoise,
             sampler_linear,
         })
     }
@@ -378,16 +342,30 @@ pub struct ImageResources {
     // what the passes actually read. Never read directly, hence the allows.
     #[allow(dead_code)]
     pub texture: wgpu::Texture,
-    #[allow(dead_code)]
     pub texture_view: wgpu::TextureView,
-    /// Phase 128: Debayer bind group (Pass 1 input: R16Uint raw texture)
-    pub debayer_bind_group: wgpu::BindGroup,
-    /// Phase 128: Intermediate debayered texture (Rgba16Float, full resolution)
+    /// Demosaiced camera-native RGB (Rgba16Float, working resolution) — the
+    /// output of the RCD passes, written once at load.
     #[allow(dead_code)] // owner — see `texture`
     pub debayer_texture: wgpu::Texture,
     pub debayer_texture_view: wgpu::TextureView,
-    /// Phase 128: Color bind group (Pass 2 input: Rgba16Float intermediate)
-    pub bind_group: wgpu::BindGroup,
+    /// Colour-pass bind group reading the demosaic directly — used whenever
+    /// no pre-pass stage is active.
+    base_bind_group: Arc<wgpu::BindGroup>,
+    /// Cached pre-pass state (denoise); see `prepare_stages`.
+    stages: std::sync::Mutex<StageState>,
+    /// The params most recently pushed — what `prepare_stages` brings the
+    /// cached stages up to date with before a render.
+    stage_params: std::sync::Mutex<EditParams>,
+    /// `GpuMasks` uniform (group 1, binding 1).
+    mask_buffer: wgpu::Buffer,
+    /// This shot's optics (matched profile, focal length, crop factor).
+    pub lens: Arc<crate::core::lens::LensContext>,
+    /// Baked point curves (binding 6); refreshed by `prepare_stages`.
+    curve_texture: wgpu::Texture,
+    curve_view: wgpu::TextureView,
+    /// This image's sensor noise model, estimated at load from the mosaic as
+    /// uploaded (so a box-filtered preview gets its own, lower, noise).
+    pub noise_model: crate::core::noise::NoiseModel,
     pub uniform_buffer: wgpu::Buffer,
     pub width: u32,
     pub height: u32,
@@ -404,6 +382,8 @@ pub struct ImageResources {
     pub forward_matrix: std::sync::RwLock<[f32; 9]>,
     pub cfa_pattern: u32,
     pub black_levels: [u32; 4],
+    /// Sensor-correction offsets the mosaic was demosaiced with.
+    pub black_offsets: [f32; 4],
     pub white_level: u32,
     pub current_params: std::sync::Mutex<GpuEditParams>,
     // Phase 140: DCP Textures
@@ -599,6 +579,86 @@ fn build_hsm_lut_upload(dcp: &crate::raw::dcp::InterpolatedProfile) -> (Vec<u8>,
     (data, extent, padded_bytes_per_row)
 }
 
+/// Bind group for the colour pass reading `source` — the demosaic, or a
+/// pre-pass stage's output. Everything else in it is per-image and fixed.
+fn make_color_bind_group(
+    context: &SharedContext,
+    source: &wgpu::TextureView,
+    uniform_buffer: &wgpu::Buffer,
+    hsv_lut_view: &wgpu::TextureView,
+    tone_curve_view: &wgpu::TextureView,
+    curve_view: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    context.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("Color Bind Group"),
+        layout: &context.bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(source) },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&context.sampler_linear),
+            },
+            wgpu::BindGroupEntry { binding: 2, resource: uniform_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(hsv_lut_view) },
+            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(tone_curve_view) },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                // Clamp-to-edge is the default addressing.
+                resource: wgpu::BindingResource::Sampler(&context.sampler_linear),
+            },
+            wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(curve_view) },
+        ],
+    })
+}
+
+/// Cached pre-pass stages and which texture the colour pass should read.
+#[derive(Debug)]
+struct StageState {
+    /// Settings the denoise output was last produced with; `None` when it
+    /// has never run (or was last skipped as inactive).
+    denoise_key: Option<super::denoise::DenoiseSettings>,
+    /// Allocated on first use and kept: re-allocating ~2 full-size textures
+    /// per slider tick would churn the allocator for nothing.
+    denoise: Option<(super::denoise::DenoiseTargets, [Arc<wgpu::BindGroup>; 2])>,
+    /// The colour bind group renders should use right now.
+    active: Arc<wgpu::BindGroup>,
+    /// Curves the LUT texture currently holds; `None` = never uploaded.
+    curves: Option<crate::core::curves::ToneCurves>,
+    /// Strokes the brush layers were last rasterised from.
+    brush_key: Option<crate::core::brush::BrushData>,
+    /// Allocated on the first stroke.
+    brush: Option<super::brush::BrushLayers>,
+    /// Group 1 for the colour pass: brush layers (or the placeholder) + masks.
+    masks: Arc<wgpu::BindGroup>,
+}
+
+/// The two bind groups a colour pass needs.
+pub struct ColorBindings {
+    pub main: Arc<wgpu::BindGroup>,
+    pub masks: Arc<wgpu::BindGroup>,
+}
+
+fn make_mask_bind_group(
+    context: &SharedContext,
+    layers: &wgpu::TextureView,
+    mask_buffer: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    context.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("Mask Bind Group"),
+        layout: &context.mask_bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(layers) },
+            wgpu::BindGroupEntry { binding: 1, resource: mask_buffer.as_entire_binding() },
+        ],
+    })
+}
+
+impl StageState {
+    fn new(base: Arc<wgpu::BindGroup>, masks: Arc<wgpu::BindGroup>) -> Self {
+        Self { denoise_key: None, denoise: None, active: base, curves: None, brush_key: None, brush: None, masks }
+    }
+}
+
 impl ImageResources {
     /// Create new image resources for a specific image
     #[allow(clippy::too_many_arguments)]
@@ -617,6 +677,7 @@ impl ImageResources {
         dcp_profile: Option<&crate::raw::dcp::InterpolatedProfile>,
         max_preview_width: Option<u32>,
         orientation: u32,
+        lens: Arc<crate::core::lens::LensContext>,
     ) -> Result<Self, String> {
         let max_w = max_preview_width.unwrap_or(u32::MAX);
 
@@ -714,6 +775,13 @@ impl ImageResources {
         gpu_params.has_dcp = if dcp_profile.is_some() { 1 } else { 0 };
         gpu_params.dcp_has_curve = if dcp_profile.is_some_and(|p| p.has_tone_curve) { 1 } else { 0 };
         gpu_params.orientation = orientation;
+        gpu_params.set_lens(&crate::core::lens::gpu_params(
+            &lens,
+            &params.lens,
+            original_width,
+            original_height,
+        ));
+        gpu_params.set_defringe_radius(original_width as f32 / width.max(1) as f32);
 
         let uniform_buffer = context
             .device
@@ -721,28 +789,6 @@ impl ImageResources {
                 label: Some("Uniform Buffer"),
                 contents: bytemuck::cast_slice(&[gpu_params]),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            });
-
-        // Phase 128: Debayer bind group (Pass 1 reads R16Uint raw texture)
-        let debayer_bind_group = context
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Debayer Bind Group"),
-                layout: &context.debayer_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&texture_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&context.sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: uniform_buffer.as_entire_binding(),
-                    },
-                ],
             });
 
         // Phase 140: Create DCP Textures
@@ -806,47 +852,77 @@ impl ImageResources {
         let hsv_lut_view = hsv_lut_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let tone_curve_view = tone_curve_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // Phase 128: Color bind group (Pass 2 reads Rgba16Float intermediate)
-        let bind_group = context
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Color Bind Group"),
-                layout: &context.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&debayer_texture_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&context.sampler_linear),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: uniform_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: wgpu::BindingResource::TextureView(&hsv_lut_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: wgpu::BindingResource::TextureView(&tone_curve_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 5,
-                        resource: wgpu::BindingResource::Sampler(&context.sampler_linear), // Clamp to edge is default
-                    },
-                ],
-            });
+        let curve_texture = context.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Point Curve LUT"),
+            size: wgpu::Extent3d {
+                width: crate::core::curves::CURVE_LUT_SIZE as u32,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D1,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let curve_view = curve_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mask_buffer = context.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Mask Uniforms"),
+            contents: bytemuck::bytes_of(&super::params::GpuMasks::from_params(params)),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        // A 1×1 stand-in for the brush layers until something is painted
+        // (the bind group keeps it alive).
+        let mask_bind_group = Arc::new(make_mask_bind_group(
+            context,
+            &super::brush::placeholder(&context.device),
+            &mask_buffer,
+        ));
+
+        let base_bind_group = Arc::new(make_color_bind_group(
+            context,
+            &debayer_texture_view,
+            &uniform_buffer,
+            &hsv_lut_view,
+            &tone_curve_view,
+            &curve_view,
+        ));
+
+        // Noise model of the mosaic exactly as uploaded: the develop preview
+        // is box-filtered, which lowers its noise, and the denoiser must know.
+        let demosaic_params = super::demosaic::GpuDemosaicParams::new(
+            cfa_pattern,
+            black_levels,
+            params.black_offsets,
+            white_level,
+            wb_multipliers,
+        );
+        let noise_model = crate::core::noise::estimate(
+            &raw_data[..pixel_count],
+            width as usize,
+            height as usize,
+            super::demosaic::tile_colors(cfa_pattern),
+            demosaic_params.black,
+            demosaic_params.scale,
+            [demosaic_params.ceil[0], demosaic_params.ceil[1], demosaic_params.ceil[2]],
+        );
+        tracing::info!("Noise model: a={:?} b={:?}", noise_model.a, noise_model.b);
 
         let resources = Self {
             texture,
             texture_view,
-            debayer_bind_group,
             debayer_texture,
             debayer_texture_view,
-            bind_group,
+            stages: std::sync::Mutex::new(StageState::new(base_bind_group.clone(), mask_bind_group)),
+            mask_buffer,
+            base_bind_group,
+            stage_params: std::sync::Mutex::new(*params),
+            lens,
+            curve_texture,
+            curve_view,
+            noise_model,
             uniform_buffer,
             width,
             height,
@@ -858,6 +934,7 @@ impl ImageResources {
             forward_matrix: std::sync::RwLock::new(forward_matrix),
             cfa_pattern,
             black_levels,
+            black_offsets: params.black_offsets,
             white_level,
             current_params: std::sync::Mutex::new(gpu_params),
             hsv_lut_texture,
@@ -873,41 +950,129 @@ impl ImageResources {
             last_uploaded_tone: std::sync::RwLock::new(None),
         };
 
-        // Phase 128: Run initial debayer pass
-        resources.run_debayer(context);
-        tracing::info!("Phase 128: Initial debayer pass complete for image {}", image_id);
+        resources.run_demosaic(context);
+        tracing::info!("RCD demosaic submitted for image {}", image_id);
 
         Ok(resources)
     }
 
-    /// Phase 128: Execute the debayer pass (Pass 1).
-    /// Renders the R16Uint raw texture into the Rgba16Float intermediate texture.
-    /// Call this when the image changes or sensor parameters (black level) change.
-    pub fn run_debayer(&self, context: &SharedContext) {
-        let mut encoder = context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Debayer Encoder"),
-        });
-        {
-            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Debayer Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.debayer_texture_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            rpass.set_viewport(0.0, 0.0, self.width as f32, self.height as f32, 0.0, 1.0);
-            rpass.set_pipeline(&context.debayer_pipeline);
-            rpass.set_bind_group(0, &self.debayer_bind_group, &[]);
-            rpass.draw(0..3, 0..1);
+    /// Pass 1: demosaic the R16Uint mosaic into `debayer_texture`. Depends
+    /// only on the sensor data and its calibration, so it runs once per load.
+    pub fn run_demosaic(&self, context: &SharedContext) {
+        let params = super::demosaic::GpuDemosaicParams::new(
+            self.cfa_pattern,
+            self.black_levels,
+            self.black_offsets,
+            self.white_level,
+            self.wb_multipliers,
+        );
+        context.demosaic.run(
+            &context.device,
+            &context.queue,
+            &self.texture_view,
+            self.width,
+            self.height,
+            &params,
+            &self.debayer_texture_view,
+        );
+    }
+
+    /// Bring the cached pre-pass stages up to date with the most recently
+    /// pushed params, and return the colour bind group to render with.
+    ///
+    /// Called by every render entry point (develop, overview, export), so a
+    /// stage can never be stale for the frame that reads it. Re-runs a stage
+    /// only when its own settings changed: a drag on any other slider costs
+    /// one mutex lock and a comparison here.
+    pub fn prepare_stages(&self, context: &SharedContext) -> ColorBindings {
+        let params = *self.stage_params.lock().unwrap_or_else(|e| e.into_inner());
+        let mut st = self.stages.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Point curves: re-bake only when they changed (the shader skips the
+        // lookup entirely while they are identity — `curve_active`).
+        if st.curves != Some(params.curves) {
+            let lut: Vec<half::f16> = params
+                .curves
+                .bake()
+                .iter()
+                .flat_map(|e| e.map(half::f16::from_f32))
+                .collect();
+            context.queue.write_texture(
+                self.curve_texture.as_image_copy(),
+                bytemuck::cast_slice(&lut),
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(crate::core::curves::CURVE_LUT_SIZE as u32 * 8),
+                    rows_per_image: None,
+                },
+                wgpu::Extent3d {
+                    width: crate::core::curves::CURVE_LUT_SIZE as u32,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+            );
+            st.curves = Some(params.curves);
         }
-        context.queue.submit(Some(encoder.finish()));
+
+        // Brush layers: re-rasterise only when the strokes changed. No
+        // strokes → nothing to draw (the shader skips masks without any).
+        if st.brush_key != Some(params.brush) {
+            if !params.brush.is_empty() {
+                if st.brush.is_none() {
+                    let (dw, dh) = self.oriented_dims();
+                    let (lw, lh) = super::brush::layer_size(dw, dh);
+                    let layers = context.brush.layers(&context.device, lw, lh);
+                    st.masks = Arc::new(make_mask_bind_group(context, &layers.array_view, &self.mask_buffer));
+                    st.brush = Some(layers);
+                }
+                if let Some(layers) = &st.brush {
+                    context.brush.rasterize(&context.device, &context.queue, layers, &params.brush);
+                }
+            }
+            st.brush_key = Some(params.brush);
+        }
+        let masks = st.masks.clone();
+
+        let settings = super::denoise::DenoiseSettings::from_params(&params);
+        if !settings.is_active() {
+            st.denoise_key = None;
+            st.active = self.base_bind_group.clone();
+            return ColorBindings { main: st.active.clone(), masks };
+        }
+        if st.denoise_key == Some(settings) {
+            return ColorBindings { main: st.active.clone(), masks };
+        }
+
+        if st.denoise.is_none() {
+            let targets = context.denoise.targets(
+                &context.device,
+                &self.debayer_texture_view,
+                self.width,
+                self.height,
+            );
+            let groups = [0, 1].map(|i| {
+                Arc::new(make_color_bind_group(
+                    context,
+                    targets.view(i),
+                    &self.uniform_buffer,
+                    &self.hsv_lut_view,
+                    &self.tone_curve_view,
+                    &self.curve_view,
+                ))
+            });
+            st.denoise = Some((targets, groups));
+        }
+        let wb = self.wb_multipliers;
+        let g = if wb[1] > 0.0 { wb[1] } else { 1.0 };
+        let wb = [(wb[0] / g).clamp(0.05, 20.0), 1.0, (wb[2] / g).clamp(0.05, 20.0)];
+        let stride = self.original_width as f32 / self.width.max(1) as f32;
+        let passes = super::denoise::plan(settings, &self.noise_model, wb, stride);
+        if let Some((targets, groups)) = &st.denoise {
+            let out = context.denoise.run(&context.device, &context.queue, targets, &passes);
+            st.active = groups[out].clone();
+        }
+        st.denoise_key = Some(settings);
+        ColorBindings { main: st.active.clone(), masks }
     }
 
     /// Display-space dimensions of the working (possibly subsampled) texture:
@@ -1020,6 +1185,13 @@ impl ImageResources {
         gpu_params.has_dcp = if self.has_dcp { 1 } else { 0 };
         gpu_params.dcp_has_curve = if self.dcp_has_curve { 1 } else { 0 };
         gpu_params.orientation = self.orientation;
+        gpu_params.set_lens(&crate::core::lens::gpu_params(
+            &self.lens,
+            &params.lens,
+            self.original_width,
+            self.original_height,
+        ));
+        gpu_params.set_defringe_radius(self.original_width as f32 / self.width.max(1) as f32);
 
         context
             .queue
@@ -1028,6 +1200,14 @@ impl ImageResources {
         if let Ok(mut current) = self.current_params.lock() {
             *current = gpu_params;
         }
+        if let Ok(mut stage) = self.stage_params.lock() {
+            *stage = *params;
+        }
+        context.queue.write_buffer(
+            &self.mask_buffer,
+            0,
+            bytemuck::bytes_of(&super::params::GpuMasks::from_params(params)),
+        );
     }
 
 }

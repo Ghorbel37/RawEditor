@@ -52,6 +52,10 @@ bytemuck = { version = "1.14", features = ["derive"] }
 # Matrix math for color space conversions (Phase 15)
 cgmath = "0.18"
 
+# lensfun lens-profile database (XML). Already in the tree via iced's SVG
+# stack, so this adds no new code to the build.
+roxmltree = "0.20"
+
 # Image processing (decode, resize, save thumbnails)
 image = "0.25"
 

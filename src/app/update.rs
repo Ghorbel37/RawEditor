@@ -33,11 +33,14 @@ fn is_slider_change(message: &Message) -> bool {
             | Message::TemperatureChanged(_)
             | Message::TintChanged(_)
             | Message::LumaNoiseChanged(_)
+            | Message::LumaDetailChanged(_)
             | Message::ColorNoiseChanged(_)
             | Message::SharpeningChanged(_)
             | Message::SharpenMaskingChanged(_)
             | Message::RotationChanged(_)
             | Message::MaskAdjustmentChanged(..)
+            | Message::LensParamChanged(..)
+            | Message::DefringeChanged(..)
     )
 }
 
@@ -88,6 +91,30 @@ fn dispatch(editor: &mut RawEditor, message: Message) -> Task<Message> {
         Message::ProfileCurveChanged(v) => {
             handlers::develop::handle_profile_curve_changed(editor, v)
         }
+        Message::CurveChanged(ch, curve, commit) => {
+            handlers::develop::handle_curve_changed(editor, ch, curve, commit)
+        }
+        Message::SetCurveChannel(ch) => {
+            editor.curve_channel = ch;
+            Task::none()
+        }
+        Message::ResetCurve => {
+            let ch = editor.curve_channel;
+            handlers::develop::handle_curve_changed(editor, ch, Default::default(), true)
+        }
+        Message::LensParamChanged(which, v) => {
+            handlers::lens::handle_lens_param_changed(editor, which, v)
+        }
+        Message::LensToggled(which, on) => handlers::lens::handle_lens_toggled(editor, which, on),
+        Message::DefringeChanged(which, v) => {
+            handlers::lens::handle_defringe_changed(editor, which, v)
+        }
+        Message::ToggleSection(section) => {
+            if !editor.collapsed_sections.remove(&section) {
+                editor.collapsed_sections.insert(section);
+            }
+            Task::none()
+        }
         Message::ToneMapperChanged(m) => {
             handlers::develop::handle_tone_mapper_changed(editor, m)
         }
@@ -99,6 +126,9 @@ fn dispatch(editor: &mut RawEditor, message: Message) -> Task<Message> {
         Message::TintChanged(v) => handlers::develop::handle_tint_changed(editor, v),
         Message::LumaNoiseChanged(v) => {
             handlers::develop::handle_luma_noise_changed(editor, v)
+        }
+        Message::LumaDetailChanged(v) => {
+            handlers::develop::handle_luma_detail_changed(editor, v)
         }
         Message::ColorNoiseChanged(v) => {
             handlers::develop::handle_color_noise_changed(editor, v)
@@ -131,6 +161,35 @@ fn dispatch(editor: &mut RawEditor, message: Message) -> Task<Message> {
         Message::MaskHandleGrabbed(h, b) => {
             handlers::masks::handle_mask_handle_grabbed(editor, h, b)
         }
+        Message::ToggleBrushArmed => handlers::masks::handle_toggle_brush_armed(editor),
+        Message::SetBrushErase(erase) => {
+            editor.brush_settings.erase = erase;
+            Task::none()
+        }
+        Message::BrushSettingChanged(which, v) => {
+            let b = &mut editor.brush_settings;
+            match which {
+                crate::app::message::BrushSetting::Size => b.size = v.clamp(0.002, 0.5),
+                crate::app::message::BrushSetting::Feather => b.feather = v.clamp(0.0, 1.0),
+                crate::app::message::BrushSetting::Flow => b.flow = v.clamp(0.01, 1.0),
+            }
+            editor.canvas_cache.clear();
+            Task::none()
+        }
+        Message::BrushStroke(ev) => handlers::masks::handle_brush_stroke(editor, ev),
+        Message::ClearMaskBrush => handlers::masks::handle_clear_mask_brush(editor),
+        Message::ToggleMaskOverlay(on) => {
+            editor.show_mask_overlay = on;
+            crate::app::handlers::develop::update_pipeline(editor)
+        }
+        Message::ToggleMaskLumaRange(on) => handlers::masks::handle_toggle_luma_range(editor, on),
+        Message::ToggleMaskColorRange(on) => handlers::masks::handle_toggle_color_range(editor, on),
+        Message::PickMaskColor => {
+            editor.color_picking_mask = editor.selected_mask;
+            editor.status = "Color range: click the colour to select".to_string();
+            Task::none()
+        }
+        Message::MaskColorPicked(u, v) => handlers::masks::handle_mask_color_picked(editor, u, v),
         Message::CommitEdit => handlers::develop::handle_commit_edit(editor),
         Message::Undo => handlers::develop::handle_undo(editor),
         Message::Redo => handlers::develop::handle_redo(editor),

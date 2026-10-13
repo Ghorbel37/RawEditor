@@ -484,6 +484,19 @@ pub struct CropOverlay {
     /// The selected mask (geometry drawn + handles hit-tested). Copy of the
     /// MaskParams — geometry is full-image display UV, same space as `crop`.
     pub selected_mask: Option<crate::core::types::MaskParams>,
+    /// Painting into the selected mask is armed: presses paint instead of
+    /// grabbing handles. (radius as a fraction of image height, feather.)
+    pub brush: Option<(f32, f32)>,
+    /// Colour-range eyedropper armed: a click emits `MaskColorPicked`.
+    pub is_color_picking: bool,
+}
+
+/// Canvas state: last seen size (for resize sensing) and an in-progress
+/// brush stroke.
+#[derive(Default)]
+pub struct OverlayState {
+    size: (f32, f32),
+    painting: bool,
 }
 
 impl CropOverlay {
@@ -695,8 +708,29 @@ impl CropOverlay {
     }
 }
 
+impl CropOverlay {
+    /// Brush cursor: outer radius and feather start, around the pointer.
+    fn draw_brush_cursor(&self, frame: &mut canvas::Frame, bounds: Rectangle, cursor: Cursor) {
+        let (Some((radius, feather)), Some(p)) = (self.brush, cursor.position_in(bounds)) else {
+            return;
+        };
+        let ib = self.image_bounds(bounds.width, bounds.height);
+        // `radius` is in full-image heights; the screen shows crop[3] of it.
+        let r = radius * ib.height / self.crop[3].max(1e-6);
+        let ring = |frame: &mut canvas::Frame, r: f32, c: Color, w: f32| {
+            frame.stroke(&canvas::Path::circle(p, r), canvas::Stroke::default().with_color(c).with_width(w));
+        };
+        ring(frame, r, Color::from_rgba(0.0, 0.0, 0.0, 0.6), 3.0);
+        ring(frame, r, Color::WHITE, 1.2);
+        let inner = r * (1.0 - feather.clamp(0.0, 1.0));
+        if inner > 2.0 && feather > 0.02 {
+            ring(frame, inner, Color::from_rgba(1.0, 1.0, 1.0, 0.45), 1.0);
+        }
+    }
+}
+
 impl canvas::Program<Message> for CropOverlay {
-    type State = (f32, f32, f32); // Phase 116: Track (width, height, scale_factor) for resize sensing
+    type State = OverlayState;
 
     fn draw(
         &self,
@@ -704,10 +738,16 @@ impl canvas::Program<Message> for CropOverlay {
         renderer: &iced::Renderer,
         _theme: &iced::Theme,
         bounds: Rectangle,
-        _cursor: Cursor,
+        cursor: Cursor,
     ) -> Vec<canvas::Geometry> {
         if !self.is_cropping {
-            return self.draw_mask_overlay(renderer, bounds);
+            let mut layers = self.draw_mask_overlay(renderer, bounds);
+            if self.brush.is_some() {
+                let mut frame = canvas::Frame::new(renderer, bounds.size());
+                self.draw_brush_cursor(&mut frame, bounds, cursor);
+                layers.push(frame.into_geometry());
+            }
+            return layers;
         }
 
         let image_bounds = self.image_bounds(bounds.width, bounds.height);
@@ -767,14 +807,42 @@ impl canvas::Program<Message> for CropOverlay {
         // overwrote the real value on every resize — so on a HiDPI display the
         // preview always rendered at half resolution. It comes from the window
         // instead (`Message::ScaleFactorChanged`).
-        if state.0 != bounds.width || state.1 != bounds.height {
-            *state = (bounds.width, bounds.height, 1.0);
+        if state.size != (bounds.width, bounds.height) {
+            state.size = (bounds.width, bounds.height);
             return (canvas::event::Status::Captured, Some(Message::ViewportResized(bounds.width, bounds.height)));
+        }
+
+        // A stroke in progress owns the mouse until release, even if the
+        // pointer leaves the image (or the canvas) mid-drag.
+        if state.painting {
+            match event {
+                canvas::Event::Mouse(iced::mouse::Event::CursorMoved { .. }) => {
+                    if let Some(p) = cursor.position() {
+                        let ib = self.image_bounds(bounds.width, bounds.height);
+                        let local = iced::Point::new(p.x - bounds.x, p.y - bounds.y);
+                        let (u, v) = self.screen_to_uv(local, &ib);
+                        return (
+                            canvas::event::Status::Captured,
+                            Some(Message::BrushStroke(crate::app::message::StrokeEvent::Move(u, v))),
+                        );
+                    }
+                }
+                canvas::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)) => {
+                    state.painting = false;
+                    return (
+                        canvas::event::Status::Captured,
+                        Some(Message::BrushStroke(crate::app::message::StrokeEvent::End)),
+                    );
+                }
+                _ => {}
+            }
+            return (canvas::event::Status::Captured, None);
         }
 
         if !self.is_cropping
             && !self.is_wb_picking
             && !self.is_mask_placing
+            && !self.is_color_picking
             && self.selected_mask.is_none()
         {
             return (canvas::event::Status::Ignored, None);
@@ -793,6 +861,37 @@ impl canvas::Program<Message> for CropOverlay {
                 let v = (cursor_position.y - image_bounds.y) / image_bounds.height.max(1.0);
                 if (0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v) {
                     return (canvas::event::Status::Captured, Some(Message::WbPicked(u, v)));
+                }
+            }
+            return (canvas::event::Status::Ignored, None);
+        }
+
+        // Colour-range eyedropper: same contract as the WB picker.
+        if self.is_color_picking {
+            if let canvas::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)) = event {
+                let image_bounds = self.image_bounds(bounds.width, bounds.height);
+                let u = (cursor_position.x - image_bounds.x) / image_bounds.width.max(1.0);
+                let v = (cursor_position.y - image_bounds.y) / image_bounds.height.max(1.0);
+                if (0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v) {
+                    return (canvas::event::Status::Captured, Some(Message::MaskColorPicked(u, v)));
+                }
+            }
+            return (canvas::event::Status::Ignored, None);
+        }
+
+        // Armed brush: a press on the image starts a stroke.
+        if self.brush.is_some() && self.selected_mask.is_some() {
+            if let canvas::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)) = event {
+                let image_bounds = self.image_bounds(bounds.width, bounds.height);
+                let view_u = (cursor_position.x - image_bounds.x) / image_bounds.width.max(1.0);
+                let view_v = (cursor_position.y - image_bounds.y) / image_bounds.height.max(1.0);
+                if (0.0..=1.0).contains(&view_u) && (0.0..=1.0).contains(&view_v) {
+                    let (u, v) = self.screen_to_uv(cursor_position, &image_bounds);
+                    state.painting = true;
+                    return (
+                        canvas::event::Status::Captured,
+                        Some(Message::BrushStroke(crate::app::message::StrokeEvent::Begin(u, v))),
+                    );
                 }
             }
             return (canvas::event::Status::Ignored, None);
@@ -870,7 +969,11 @@ impl canvas::Program<Message> for CropOverlay {
         bounds: Rectangle,
         cursor: Cursor,
     ) -> iced::mouse::Interaction {
-        if self.is_wb_picking || self.is_mask_placing {
+        if self.is_wb_picking || self.is_mask_placing || self.is_color_picking {
+            return iced::mouse::Interaction::Crosshair;
+        }
+        if self.brush.is_some() && cursor.position_in(bounds).is_some() {
+            // A precise point at the centre of the ring drawn in `draw`.
             return iced::mouse::Interaction::Crosshair;
         }
         if !self.is_cropping {

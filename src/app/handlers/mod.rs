@@ -1,5 +1,6 @@
 pub mod library;
 pub mod develop;
+pub mod lens;
 pub mod masks;
 pub mod scroll;
 pub mod navigation;

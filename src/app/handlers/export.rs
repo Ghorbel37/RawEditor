@@ -273,7 +273,7 @@ pub fn handle_process_next_export(editor: &mut RawEditor) -> Task<Message> {
             };
             // Exporting while the crop tool is open must still produce the
             // cropped photo, not the tool's dimmed full-sensor preview.
-            params.is_cropping = 0;
+            params = params.without_tool_state();
             // Reuse an already-decoded RAW when the develop/cull preload has
             // one. Skips a multi-second decode per image for the common
             // "cull, then export the selects" flow, and costs nothing: the
@@ -386,6 +386,7 @@ pub fn handle_export_raw_loaded(
                         interpolated_dcp.as_ref(),
                         None, // full resolution for export
                         raw_data.orientation,
+                        raw_data.lens_context.clone(),
                     )
                     .map(|res| (context, Arc::new(res)))
                 },
