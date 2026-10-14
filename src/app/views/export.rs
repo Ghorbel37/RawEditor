@@ -10,7 +10,8 @@
 //! Develop; both drive the same `ExportConfirmed` handler.
 
 use iced::font::{Font, Weight};
-use iced::widget::{button, checkbox, column, container, radio, row, scrollable, slider, text, text_input};
+use iced::widget::{checkbox, column, container, radio, row, scrollable, slider, text, text_input};
+use crate::ui::widgets::button;
 use iced::{Alignment, Background, Border, Color, Element, Length, Theme};
 
 use crate::app::message::Message;

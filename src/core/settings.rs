@@ -27,6 +27,9 @@ pub struct AppSettings {
     /// memory cannot be determined.
     #[serde(default = "default_min_free_ram_mb")]
     pub min_free_ram_mb: u32,
+    /// Preferences › Reduce motion. `#[serde(default)]`: see above.
+    #[serde(default)]
+    pub reduce_motion: bool,
 }
 
 fn default_min_free_ram_mb() -> u32 {
@@ -47,6 +50,7 @@ impl Default for AppSettings {
             raw_preload_ahead: 4,
             copy_categories: crate::core::types::CopyCategories::default(),
             min_free_ram_mb: default_min_free_ram_mb(),
+            reduce_motion: false,
         }
     }
 }

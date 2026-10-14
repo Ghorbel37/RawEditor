@@ -1,7 +1,8 @@
 use iced::font::{Font, Weight};
 use iced::widget::{
-    button, checkbox, column, container, row, scrollable, slider, stack, text, Container,
+    checkbox, column, container, row, scrollable, slider, stack, text, Container,
 };
+use crate::ui::widgets::button;
 use iced::{Alignment, Background, Border, Color, Element, Length, Theme};
 
 use crate::app::message::{DefringeParam, LensParam, LensToggle, Message, SidebarSection};
@@ -9,6 +10,10 @@ use crate::app::state::{EditorReadiness, RawEditor};
 use crate::database::models::Image as ImageData;
 use crate::ui;
 use crate::ui::icons::ICON_FONT;
+use crate::ui::widgets::transition::entrance;
+
+/// The edit sidebar's background — also what folding sections fade from.
+const SIDEBAR_BACKGROUND: Color = Color::from_rgb(0.15, 0.15, 0.15);
 
 /// Build the Develop tab view (full-screen editor with preview)
 pub fn view_develop(editor: &RawEditor) -> Element<'_, Message> {
@@ -19,7 +24,7 @@ pub fn view_develop(editor: &RawEditor) -> Element<'_, Message> {
             .height(Length::Fill),
     )
     .style(|_theme| container::Style {
-        background: Some(Background::Color(Color::from_rgb(0.15, 0.15, 0.15))),
+        background: Some(Background::Color(SIDEBAR_BACKGROUND)),
         ..Default::default()
     });
 
@@ -132,8 +137,7 @@ fn view_sidebar(editor: &RawEditor) -> iced::widget::Column<'_, Message> {
             0.005,
             Message::BlacksChanged,
         ))
-        .push(section_header(editor, "Tone Curve", SidebarSection::ToneCurve))
-        .push_maybe(expanded(editor, SidebarSection::ToneCurve).then(|| curve_section(editor)))
+        .push(collapsible_section(editor, "Tone Curve", SidebarSection::ToneCurve, curve_section(editor)))
         .push(text("Tone Mapping").size(14))
         .push(tone_mapper_selector(editor))
         .push(tone_mapper_hint(editor))
@@ -314,10 +318,8 @@ fn view_sidebar(editor: &RawEditor) -> iced::widget::Column<'_, Message> {
         );
 
     sidebar = sidebar
-        .push(section_header(editor, "Lens Corrections", SidebarSection::Lens))
-        .push_maybe(expanded(editor, SidebarSection::Lens).then(|| lens_section(editor)))
-        .push(section_header(editor, "Defringe", SidebarSection::Defringe))
-        .push_maybe(expanded(editor, SidebarSection::Defringe).then(|| defringe_section(editor)));
+        .push(collapsible_section(editor, "Lens Corrections", SidebarSection::Lens, lens_section(editor)))
+        .push(collapsible_section(editor, "Defringe", SidebarSection::Defringe, defringe_section(editor)));
 
     sidebar = push_mask_section(sidebar, editor);
 
@@ -470,7 +472,7 @@ fn prepare_preview(editor: &RawEditor) -> (bool, Option<Element<'_, Message>>) {
             .padding(20)
             .align_x(iced::Alignment::End)
             .align_y(iced::Alignment::End);
-            (has_pixels, Some(overlay.into()))
+            (has_pixels, Some(entrance(overlay).starting_scale(0.94).starting_offset(0.0, 10.0).into()))
         }
         EditorReadiness::Ready(_) => {
             if let (Some(_ctx), Some(_resources)) = (&editor.gpu_context, &editor.image_resources) {
@@ -617,22 +619,28 @@ fn view_main_content<'a>(
                 // Without a badge there is nothing distinguishing "the original"
                 // from "an edit that did nothing" — which is a fair part of why
                 // the old before/after went unnoticed after it broke.
+                // It drops in on a lively spring, so the switch to the
+                // original registers even out of the corner of an eye.
                 let badge: Element<'_, Message> = if peeking {
                     container(
-                        container(
-                            text("BEFORE")
-                                .size(11)
-                                .font(Font { weight: Weight::Bold, ..Default::default() })
-                                .style(|_theme| text::Style { color: Some(Color::WHITE) }),
+                        entrance(
+                            container(
+                                text("BEFORE")
+                                    .size(11)
+                                    .font(Font { weight: Weight::Bold, ..Default::default() })
+                                    .style(|_theme| text::Style { color: Some(Color::WHITE) }),
+                            )
+                            .padding([4, 10])
+                            .style(|_theme| container::Style {
+                                background: Some(Background::Color(Color::from_rgb(
+                                    0.98, 0.45, 0.09,
+                                ))),
+                                border: Border { radius: 3.0.into(), ..Default::default() },
+                                ..Default::default()
+                            }),
                         )
-                        .padding([4, 10])
-                        .style(|_theme| container::Style {
-                            background: Some(Background::Color(Color::from_rgb(
-                                0.98, 0.45, 0.09,
-                            ))),
-                            border: Border { radius: 3.0.into(), ..Default::default() },
-                            ..Default::default()
-                        }),
+                        .starting_scale(0.8)
+                        .starting_offset(0.0, -8.0),
                     )
                     .width(Length::Fill)
                     .height(Length::Fill)
@@ -664,8 +672,10 @@ fn view_main_content<'a>(
         iced::widget::Space::new(Length::Fill, Length::Fill).into()
     };
 
-    let overlay = match editor.info_overlay {
-        crate::app::state::InfoOverlayState::Hidden => container(column![]),
+    // The `I` panels slide down into place; cycling between them keeps the
+    // same widget, so only the first appearance animates.
+    let overlay: Element<'_, Message> = match editor.info_overlay {
+        crate::app::state::InfoOverlayState::Hidden => container(column![]).into(),
         // Cache debug: what the loader is actually holding. Previously this
         // shared an arm with Metadata and rendered identically, so cycling with
         // `I` appeared to show the same panel twice before hiding.
@@ -686,7 +696,7 @@ fn view_main_content<'a>(
                 })
                 .unwrap_or("no selection");
 
-            info_panel(
+            info_entrance(info_panel(
                 column![
                     text("CACHE").size(12).style(|_| text::Style {
                         color: Some(Color::from_rgb(0.98, 0.45, 0.09))
@@ -717,7 +727,7 @@ fn view_main_content<'a>(
                 ]
                 .spacing(2)
                 .into(),
-            )
+            ))
         }
         crate::app::state::InfoOverlayState::Metadata => {
             let mut lines = column![
@@ -732,7 +742,7 @@ fn view_main_content<'a>(
             for line in metadata_lines(editor) {
                 lines = lines.push(info_line(line));
             }
-            info_panel(lines.into())
+            info_entrance(info_panel(lines.into()))
         }
     };
 
@@ -1041,6 +1051,26 @@ fn push_mask_section<'a>(
     sidebar
 }
 
+/// A section title that folds its body away (`ui::widgets::collapse`).
+///
+/// Header and body are a single sidebar item, with the gap between them
+/// inside the body: a folded section then adds no spacing of its own, and
+/// the gap folds away with the body instead of snapping.
+fn collapsible_section<'a>(
+    editor: &RawEditor,
+    title: &'a str,
+    section: SidebarSection,
+    body: Element<'a, Message>,
+) -> Element<'a, Message> {
+    let body = container(body).padding(iced::Padding { top: 10.0, ..iced::Padding::ZERO });
+    column![
+        section_header(editor, title, section),
+        crate::ui::widgets::collapse::collapse(expanded(editor, section), body)
+            .veil(SIDEBAR_BACKGROUND),
+    ]
+    .into()
+}
+
 fn expanded(editor: &RawEditor, section: SidebarSection) -> bool {
     !editor.collapsed_sections.contains(&section)
 }
@@ -1309,6 +1339,10 @@ fn info_panel<'a>(body: Element<'a, Message>) -> Container<'a, Message> {
             },
             ..Default::default()
         })
+}
+
+fn info_entrance<'a>(panel: Container<'a, Message>) -> Element<'a, Message> {
+    entrance(panel).starting_scale(0.97).starting_offset(0.0, -6.0).into()
 }
 
 /// Camera / lens / exposure lines for the `I` overlay, shared with Cull.

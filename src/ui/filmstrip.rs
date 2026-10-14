@@ -1,4 +1,6 @@
-use iced::widget::{button, container, image, mouse_area, row, scrollable, text, stack, Space};
+use iced::widget::{container, mouse_area, row, scrollable, text, stack, Space};
+use crate::ui::widgets::button;
+use crate::ui::widgets::fade_image::fade_image;
 use iced::{Background, Border, Color, Element, Length, Theme};
 
 use crate::database::models::{Image, MARKED_FOR_REMOVAL_RATING};
@@ -31,14 +33,33 @@ pub fn visible_items(scroll_x: f32, view_width: f32, count: usize) -> (usize, us
     (first, last.max(first))
 }
 
-/// The scroll offset that centres slot `index`, or `None` if it is already
-/// fully visible.
-pub fn scroll_to_reveal(index: usize, scroll_x: f32, view_width: f32) -> Option<f32> {
+/// Where [`scroll_to_reveal`] puts a slot it has to scroll to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reveal {
+    /// Just far enough: the slot lands at the edge it was beyond, as the
+    /// first or last one visible, and one slot leaves the other end. For
+    /// stepping through the strip, where centring would throw the user's
+    /// place half a screen away on every edge crossing.
+    Edge,
+    /// Centred, for arriving somewhere new (a tab switch) with context on
+    /// both sides.
+    Center,
+}
+
+/// The scroll offset that brings slot `index` into view, or `None` if it is
+/// already fully visible.
+pub fn scroll_to_reveal(index: usize, scroll_x: f32, view_width: f32, how: Reveal) -> Option<f32> {
     let left = index as f32 * ITEM_WIDTH;
-    if left >= scroll_x && left + ITEM_WIDTH <= scroll_x + view_width {
+    let right = left + ITEM_WIDTH;
+    if left >= scroll_x && right <= scroll_x + view_width {
         return None;
     }
-    Some((left - (view_width - ITEM_WIDTH) / 2.0).max(0.0))
+    let offset = match how {
+        Reveal::Center => left - (view_width - ITEM_WIDTH) / 2.0,
+        Reveal::Edge if left < scroll_x => left,
+        Reveal::Edge => right - view_width,
+    };
+    Some(offset.max(0.0))
 }
 
 /// Render the filmstrip timeline at the bottom of the Develop and Cull tabs.
@@ -72,19 +93,20 @@ pub fn view<'a>(
         // The edited proxy when the image has edits, so the strip shows the
         // photos as edited. Images still waiting on their cache tiers get a
         // blank slot rather than being skipped: every slot must be ITEM_WIDTH
-        // wide for the index → position arithmetic above to hold.
-        let img_widget: Element<'a, Message> = match editor.thumbnail_handle(img) {
-            Some(handle) => image(handle)
-                .width(Length::Fixed(THUMB_W))
-                .height(Length::Fixed(THUMB_H))
-                .into(),
-            None => container(Space::new(Length::Fixed(THUMB_W), Length::Fixed(THUMB_H)))
-                .style(|_| container::Style {
-                    background: Some(Background::Color(Color::from_rgb(0.12, 0.12, 0.12))),
+        // wide for the index → position arithmetic above to hold. A
+        // `FadeImage` either way, so the thumbnail fades in when it lands.
+        let handle = editor.thumbnail_handle(img);
+        // Only an empty slot gets the placeholder tone: a portrait thumbnail
+        // is letterboxed, and its side bars should show the selection tint.
+        let waiting = handle.is_none();
+        let img_widget: Element<'a, Message> =
+            container(fade_image(img.id as u64, handle, THUMB_W, THUMB_H))
+                .style(move |_| container::Style {
+                    background: waiting
+                        .then_some(Background::Color(Color::from_rgb(0.12, 0.12, 0.12))),
                     ..Default::default()
                 })
-                .into(),
-        };
+                .into();
 
         // Phase 56: Overlay star rating (or the "marked for removal" badge,
         // which reuses this same field via a reserved sentinel — must be
@@ -169,17 +191,8 @@ pub fn view<'a>(
                 left: ITEM_PAD_X,
             })
             .style(move |_theme: &Theme| {
-                let mut style = if is_selected {
-                    // Selected: light grey background only (no border)
-                    container::Style {
-                        background: Some(Background::Color(Color::from_rgb(0.3, 0.3, 0.3))),
-                        ..Default::default()
-                    }
-                } else {
-                    // Unselected: no styling
-                    container::Style::default()
-                };
-                
+                // Selection is drawn by the button below, so it can fade.
+                let mut style = container::Style::default();
                 // Phase 83: Flag Feedback
                 if img.flag == -1 {
                     style.text_color = Some(Color::from_rgba(1.0, 1.0, 1.0, 0.5)); // Dim text if any
@@ -222,15 +235,26 @@ pub fn view<'a>(
             ]);
         }
 
-        // Wrap in button for clicking
+        // Wrap in button for clicking. Selection and hover are its style, so
+        // moving through the strip crossfades the highlight from one frame to
+        // the next; keyed by id because the strip is virtualised.
         let thumbnail_button = button(final_content)
             .padding(0)  // Remove button's default padding
             .on_press(Message::ImageSelected(img.id))
-            .style(|_theme: &Theme, status| {
+            .key(img.id as u64)
+            .style(move |_theme: &Theme, status| {
+                let tint = match (is_selected, status) {
+                    (true, _) => Some(Color::from_rgb(0.3, 0.3, 0.3)),
+                    (false, button::Status::Hovered | button::Status::Pressed) => {
+                        Some(Color::from_rgb(0.17, 0.17, 0.17))
+                    }
+                    (false, _) => None,
+                };
                 button::Style {
-                    background: None,
+                    background: tint.map(Background::Color),
                     border: Border::default(),
-                    ..button::primary(_theme, status)
+                    text_color: Color::WHITE,
+                    ..Default::default()
                 }
             })
             .into(); // Convert to Element
@@ -331,11 +355,26 @@ mod tests {
 
     #[test]
     fn reveal_centres_an_off_screen_slot_and_leaves_visible_ones() {
-        assert_eq!(scroll_to_reveal(2, 0.0, 1720.0), None);
-        let x = scroll_to_reveal(50, 0.0, 1720.0).expect("slot 50 is off screen");
+        assert_eq!(scroll_to_reveal(2, 0.0, 1720.0, Reveal::Center), None);
+        let x = scroll_to_reveal(50, 0.0, 1720.0, Reveal::Center).expect("slot 50 is off screen");
         let centre = 50.0 * ITEM_WIDTH + ITEM_WIDTH / 2.0;
         assert!((x + 1720.0 / 2.0 - centre).abs() < 1e-3);
         // Never scrolls before the start.
-        assert_eq!(scroll_to_reveal(0, 500.0, 1720.0), Some(0.0));
+        assert_eq!(scroll_to_reveal(0, 500.0, 1720.0, Reveal::Center), Some(0.0));
+    }
+
+    /// Stepping off either end brings the slot to that edge — the last one
+    /// visible going right, the first going left — not to the centre.
+    #[test]
+    fn edge_reveal_moves_just_far_enough() {
+        let view = 1720.0;
+        assert_eq!(scroll_to_reveal(5, 0.0, view, Reveal::Edge), None);
+        // The view holds exactly ten slots: slot 10 is the first off it.
+        let x = scroll_to_reveal(10, 0.0, view, Reveal::Edge).expect("slot 10 is off screen");
+        assert!((x + view - 11.0 * ITEM_WIDTH).abs() < 1e-3, "right edges should meet");
+        assert!((x - ITEM_WIDTH).abs() < 1e-3, "one step, not half a screen: {x}");
+        // Going left: the slot becomes the first visible.
+        let x = scroll_to_reveal(20, 22.0 * ITEM_WIDTH, view, Reveal::Edge).unwrap();
+        assert_eq!(x, 20.0 * ITEM_WIDTH);
     }
 }

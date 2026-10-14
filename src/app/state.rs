@@ -64,7 +64,7 @@ use lru::LruCache;
 use std::num::NonZeroUsize;
 
 /// Phase 84: Modal system
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Modal {
     None,
     Help,
@@ -80,6 +80,58 @@ pub enum Modal {
     /// Confirm forgetting a folder. Its target lives in
     /// `RawEditor::pending_remove_folder`.
     RemoveFolder,
+}
+
+/// A modal on its way out: which one, and a token so a timer from an earlier
+/// close can't cut a later one short.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModalExit {
+    pub modal: Modal,
+    pub token: u64,
+}
+
+/// Which scrollable a [`ScrollGlide`] drives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlideTarget {
+    Grid,
+    Filmstrip,
+}
+
+/// A spring-driven scroll towards the selection (`handlers::scroll`). A
+/// spring rather than a fixed-length tween so holding an arrow key — a new
+/// target every repeat — keeps one continuous motion instead of restarting.
+///
+/// The spring runs on the *displacement* from `to`, towards zero, not on the
+/// offset itself: offsets reach six figures in a long filmstrip, where `f32`
+/// is too coarse for a spring to settle, and a glide that never ended kept
+/// issuing `scroll_to` every frame (see `ui::motion::Animated`).
+#[derive(Debug, Clone, Copy)]
+pub struct ScrollGlide {
+    pub target: GlideTarget,
+    /// Where the glide comes to rest.
+    pub to: f32,
+    /// Current offset minus `to`; springs to 0.
+    pub displacement: crate::ui::motion::Animated,
+    /// How fast `to` is advancing (px/s, signed) while an arrow key is held,
+    /// fed forward so the strip keeps pace instead of trailing; 0 otherwise.
+    /// See `handlers::scroll::hold_rate`.
+    pub rate: f32,
+    /// Sign of travel of the current hold.
+    pub direction: f32,
+    /// When the current hold began; `None` once released.
+    pub hold_start: Option<std::time::Instant>,
+    /// Distance `to` has travelled this hold, exponentially decayed.
+    pub flux: f32,
+    /// Retargets so far this hold.
+    pub retargets: u32,
+    pub last_retarget: Option<std::time::Instant>,
+    pub last_tick: Option<std::time::Instant>,
+}
+
+impl ScrollGlide {
+    pub fn offset(&self) -> f32 {
+        self.to + self.displacement.value
+    }
 }
 
 /// Phase 89: Export Format
@@ -202,6 +254,21 @@ pub const EDITED_PROXY_CAPACITY: usize = 128;
 pub struct RawEditor {
     // Phase 84: Active modal overlay
     pub active_modal: Modal,
+    /// A modal that has just closed and is still playing its exit (see
+    /// `ui::widgets::modal`). Set and cleared centrally in `update`, so no
+    /// close path has to remember it.
+    pub modal_exit: Option<ModalExit>,
+    /// Source of `ModalExit::token`s; never reused, so a stale timer can't
+    /// match a later exit.
+    pub modal_exit_seq: u64,
+    /// Preferences › Reduce motion: every animation jumps to its end state.
+    /// Mirrored into `ui::motion::set_reduced`, which the widgets read.
+    pub reduce_motion: bool,
+    /// An in-flight smooth scroll that brings the selection into view.
+    pub scroll_glide: Option<ScrollGlide>,
+    /// Bumped whenever a title-bar dropdown entry is chosen, which remounts
+    /// (and so closes) the menu bar — see `views::layout::view_title_bar`.
+    pub menu_generation: u64,
 
     /// Image IDs the open Delete modal acts on — a stable snapshot taken
     /// when the modal opens, not re-read live from multi_selection.
@@ -549,6 +616,11 @@ impl RawEditor {
         tracing::info!("RAW Editor starting (instant splash screen)...");
 
         let settings = crate::core::settings::AppSettings::load_or_default();
+        // Not under test: the flag is process-global, tests build editors in
+        // parallel, and this reads the developer's real settings file.
+        if !cfg!(test) {
+            crate::ui::motion::set_reduced(settings.reduce_motion);
+        }
         let cache_capacity = settings.cache_capacity.clamp(20, 500);
         let raw_preload_budget_mb = settings.raw_preload_budget_mb.min(4096);
         let thumbnail_size = settings.thumbnail_size.clamp(100.0, 400.0);
@@ -666,6 +738,11 @@ impl RawEditor {
                 filmstrip_view_w: 0.0,
                 filmstrip_velocity: 0.0,
                 last_kinetic_tick: None,
+                modal_exit: None,
+                modal_exit_seq: 0,
+                reduce_motion: settings.reduce_motion,
+                scroll_glide: None,
+                menu_generation: 0,
                 last_wheel_time: None,
                 filmstrip_input_speed: 0.0,
                 filmstrip_decay: 4.0,
@@ -1176,6 +1253,7 @@ impl RawEditor {
             raw_preload_ahead: self.raw_preload_ahead,
             copy_categories: self.copy_categories,
             min_free_ram_mb: self.min_free_ram_mb,
+            reduce_motion: self.reduce_motion,
         };
 
         if let Err(e) = settings.save() {
@@ -1221,11 +1299,18 @@ impl RawEditor {
             if let iced::Event::Window(iced::window::Event::Unfocused) = event {
                 return Some(Message::SetBeforePeek(false));
             }
-            // Hold-to-peek needs the release edge; every other shortcut here
-            // is press-only.
+            // Hold-to-peek and the arrow-key follow scroll need the release
+            // edge; every other shortcut here is press-only.
             if let iced::Event::Keyboard(keyboard::Event::KeyReleased { key, .. }) = &event {
                 if matches!(key, keyboard::Key::Named(Named::Space)) {
                     return Some(Message::SetBeforePeek(false));
+                }
+                // The end of a held arrow key: the follow scroll coasts to rest.
+                if matches!(
+                    key,
+                    keyboard::Key::Named(Named::ArrowLeft | Named::ArrowRight)
+                ) {
+                    return Some(Message::NavigationKeyReleased);
                 }
                 return None;
             }
@@ -1348,9 +1433,9 @@ impl RawEditor {
         );
 
         let mut subs = vec![keyboard_subscription, loader_subscription];
-        // Only tick while a filmstrip glide is in progress — avoids driving a
-        // redraw-linked subscription at all times.
-        if self.filmstrip_velocity != 0.0 {
+        // Only tick while a filmstrip glide or a reveal scroll is in progress
+        // — avoids driving a redraw-linked subscription at all times.
+        if self.filmstrip_velocity != 0.0 || self.scroll_glide.is_some() {
             subs.push(iced::window::frames().map(Message::KineticTick));
         }
         iced::Subscription::batch(subs)

@@ -177,6 +177,13 @@ pub fn handle_toggle_info_hud(editor: &mut RawEditor) -> Task<Message> {
     Task::none()
 }
 
+pub fn handle_toggle_reduce_motion(editor: &mut RawEditor) -> Task<Message> {
+    editor.reduce_motion = !editor.reduce_motion;
+    crate::ui::motion::set_reduced(editor.reduce_motion);
+    editor.save_preferences();
+    Task::none()
+}
+
 pub fn handle_set_thumbnail_size(editor: &mut RawEditor, size: f32) -> Task<Message> {
     editor.thumbnail_size = size.clamp(100.0, 400.0);
     editor.save_preferences();
@@ -263,6 +270,8 @@ pub fn handle_reset_preferences(editor: &mut RawEditor) -> Task<Message> {
     editor.raw_preload_behind = defaults.raw_preload_behind;
     editor.raw_preload_ahead = defaults.raw_preload_ahead;
     editor.min_free_ram_mb = defaults.min_free_ram_mb;
+    editor.reduce_motion = defaults.reduce_motion;
+    crate::ui::motion::set_reduced(editor.reduce_motion);
 
     editor.evict_raw_cache_to_budget();
     editor.save_preferences();

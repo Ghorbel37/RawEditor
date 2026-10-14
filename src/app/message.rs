@@ -364,7 +364,18 @@ pub enum Message {
     // Phase 84: Generic Modal System
     OpenModal(crate::app::state::Modal),
     CloseModal,
+    /// A closed modal's exit animation is over; unmount it (token-matched,
+    /// see `state::ModalExit`).
+    ModalExitFinished(u64),
+    /// Preferences › Reduce motion.
+    ToggleReduceMotion,
     ModalNoOp, // Swallows clicks
+    /// An arrow key came up: ends a held-key follow scroll
+    /// (`handlers::scroll::release`).
+    NavigationKeyReleased,
+    /// A title-bar dropdown entry was chosen: closes the dropdown, then runs
+    /// the entry's own message. See `views::layout::view_title_bar`.
+    MenuItem(Box<Message>),
     Escape,    // Global Escape key
     /// Ctrl/Cmd+A — select every image the current tab displays.
     SelectAll,
