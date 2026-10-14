@@ -370,6 +370,9 @@ pub enum Message {
     /// Preferences › Reduce motion.
     ToggleReduceMotion,
     ModalNoOp, // Swallows clicks
+    /// An arrow key came up: ends a held-key follow scroll
+    /// (`handlers::scroll::release`).
+    NavigationKeyReleased,
     /// A title-bar dropdown entry was chosen: closes the dropdown, then runs
     /// the entry's own message. See `views::layout::view_title_bar`.
     MenuItem(Box<Message>),

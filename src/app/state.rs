@@ -112,6 +112,19 @@ pub struct ScrollGlide {
     pub to: f32,
     /// Current offset minus `to`; springs to 0.
     pub displacement: crate::ui::motion::Animated,
+    /// How fast `to` is advancing (px/s, signed) while an arrow key is held,
+    /// fed forward so the strip keeps pace instead of trailing; 0 otherwise.
+    /// See `handlers::scroll::hold_rate`.
+    pub rate: f32,
+    /// Sign of travel of the current hold.
+    pub direction: f32,
+    /// When the current hold began; `None` once released.
+    pub hold_start: Option<std::time::Instant>,
+    /// Distance `to` has travelled this hold, exponentially decayed.
+    pub flux: f32,
+    /// Retargets so far this hold.
+    pub retargets: u32,
+    pub last_retarget: Option<std::time::Instant>,
     pub last_tick: Option<std::time::Instant>,
 }
 
@@ -1286,11 +1299,18 @@ impl RawEditor {
             if let iced::Event::Window(iced::window::Event::Unfocused) = event {
                 return Some(Message::SetBeforePeek(false));
             }
-            // Hold-to-peek needs the release edge; every other shortcut here
-            // is press-only.
+            // Hold-to-peek and the arrow-key follow scroll need the release
+            // edge; every other shortcut here is press-only.
             if let iced::Event::Keyboard(keyboard::Event::KeyReleased { key, .. }) = &event {
                 if matches!(key, keyboard::Key::Named(Named::Space)) {
                     return Some(Message::SetBeforePeek(false));
+                }
+                // The end of a held arrow key: the follow scroll coasts to rest.
+                if matches!(
+                    key,
+                    keyboard::Key::Named(Named::ArrowLeft | Named::ArrowRight)
+                ) {
+                    return Some(Message::NavigationKeyReleased);
                 }
                 return None;
             }

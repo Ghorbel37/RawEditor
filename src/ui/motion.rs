@@ -94,7 +94,7 @@ pub mod duration {
     /// Thumbnail fades / crossfades.
     pub const FADE: f32 = 0.22;
     /// Tab content fade-through.
-    pub const PAGE: f32 = 0.26;
+    pub const PAGE: f32 = 0.20;
     /// Modal entrance (surface + content, staggered within it).
     pub const MODAL_ENTER: f32 = 0.30;
     /// Modal exit. Exits are quicker than entrances: the user has already
@@ -213,22 +213,48 @@ impl Spring {
     pub const RELEASE: Spring = Spring { response: 0.32, damping: 0.55 };
     /// Pop-in for small badges: lively, noticeable overshoot.
     pub const POP: Spring = Spring { response: 0.34, damping: 0.62 };
+    /// Keeping up with something moving (the selection, while an arrow key
+    /// is held): stiff enough to catch up within a few thumbnails, no
+    /// overshoot. Used with [`Spring::track`].
+    pub const FOLLOW: Spring = Spring { response: 0.24, damping: 1.0 };
+
+    /// Angular frequency (rad/s) of the undamped oscillation.
+    pub fn omega(&self) -> f32 {
+        std::f32::consts::TAU / self.response.max(1e-3)
+    }
 
     /// Advance `(value, velocity)` towards `target` by `dt` seconds.
+    pub fn step(&self, value: &mut f32, velocity: &mut f32, target: f32, dt: f32) {
+        self.track(value, velocity, target, 0.0, dt);
+    }
+
+    /// [`step`](Self::step) towards a target that is itself moving at
+    /// `target_velocity`. The damping pulls the velocity towards the
+    /// target's rather than towards zero, so a steadily moving target is
+    /// followed at its own constant speed with no lag at all — where a plain
+    /// spring would trail it by `2ζ/ω × speed` forever.
     ///
     /// Semi-implicit Euler in fixed substeps: stable for any spring here at
     /// any frame rate, and far cheaper to reason about than the closed form.
-    pub fn step(&self, value: &mut f32, velocity: &mut f32, target: f32, dt: f32) {
+    pub fn track(
+        &self,
+        value: &mut f32,
+        velocity: &mut f32,
+        target: f32,
+        target_velocity: f32,
+        dt: f32,
+    ) {
         if dt <= 0.0 {
             return;
         }
-        let omega = std::f32::consts::TAU / self.response.max(1e-3);
+        let omega = self.omega();
         let stiffness = omega * omega;
         let damping = 2.0 * self.damping * omega;
         let steps = (dt / 0.002).ceil().clamp(1.0, 64.0) as usize;
         let h = dt / steps as f32;
         for _ in 0..steps {
-            let accel = -stiffness * (*value - target) - damping * *velocity;
+            let accel =
+                -stiffness * (*value - target) - damping * (*velocity - target_velocity);
             *velocity += accel * h;
             *value += *velocity * h;
         }
@@ -276,21 +302,12 @@ impl Animated {
     /// Advance by `dt`; returns `true` while still moving. Lands exactly on
     /// the target once at rest, so callers can compare against it.
     pub fn step(&mut self, spring: Spring, dt: f32) -> bool {
-        self.step_until(spring, dt, REST_DISTANCE)
-    }
-
-    /// [`step`](Self::step), at rest within `rest` of the target (in the
-    /// value's own units) — for pixel quantities, where the default would
-    /// spend a long tail on sub-pixel motion nobody can see.
-    pub fn step_until(&mut self, spring: Spring, dt: f32, rest: f32) -> bool {
         if reduced() {
             self.snap(self.target);
             return false;
         }
         spring.step(&mut self.value, &mut self.velocity, self.target, dt);
-        let at_rest = (self.value - self.target).abs() < rest
-            && self.velocity.abs() < rest * (REST_SPEED / REST_DISTANCE);
-        if at_rest {
+        if self.is_settled() {
             self.snap(self.target);
             false
         } else {
@@ -585,6 +602,36 @@ mod tests {
         a.set(0.0);
         a.step(Spring::SNAPPY, 1.0 / 60.0);
         assert!(a.value > v, "reversed instantly: {v} -> {}", a.value);
+    }
+
+    /// A plain spring trails a steadily moving target forever; tracking
+    /// with the target's velocity closes the gap and then holds its speed.
+    #[test]
+    fn tracking_a_moving_target_catches_up_and_holds_its_speed() {
+        let speed = 5000.0;
+        let (mut tracked, mut tv) = (0.0f32, 0.0f32);
+        let (mut plain, mut pv) = (0.0f32, 0.0f32);
+        let dt = 1.0 / 60.0;
+        let mut halfway = 0.0;
+        for frame in 1..=60 {
+            // Held for the whole frame, so sampled at its middle: an
+            // end-of-frame sample would bias any follower half a frame ahead.
+            let target = speed * (frame as f32 - 0.5) * dt;
+            Spring::FOLLOW.track(&mut tracked, &mut tv, target, speed, dt);
+            Spring::FOLLOW.step(&mut plain, &mut pv, target, dt);
+            if frame == 30 {
+                halfway = tracked;
+            }
+        }
+        let target = speed * 1.0;
+        // Within 2ms of travel: the integrator's own error, not lag.
+        assert!((target - tracked).abs() < speed * 0.002, "tracking lags by {}", target - tracked);
+        // Constant speed over the second half: the target's own.
+        let cruise = (tracked - halfway) / 0.5;
+        assert!((cruise - speed).abs() < speed * 0.01, "cruising at {cruise}, not {speed}");
+        assert!(tv > 0.0);
+        let lag = 2.0 * Spring::FOLLOW.damping / Spring::FOLLOW.omega() * speed;
+        assert!((target - plain - lag).abs() < lag * 0.05, "plain spring lag {}", target - plain);
     }
 
     #[test]

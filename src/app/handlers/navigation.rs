@@ -130,7 +130,13 @@ fn reveal(editor: &mut RawEditor, animate: bool) -> Task<Message> {
             };
             let from = glide_destination(editor, GlideTarget::Filmstrip)
                 .unwrap_or(editor.filmstrip_scroll_x);
-            if let Some(x) = crate::ui::filmstrip::scroll_to_reveal(index, from, view_width) {
+            // Stepping through: just far enough. Arriving: centred.
+            let how = if animate {
+                crate::ui::filmstrip::Reveal::Edge
+            } else {
+                crate::ui::filmstrip::Reveal::Center
+            };
+            if let Some(x) = crate::ui::filmstrip::scroll_to_reveal(index, from, view_width, how) {
                 // A reveal overrides any momentum glide.
                 editor.filmstrip_velocity = 0.0;
                 editor.last_kinetic_tick = None;

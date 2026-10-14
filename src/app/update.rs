@@ -382,6 +382,7 @@ fn dispatch(editor: &mut RawEditor, message: Message) -> Task<Message> {
             handlers::window::query_scale_factor()
         }
         Message::KineticTick(now) => handlers::scroll::handle_kinetic_tick(editor, now),
+        Message::NavigationKeyReleased => handlers::scroll::handle_navigation_released(editor),
         Message::FilmstripWheel(delta) => handlers::scroll::handle_filmstrip_wheel(editor, delta),
     }
 }

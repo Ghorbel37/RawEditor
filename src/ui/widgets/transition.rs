@@ -26,8 +26,9 @@ type Renderer = iced::Renderer;
 
 // ── FadeThrough ─────────────────────────────────────────────────────────────
 
-/// Fades `content` in from `background`, rising a few pixels as it does,
-/// whenever `key` changes — and once when first shown.
+/// Fades `content` in from `background` whenever `key` changes — and once
+/// when first shown. A pure fade: the content never moves, so the workspace
+/// stays put under the user's eye while it resolves.
 ///
 /// Used for the tab switch: the old tab is gone at once, the new one fades
 /// up through the app's background. The outgoing content can't be kept (iced
@@ -37,7 +38,6 @@ pub struct FadeThrough<'a, Message> {
     content: Element<'a, Message>,
     key: u64,
     background: Color,
-    rise: f32,
 }
 
 pub fn fade_through<'a, Message>(
@@ -45,7 +45,7 @@ pub fn fade_through<'a, Message>(
     background: Color,
     content: impl Into<Element<'a, Message>>,
 ) -> FadeThrough<'a, Message> {
-    FadeThrough { content: content.into(), key, background, rise: 6.0 }
+    FadeThrough { content: content.into(), key, background }
 }
 
 struct FadeState {
@@ -54,13 +54,9 @@ struct FadeState {
     now: Option<Instant>,
 }
 
-/// `(content offset in px, veil alpha)` at linear progress `t`.
-fn fade_through_frame(t: f32, rise: f32) -> (f32, f32) {
-    let offset = rise * (1.0 - ease::EMPHASIZED.ease(t));
-    // The veil clears a little ahead of the motion so the content is legible
-    // while its last pixels settle.
-    let veil = 1.0 - ease::STANDARD.ease(motion::segment(t, 0.0, 0.75));
-    (offset, veil)
+/// Veil alpha at linear progress `t`: fast to clear, gentle to finish.
+fn fade_through_veil(t: f32) -> f32 {
+    1.0 - ease::STANDARD.ease(t)
 }
 
 impl<'a, Message> Widget<Message, Theme, Renderer> for FadeThrough<'a, Message> {
@@ -168,8 +164,8 @@ impl<'a, Message> Widget<Message, Theme, Renderer> for FadeThrough<'a, Message> 
             draw_child(renderer);
             return;
         }
-        let (offset, veil) = fade_through_frame(t, self.rise);
-        renderer.with_translation(Vector::new(0.0, offset), draw_child);
+        draw_child(renderer);
+        let veil = fade_through_veil(t);
         // A layer of its own so it lands on top of everything the content
         // drew — within one layer iced draws text after quads.
         let bounds = layout.bounds();
@@ -392,13 +388,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fade_through_starts_hidden_and_low_and_ends_clear_and_level() {
-        assert_eq!(fade_through_frame(0.0, 6.0), (6.0, 1.0));
-        let (offset, veil) = fade_through_frame(1.0, 6.0);
-        assert!(offset.abs() < 1e-4 && veil.abs() < 1e-4);
-        // The veil clears before the motion finishes.
-        let (offset, veil) = fade_through_frame(0.75, 6.0);
-        assert_eq!(veil, 0.0);
-        assert!((0.0..1.0).contains(&offset));
+    fn fade_through_starts_hidden_and_ends_clear() {
+        assert_eq!(fade_through_veil(0.0), 1.0);
+        assert!(fade_through_veil(1.0).abs() < 1e-6);
+        // Front-loaded: most of the way there by the halfway point.
+        assert!(fade_through_veil(0.5) < 0.2);
     }
 }
