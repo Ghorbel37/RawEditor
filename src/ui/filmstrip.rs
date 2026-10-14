@@ -1,4 +1,6 @@
-use iced::widget::{button, container, image, mouse_area, row, scrollable, text, stack, Space};
+use iced::widget::{container, mouse_area, row, scrollable, text, stack, Space};
+use crate::ui::widgets::button;
+use crate::ui::widgets::fade_image::fade_image;
 use iced::{Background, Border, Color, Element, Length, Theme};
 
 use crate::database::models::{Image, MARKED_FOR_REMOVAL_RATING};
@@ -72,19 +74,20 @@ pub fn view<'a>(
         // The edited proxy when the image has edits, so the strip shows the
         // photos as edited. Images still waiting on their cache tiers get a
         // blank slot rather than being skipped: every slot must be ITEM_WIDTH
-        // wide for the index → position arithmetic above to hold.
-        let img_widget: Element<'a, Message> = match editor.thumbnail_handle(img) {
-            Some(handle) => image(handle)
-                .width(Length::Fixed(THUMB_W))
-                .height(Length::Fixed(THUMB_H))
-                .into(),
-            None => container(Space::new(Length::Fixed(THUMB_W), Length::Fixed(THUMB_H)))
-                .style(|_| container::Style {
-                    background: Some(Background::Color(Color::from_rgb(0.12, 0.12, 0.12))),
+        // wide for the index → position arithmetic above to hold. A
+        // `FadeImage` either way, so the thumbnail fades in when it lands.
+        let handle = editor.thumbnail_handle(img);
+        // Only an empty slot gets the placeholder tone: a portrait thumbnail
+        // is letterboxed, and its side bars should show the selection tint.
+        let waiting = handle.is_none();
+        let img_widget: Element<'a, Message> =
+            container(fade_image(img.id as u64, handle, THUMB_W, THUMB_H))
+                .style(move |_| container::Style {
+                    background: waiting
+                        .then_some(Background::Color(Color::from_rgb(0.12, 0.12, 0.12))),
                     ..Default::default()
                 })
-                .into(),
-        };
+                .into();
 
         // Phase 56: Overlay star rating (or the "marked for removal" badge,
         // which reuses this same field via a reserved sentinel — must be
@@ -169,17 +172,8 @@ pub fn view<'a>(
                 left: ITEM_PAD_X,
             })
             .style(move |_theme: &Theme| {
-                let mut style = if is_selected {
-                    // Selected: light grey background only (no border)
-                    container::Style {
-                        background: Some(Background::Color(Color::from_rgb(0.3, 0.3, 0.3))),
-                        ..Default::default()
-                    }
-                } else {
-                    // Unselected: no styling
-                    container::Style::default()
-                };
-                
+                // Selection is drawn by the button below, so it can fade.
+                let mut style = container::Style::default();
                 // Phase 83: Flag Feedback
                 if img.flag == -1 {
                     style.text_color = Some(Color::from_rgba(1.0, 1.0, 1.0, 0.5)); // Dim text if any
@@ -222,15 +216,26 @@ pub fn view<'a>(
             ]);
         }
 
-        // Wrap in button for clicking
+        // Wrap in button for clicking. Selection and hover are its style, so
+        // moving through the strip crossfades the highlight from one frame to
+        // the next; keyed by id because the strip is virtualised.
         let thumbnail_button = button(final_content)
             .padding(0)  // Remove button's default padding
             .on_press(Message::ImageSelected(img.id))
-            .style(|_theme: &Theme, status| {
+            .key(img.id as u64)
+            .style(move |_theme: &Theme, status| {
+                let tint = match (is_selected, status) {
+                    (true, _) => Some(Color::from_rgb(0.3, 0.3, 0.3)),
+                    (false, button::Status::Hovered | button::Status::Pressed) => {
+                        Some(Color::from_rgb(0.17, 0.17, 0.17))
+                    }
+                    (false, _) => None,
+                };
                 button::Style {
-                    background: None,
+                    background: tint.map(Background::Color),
                     border: Border::default(),
-                    ..button::primary(_theme, status)
+                    text_color: Color::WHITE,
+                    ..Default::default()
                 }
             })
             .into(); // Convert to Element

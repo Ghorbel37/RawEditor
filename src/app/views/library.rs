@@ -1,7 +1,9 @@
 use iced::widget::image::Handle;
 use iced::widget::{
-    button, container, column, mouse_area, row, scrollable, stack, text, Image, Space,
+    container, column, mouse_area, row, scrollable, stack, text, Space,
 };
+use crate::ui::widgets::button;
+use crate::ui::widgets::fade_image::fade_image;
 use iced::{Alignment, Background, Border, Color, Element, Length, Theme};
 use std::collections::HashMap;
 
@@ -432,21 +434,13 @@ fn view_image_card<'a>(
     let thumb_state = thumbnail_state(img);
     let has_loaded_thumb = thumb_state == ThumbnailState::Ready;
 
-    let image_content: Element<'a, Message> = if has_loaded_thumb {
-        if let Some(thumbnail) = thumbnail {
-            container(
-                Image::new(thumbnail)
-                    .content_fit(iced::ContentFit::Cover)
-                    .width(Length::Fixed(thumb_width))
-                    .height(Length::Fixed(thumb_height)),
-            )
-            .width(Length::Fixed(thumb_width))
-            .height(Length::Fixed(thumb_height))
-            .clip(true)
-            .into()
-        } else {
-            Space::with_width(Length::Fill).into()
-        }
+    // The thumbnail fades up over the placeholder when its cache tier lands,
+    // and crossfades when an edited proxy replaces it. The image is the TOP
+    // layer at a fixed position whether or not it is ready yet: `FadeImage`
+    // can only animate a change it was mounted to see. Keyed by image id, so
+    // a virtualised slot that scrolls onto another photo just shows it.
+    let placeholder: Element<'a, Message> = if has_loaded_thumb {
+        Space::new(Length::Fill, Length::Fill).into()
     } else {
         let placeholder_label = match thumb_state {
             ThumbnailState::Missing => "Missing...",
@@ -467,16 +461,19 @@ fn view_image_card<'a>(
         .height(Length::Fill)
         .center_x(Length::Fill)
         .center_y(Length::Fill)
-        .style(|_| container::Style {
-            background: Some(Background::Color(Color::from_rgb(0.12, 0.12, 0.12))),
-            border: Border {
-                radius: 0.0.into(),
-                ..Default::default()
-            },
-            ..Default::default()
-        })
         .into()
     };
+    let image_content: Element<'a, Message> = stack![
+        placeholder,
+        fade_image(
+            img.id as u64,
+            thumbnail.filter(|_| has_loaded_thumb),
+            thumb_width,
+            thumb_height,
+        )
+        .content_fit(iced::ContentFit::Cover),
+    ]
+    .into();
 
     let top_left_badge: Element<'a, Message> = if has_loaded_thumb && img.flag == 1 {
         container(
@@ -564,7 +561,8 @@ fn view_image_card<'a>(
             .height(Length::Fixed(thumb_height))
             .clip(true)
             .style(|_| container::Style {
-                background: Some(Background::Color(Color::from_rgb(0.10, 0.10, 0.10))),
+                // The placeholder tone; a Cover-fit thumbnail hides it.
+                background: Some(Background::Color(Color::from_rgb(0.12, 0.12, 0.12))),
                 border: Border {
                     radius: 0.0.into(),
                     ..Default::default()
@@ -585,44 +583,35 @@ fn view_image_card<'a>(
             .padding(8),
     ];
 
-    let card = container(image_stack)
+    // Selection and hover live on the button so they *transition* (see
+    // `ui::widgets::button`): a click crossfades the highlight in, hovering
+    // warms the frame. Keyed by id like the image.
+    button(image_stack)
+        .on_press(Message::ImageSelected(img.id))
         .width(Length::Fixed(thumb_width + 14.0))
         .height(Length::Fixed(thumb_height + 14.0))
         .padding(7)
         .clip(true)
-        .style(move |_| {
-            if is_selected {
-                container::Style {
-                    background: Some(Background::Color(palette::accent_selection_fill())),
-                    border: Border {
-                        radius: 0.0.into(),
-                        width: 1.0,
-                        color: palette::accent_selection_border(),
-                    },
-                    ..Default::default()
-                }
-            } else {
-                container::Style {
-                    background: Some(Background::Color(Color::from_rgb(0.09, 0.09, 0.09))),
-                    border: Border {
-                        radius: 0.0.into(),
-                        width: 1.0,
-                        color: Color::from_rgb(0.17, 0.17, 0.17),
-                    },
-                    ..Default::default()
-                }
-            }
-        });
-
-    button(card)
-        .on_press(Message::ImageSelected(img.id))
-        .padding(0)
-        .style(|_theme, _status| button::Style {
-            background: None,
-            border: Border::default(),
-            ..Default::default()
-        })
+        .key(img.id as u64)
+        .style(move |_theme, status| card_style(is_selected, status))
         .into()
+}
+
+/// The contact-sheet frame around a thumbnail. Square corners throughout.
+fn card_style(is_selected: bool, status: button::Status) -> button::Style {
+    let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+    let (fill, edge) = match (is_selected, hovered) {
+        (true, false) => (palette::accent_selection_fill(), palette::accent_selection_border()),
+        (true, true) => (palette::accent_selection_fill(), palette::accent_text()),
+        (false, false) => (Color::from_rgb(0.09, 0.09, 0.09), Color::from_rgb(0.17, 0.17, 0.17)),
+        (false, true) => (Color::from_rgb(0.12, 0.12, 0.12), Color::from_rgb(0.34, 0.34, 0.34)),
+    };
+    button::Style {
+        background: Some(Background::Color(fill)),
+        border: Border { radius: 0.0.into(), width: 1.0, color: edge },
+        text_color: Color::WHITE,
+        ..Default::default()
+    }
 }
 
 /// The virtualised thumbnail grid — see [`GridGeometry`].

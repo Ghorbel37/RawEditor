@@ -1,4 +1,4 @@
-use iced::widget::{slider, container};
+use iced::widget::slider;
 use iced::{Background, Border, Color, Theme};
 use super::palette;
 
@@ -76,31 +76,30 @@ pub struct TabButton {
 }
 
 impl TabButton {
+    /// The active tab draws no background of its own: the sliding highlight
+    /// (`ui::widgets::indicator`) beneath it is the active state. Hover is a
+    /// translucent tint for the same reason — an opaque one would hide the
+    /// highlight as it slides past.
     pub fn style(&self, _theme: &Theme, status: iced::widget::button::Status) -> iced::widget::button::Style {
-        if self.is_active {
-            iced::widget::button::Style {
-                background: Some(Background::Color(Color::from_rgb(0.2, 0.2, 0.2))), // Grey
+        use iced::widget::button::{Status, Style};
+        let tint = |a: f32| Some(Background::Color(Color::from_rgba(1.0, 1.0, 1.0, a)));
+        match (self.is_active, status) {
+            (true, _) => Style { background: None, text_color: Color::WHITE, ..Default::default() },
+            (false, Status::Hovered) => Style {
+                background: tint(0.05),
+                text_color: Color::from_rgb(0.92, 0.92, 0.92),
+                ..Default::default()
+            },
+            (false, Status::Pressed) => Style {
+                background: tint(0.08),
                 text_color: Color::WHITE,
                 ..Default::default()
-            }
-        } else {
-            match status {
-                iced::widget::button::Status::Hovered => iced::widget::button::Style {
-                    background: Some(Background::Color(Color::from_rgb(0.2, 0.2, 0.2))),
-                    text_color: Color::WHITE,
-                    ..Default::default()
-                },
-                iced::widget::button::Status::Pressed => iced::widget::button::Style {
-                    background: Some(Background::Color(Color::from_rgb(0.3, 0.3, 0.3))),
-                    text_color: Color::WHITE,
-                    ..Default::default()
-                },
-                _ => iced::widget::button::Style {
-                    background: None,
-                    text_color: Color::from_rgb(0.7, 0.7, 0.7),
-                    ..Default::default()
-                },
-            }
+            },
+            (false, _) => Style {
+                background: None,
+                text_color: Color::from_rgb(0.58, 0.58, 0.58),
+                ..Default::default()
+            },
         }
     }
 }
@@ -299,16 +298,21 @@ pub fn text_input_style(_theme: &Theme, _status: iced::widget::text_input::Statu
     }
 }
 
-pub fn modal_container_style(_theme: &Theme) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(Color::from_rgb(0.1, 0.1, 0.1))),
+/// The one dialog surface, drawn by `ui::widgets::modal::Sheet` so it can
+/// fade. A deep, soft shadow lifts it off the dimmed app.
+pub fn modal_surface() -> crate::ui::widgets::modal::Surface {
+    crate::ui::widgets::modal::Surface {
+        background: Color::from_rgb(0.1, 0.1, 0.1),
         border: Border {
             radius: 10.0.into(),
             width: 1.0,
-            color: Color::from_rgb(0.3, 0.3, 0.3),
+            color: Color::from_rgb(0.24, 0.24, 0.24),
         },
-        text_color: Some(Color::WHITE),
-        ..Default::default()
+        shadow: iced::Shadow {
+            color: Color::from_rgba(0.0, 0.0, 0.0, 0.6),
+            offset: iced::Vector::new(0.0, 18.0),
+            blur_radius: 44.0,
+        },
     }
 }
 

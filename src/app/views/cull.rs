@@ -25,7 +25,7 @@ pub fn view_cull(editor: &RawEditor) -> Element<'_, Message> {
     let export_bar = container(
         iced::widget::row![
             iced::widget::Space::with_width(Length::Fill),
-            iced::widget::button(
+            crate::ui::widgets::button(
                 iced::widget::row![
                     text(ui::icons::SAVE).font(crate::ui::icons::ICON_FONT).size(12),
                     text(format!("Export {selected}")).size(12)

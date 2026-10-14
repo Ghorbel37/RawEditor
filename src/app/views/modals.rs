@@ -1,15 +1,18 @@
 use iced::font::{Font, Weight};
 use iced::widget::{
-    button, checkbox, column, container, mouse_area, radio, row, scrollable, slider, stack, text,
+    checkbox, column, container, radio, row, scrollable, slider, stack, text,
     text_input,
 };
+use crate::ui::widgets::button;
 use iced::{Alignment, Background, Border, Color, Element, Length, Theme};
 
 use crate::app::message::Message;
 use crate::app::state::RawEditor;
 use crate::ui;
 
-/// Wrap a modal's body in a dimmed, click-to-dismiss, screen-centred overlay.
+/// Wrap a modal's body in a dimmed, click-to-dismiss, screen-centred overlay
+/// that animates in and out (`ui::widgets::modal`). `key` identifies the
+/// dialog; `exiting` is set while a closed one plays its exit.
 ///
 /// The two-container split is load-bearing. `iced::widget::stack` resolves its
 /// size from child 0 only and then places every later layer at that layer's own
@@ -17,39 +20,27 @@ use crate::ui;
 /// card therefore pins to the top-left corner of the window, which is exactly
 /// how every modal used to render.
 ///
-/// So the fill + centering must live on an OUTER container, and the card style
-/// on an inner one. Putting `center_x(Fill)` on the styled container instead
-/// stretches its background over the whole window: a full-screen grey slab with
-/// a border at the screen edge.
-pub fn modal_overlay<'a>(content: Element<'a, Message>) -> Element<'a, Message> {
-    // The backdrop: semi-transparent black, fills screen, closes on click
-    let backdrop = mouse_area(
-        container(text(" "))
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .style(|_| container::Style {
-                background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.5))),
-                ..Default::default()
-            }),
-    )
-    .on_press(Message::CloseModal);
+/// So the fill + centering must live on an OUTER container, and the card
+/// surface on the inner `Sheet`, which shrink-wraps its content.
+pub fn modal_overlay<'a>(
+    content: Element<'a, Message>,
+    key: u64,
+    exiting: bool,
+) -> Element<'a, Message> {
+    use crate::ui::widgets::modal::{scrim, sheet};
 
-    // The card. Uses the shared style rather than its own colours so there is
-    // one modal look in the app, not two that drift apart.
-    let card = container(content)
-        .padding(20)
-        .style(ui::styles::modal_container_style);
+    // The card. Uses the shared surface rather than its own colours so there
+    // is one modal look in the app, not two that drift apart.
+    let card = sheet(key, exiting, ui::styles::modal_surface(), content);
 
     stack![
-        backdrop,
-        container(
-            // Swallow clicks on the card so they don't reach the backdrop
-            mouse_area(card).on_press(Message::ModalNoOp)
-        )
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .center_x(Length::Fill)
-        .center_y(Length::Fill)
+        // The backdrop: dims the app, closes on click.
+        scrim(Message::CloseModal, exiting),
+        container(card)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
     ]
     .into()
 }
@@ -188,6 +179,19 @@ pub fn view_help_modal<'a>() -> Element<'a, Message> {
     .into()
 }
 
+fn preferences_checkbox_style(_theme: &Theme, _status: checkbox::Status) -> checkbox::Style {
+    checkbox::Style {
+        background: Background::Color(Color::from_rgb(0.2, 0.2, 0.2)),
+        icon_color: Color::from_rgb(0.85, 0.85, 0.85),
+        border: Border {
+            color: Color::from_rgb(0.4, 0.4, 0.4),
+            width: 1.0,
+            radius: 3.0.into(),
+        },
+        text_color: Some(Color::from_rgb(0.7, 0.7, 0.7)),
+    }
+}
+
 pub fn view_preferences_modal<'a>(editor: &'a RawEditor) -> Element<'a, Message> {
     column![
         text("Preferences")
@@ -220,16 +224,15 @@ pub fn view_preferences_modal<'a>(editor: &'a RawEditor) -> Element<'a, Message>
                 .size(16)
                 .spacing(8)
                 .text_size(13)
-                .style(|_theme, _status| checkbox::Style {
-                    background: Background::Color(Color::from_rgb(0.2, 0.2, 0.2)),
-                    icon_color: Color::from_rgb(0.85, 0.85, 0.85),
-                    border: Border {
-                        color: Color::from_rgb(0.4, 0.4, 0.4),
-                        width: 1.0,
-                        radius: 3.0.into(),
-                    },
-                    text_color: Some(Color::from_rgb(0.7, 0.7, 0.7)),
-                }),
+                .style(preferences_checkbox_style),
+            // Animations are short and never block input, but some people
+            // find motion uncomfortable; this lands every one on its end state.
+            checkbox("Reduce motion", editor.reduce_motion)
+                .on_toggle(|_| Message::ToggleReduceMotion)
+                .size(16)
+                .spacing(8)
+                .text_size(13)
+                .style(preferences_checkbox_style),
         ]
         .spacing(8),
         column![

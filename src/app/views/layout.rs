@@ -1,5 +1,6 @@
 use iced::{Alignment, Background, Border, Color, Element, Length, Theme};
-use iced::widget::{button, column, container, row, stack, text, Image, Space};
+use iced::widget::{column, container, row, stack, text, Image, Space};
+use crate::ui::widgets::button;
 use iced::widget::image::Handle;
 
 use crate::ui;
@@ -63,25 +64,34 @@ pub fn view(editor: &RawEditor) -> Element<'_, Message> {
     // Phase 84: Generic Modal System.
     //
     // Everything goes through `modal_overlay`, which supplies the dimmed
-    // backdrop, click-outside-to-close, and — the part that was missing —
-    // screen centering. `stack` places non-base layers at their own intrinsic
-    // size at the origin with no alignment step, so the old bare shrink-wrapped
-    // container pinned every modal to the top-left corner.
-    let modal_body: Option<Element<'_, Message>> = match editor.active_modal {
-        Modal::None => None,
-        Modal::Help => Some(view_help_modal()),
-        Modal::Preferences => Some(view_preferences_modal(editor)),
-        Modal::Export => Some(view_export_modal(editor)),
-        Modal::Delete => Some(view_delete_modal(editor)),
-        Modal::CopySettings => Some(view_copy_settings_modal(editor)),
-        Modal::About => Some(view_about_modal()),
-        Modal::RemoveFolder => Some(view_remove_folder_modal(editor)),
+    // backdrop, click-outside-to-close, screen centering and the entrance /
+    // exit motion. A modal that has just closed stays mounted, empty, for its
+    // exit (`modal_exit`, maintained in `update`); its contents are not
+    // rebuilt, since the state they describe is usually already gone (the
+    // Delete dialog would read "0 images" on its way out).
+    let (modal, exiting) = match (editor.active_modal, editor.modal_exit) {
+        (Modal::None, Some(exit)) => (exit.modal, true),
+        (active, _) => (active, false),
+    };
+    let modal_body: Option<Element<'_, Message>> = if exiting {
+        Some(Space::new(Length::Shrink, Length::Shrink).into())
+    } else {
+        match modal {
+            Modal::None => None,
+            Modal::Help => Some(view_help_modal()),
+            Modal::Preferences => Some(view_preferences_modal(editor)),
+            Modal::Export => Some(view_export_modal(editor)),
+            Modal::Delete => Some(view_delete_modal(editor)),
+            Modal::CopySettings => Some(view_copy_settings_modal(editor)),
+            Modal::About => Some(view_about_modal()),
+            Modal::RemoveFolder => Some(view_remove_folder_modal(editor)),
+        }
     };
 
     // push_maybe rather than a zero-sized placeholder layer: Modal::None is the
     // common case and shouldn't allocate a widget tree every frame.
     stack![content]
-        .push_maybe(modal_body.map(modal_overlay))
+        .push_maybe(modal_body.map(|body| modal_overlay(body, modal as u64, exiting)))
         .into()
 }
 
@@ -184,6 +194,13 @@ fn view_main(editor: &RawEditor) -> Element<'_, Message> {
         AppTab::Develop => view_develop(editor),
         AppTab::Export => view_export(editor),
     };
+    // Each tab fades up through the app background as it arrives (and the
+    // whole workspace does once, as the splash hands over).
+    let content = crate::ui::widgets::transition::fade_through(
+        tab_index(editor.current_tab) as u64,
+        APP_BACKGROUND,
+        content,
+    );
     
     // Phase 116: Root layout container with sleek dark polish
     //
@@ -229,11 +246,31 @@ fn view_main(editor: &RawEditor) -> Element<'_, Message> {
     .width(Length::Fill)
     .height(Length::Fill)
     .style(|_theme| container::Style {
-        background: Some(Background::Color(Color::from_rgb(0.08, 0.08, 0.08))),
+        background: Some(Background::Color(APP_BACKGROUND)),
         text_color: Some(Color::WHITE),
         ..Default::default()
     })
     .into()
+}
+
+/// The workspace background, which tab content fades up from.
+const APP_BACKGROUND: Color = Color::from_rgb(0.08, 0.08, 0.08);
+
+/// Title bar tabs, in order. Their position is what the sliding indicator
+/// animates between.
+const TABS: [(AppTab, &str, &str); 4] = [
+    (AppTab::Library, ui::icons::FOLDER, "Library"),
+    (AppTab::Cull, ui::icons::CHECK, "Cull"),
+    (AppTab::Develop, ui::icons::PAINTBRUSH, "Develop"),
+    (AppTab::Export, ui::icons::SAVE, "Export"),
+];
+
+/// Every tab is the same width, so the indicator's position is arithmetic.
+/// Wide enough for the longest label ("Library"/"Develop") plus padding.
+const TAB_WIDTH: f32 = 112.0;
+
+fn tab_index(tab: AppTab) -> usize {
+    TABS.iter().position(|(t, _, _)| *t == tab).unwrap_or(0)
 }
 
 /// Build the custom window title bar
@@ -255,7 +292,7 @@ fn menu_entry<'a>(label: &'a str, checked: Option<bool>, msg: Message) -> Elemen
     .width(Length::Fill)
     .padding([6, 10])
     .style(ui::styles::WindowControlButton::style)
-    .on_press(msg)
+    .on_press(Message::MenuItem(Box::new(msg)))
     .into()
 }
 
@@ -391,29 +428,61 @@ fn view_title_bar(editor: &RawEditor) -> Element<'_, Message> {
         },
     });
 
-    let navigation = container(
-        row![
-            button(container(row![text(ui::icons::FOLDER).font(ICON_FONT).size(14), text(" Library").size(14)].spacing(5).align_y(Alignment::Center)).height(Length::Fill).align_x(iced::alignment::Horizontal::Center).align_y(iced::alignment::Vertical::Center))
-                .height(Length::Fill).padding([0, 15])
-                .style(|t, s| ui::styles::TabButton { is_active: editor.current_tab == AppTab::Library }.style(t, s))
-                .on_press(Message::TabChanged(AppTab::Library)),
-            
-            button(container(row![text(ui::icons::CHECK).font(ICON_FONT).size(14), text(" Cull").size(14)].spacing(5).align_y(Alignment::Center)).height(Length::Fill).align_x(iced::alignment::Horizontal::Center).align_y(iced::alignment::Vertical::Center))
-                .height(Length::Fill).padding([0, 15])
-                .style(|t, s| ui::styles::TabButton { is_active: editor.current_tab == AppTab::Cull }.style(t, s))
-                .on_press(Message::TabChanged(AppTab::Cull)),
+    // Choosing an entry must close its dropdown, as native menus do. iced_aw
+    // 0.10 keeps it open until the pointer leaves, and an open dropdown
+    // captures *every* event — `RedrawRequested` included — so nothing
+    // beneath it animates: a dialog opened from the menu sat invisible at
+    // its first frame. Entries send `MenuItem`, which bumps the generation;
+    // alternating the wrapper changes the widget tag at this position, which
+    // remounts the bar with fresh (closed) state. (A `column`, not a
+    // `container`: a container is transparent to the widget tree — it hands
+    // over its content's tag and state — so wrapping in one changes nothing.)
+    let menus: Element<'_, Message> = if editor.menu_generation.is_multiple_of(2) {
+        menus.into()
+    } else {
+        column![menus].into()
+    };
 
-            button(container(row![text(ui::icons::PAINTBRUSH).font(ICON_FONT).size(14), text(" Develop").size(14)].spacing(5).align_y(Alignment::Center)).height(Length::Fill).align_x(iced::alignment::Horizontal::Center).align_y(iced::alignment::Vertical::Center))
-                .height(Length::Fill).padding([0, 15])
-                .style(|t, s| ui::styles::TabButton { is_active: editor.current_tab == AppTab::Develop }.style(t, s))
-                .on_press(Message::TabChanged(AppTab::Develop)),
-
-            button(container(row![text(ui::icons::SAVE).font(ICON_FONT).size(14), text(" Export").size(14)].spacing(5).align_y(Alignment::Center)).height(Length::Fill).align_x(iced::alignment::Horizontal::Center).align_y(iced::alignment::Vertical::Center))
-                .height(Length::Fill).padding([0, 15])
-                .style(|t, s| ui::styles::TabButton { is_active: editor.current_tab == AppTab::Export }.style(t, s))
-                .on_press(Message::TabChanged(AppTab::Export)),
-        ].spacing(0).height(Length::Fill)
-    ).width(Length::Fill).height(Length::Fill).align_x(iced::alignment::Horizontal::Center).align_y(iced::alignment::Vertical::Center);
+    // The tabs sit over a highlight that slides (and stretches) between
+    // them — `ui::widgets::indicator`. The buttons themselves are transparent
+    // when active and only tint on hover, so the highlight shows through.
+    let tab_buttons = TABS.iter().fold(row![].height(Length::Fill), |tabs, &(tab, icon, label)| {
+        let is_active = editor.current_tab == tab;
+        tabs.push(
+            button(
+                container(
+                    row![text(icon).font(ICON_FONT).size(14), text(label).size(14)]
+                        .spacing(8)
+                        .align_y(Alignment::Center),
+                )
+                .height(Length::Fill)
+                .width(Length::Fill)
+                .align_x(iced::alignment::Horizontal::Center)
+                .align_y(iced::alignment::Vertical::Center),
+            )
+            .width(Length::Fixed(TAB_WIDTH))
+            .height(Length::Fill)
+            .padding(0)
+            .style(move |t, s| ui::styles::TabButton { is_active }.style(t, s))
+            .on_press(Message::TabChanged(tab)),
+        )
+    });
+    let highlight = crate::ui::widgets::indicator::indicator(
+        TABS.len(),
+        tab_index(editor.current_tab),
+        TAB_WIDTH,
+        crate::ui::widgets::indicator::Appearance {
+            fill: Color::from_rgb(0.13, 0.13, 0.13),
+            accent: ui::palette::accent(),
+            accent_height: 2.0,
+            accent_inset: 22.0,
+        },
+    );
+    let navigation = container(stack![highlight, tab_buttons].height(Length::Fill))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(iced::alignment::Horizontal::Center)
+        .align_y(iced::alignment::Vertical::Center);
 
     let controls = row![
         container(Image::new(logo()).height(Length::Fixed(24.0)).content_fit(iced::ContentFit::Contain)).height(Length::Fill).align_y(iced::alignment::Vertical::Center).padding([8,15]),

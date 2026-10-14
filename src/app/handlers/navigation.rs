@@ -90,7 +90,8 @@ pub fn handle_image_selected(editor: &mut RawEditor, image_id: i64) -> Task<Mess
 /// selection moved, the view did not. A no-op when the selection is already
 /// in view, so a click never makes anything jump.
 pub fn reveal_selection(editor: &mut RawEditor) -> Task<Message> {
-    use iced::widget::scrollable::{self, AbsoluteOffset};
+    use crate::app::handlers::scroll::{glide_destination, glide_to};
+    use crate::app::state::GlideTarget;
 
     let Some(selected) = editor.selected_image_id else {
         return Task::none();
@@ -98,17 +99,15 @@ pub fn reveal_selection(editor: &mut RawEditor) -> Task<Message> {
     let Some(index) = editor.displayed_ids().iter().position(|&id| id == selected) else {
         return Task::none();
     };
+    // "Is it in view?" is asked of where the view is *heading*: mid-glide,
+    // the current offset is a transient, and holding an arrow key would
+    // otherwise keep re-aiming at stale positions.
     match editor.current_tab {
         AppTab::Library => {
             let geom = crate::app::views::library::GridGeometry::of(editor);
-            if let Some(y) = geom.scroll_to_reveal(index / geom.columns, editor.grid_scroll_y) {
-                // Set ahead of the scrollable's own report so the very next
-                // frame already builds the rows it is scrolling to.
-                editor.grid_scroll_y = y;
-                return scrollable::scroll_to(
-                    crate::app::views::library::grid_scroll_id(),
-                    AbsoluteOffset { x: 0.0, y },
-                );
+            let from = glide_destination(editor, GlideTarget::Grid).unwrap_or(editor.grid_scroll_y);
+            if let Some(y) = geom.scroll_to_reveal(index / geom.columns, from) {
+                return glide_to(editor, GlideTarget::Grid, y);
             }
         }
         AppTab::Cull | AppTab::Develop => {
@@ -117,17 +116,13 @@ pub fn reveal_selection(editor: &mut RawEditor) -> Task<Message> {
             } else {
                 editor.window_size.width
             };
-            if let Some(x) =
-                crate::ui::filmstrip::scroll_to_reveal(index, editor.filmstrip_scroll_x, view_width)
-            {
-                // A jump to the selection overrides any momentum glide.
+            let from = glide_destination(editor, GlideTarget::Filmstrip)
+                .unwrap_or(editor.filmstrip_scroll_x);
+            if let Some(x) = crate::ui::filmstrip::scroll_to_reveal(index, from, view_width) {
+                // A reveal overrides any momentum glide.
                 editor.filmstrip_velocity = 0.0;
                 editor.last_kinetic_tick = None;
-                editor.filmstrip_scroll_x = x;
-                return scrollable::scroll_to(
-                    crate::ui::filmstrip::scroll_id(),
-                    AbsoluteOffset { x, y: 0.0 },
-                );
+                return glide_to(editor, GlideTarget::Filmstrip, x);
             }
         }
         AppTab::Export => {}

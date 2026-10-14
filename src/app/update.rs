@@ -1,6 +1,6 @@
 use crate::app::handlers;
 use crate::app::message::Message;
-use crate::app::state::RawEditor;
+use crate::app::state::{Modal, ModalExit, RawEditor};
 use iced::Task;
 
 pub fn update(editor: &mut RawEditor, message: Message) -> Task<Message> {
@@ -9,11 +9,42 @@ pub fn update(editor: &mut RawEditor, message: Message) -> Task<Message> {
     // gesture ends with never arrives — commit it here instead. Holding the
     // modifier can't mean anything else: there is no Ctrl+drag on a slider.
     let slider_reset = editor.last_modifiers.command() && is_slider_change(&message);
+    let modal_before = editor.active_modal;
     let task = dispatch(editor, message);
     if slider_reset {
         editor.commit_current_state();
     }
-    task
+    match track_modal_exit(editor, modal_before) {
+        Some(exit) => Task::batch([task, exit]),
+        None => task,
+    }
+}
+
+/// Keep a just-closed modal mounted while it plays its exit.
+///
+/// Done here, after every message, rather than in the close handlers: a
+/// dozen paths close modals (Escape, the backdrop, Cancel, every confirm),
+/// and a new one would otherwise silently skip the animation.
+fn track_modal_exit(editor: &mut RawEditor, before: Modal) -> Option<Task<Message>> {
+    if editor.active_modal != Modal::None {
+        // Opened (or re-opened) — any exit in progress is superseded.
+        editor.modal_exit = None;
+        return None;
+    }
+    if before == Modal::None || crate::ui::motion::reduced() {
+        return None;
+    }
+    editor.modal_exit_seq = editor.modal_exit_seq.wrapping_add(1);
+    let token = editor.modal_exit_seq;
+    editor.modal_exit = Some(ModalExit { modal: before, token });
+    let wait = crate::ui::motion::wall_duration(crate::ui::motion::duration::MODAL_EXIT);
+    // `async move`, not `sleep(wait)` directly: tokio builds the timer when
+    // `sleep` is *called*, which needs a runtime context; inside the block it
+    // is built when the executor first polls it.
+    Some(Task::perform(
+        async move { tokio::time::sleep(wait).await },
+        move |_| Message::ModalExitFinished(token),
+    ))
 }
 
 /// Messages emitted by the Develop sidebar's sliders.
@@ -254,7 +285,18 @@ fn dispatch(editor: &mut RawEditor, message: Message) -> Task<Message> {
         Message::DragWindow => handlers::window::handle_drag_window(editor),
         Message::OpenModal(m) => handlers::window::handle_open_modal(editor, m),
         Message::CloseModal => handlers::window::handle_close_modal(editor),
+        Message::ModalExitFinished(token) => {
+            if editor.modal_exit.is_some_and(|e| e.token == token) {
+                editor.modal_exit = None;
+            }
+            Task::none()
+        }
+        Message::ToggleReduceMotion => handlers::window::handle_toggle_reduce_motion(editor),
         Message::ModalNoOp => Task::none(),
+        Message::MenuItem(inner) => {
+            editor.menu_generation = editor.menu_generation.wrapping_add(1);
+            dispatch(editor, *inner)
+        }
         Message::Escape => handlers::window::handle_escape(editor),
         Message::ModalConfirm => handlers::window::handle_modal_confirm(editor),
         Message::SelectAll => handlers::navigation::handle_select_all(editor),
@@ -341,5 +383,51 @@ fn dispatch(editor: &mut RawEditor, message: Message) -> Task<Message> {
         }
         Message::KineticTick(now) => handlers::scroll::handle_kinetic_tick(editor, now),
         Message::FilmstripWheel(delta) => handlers::scroll::handle_filmstrip_wheel(editor, delta),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn editor() -> RawEditor {
+        RawEditor::new().0
+    }
+
+    #[test]
+    fn closing_a_modal_keeps_it_mounted_for_its_exit() {
+        let mut e = editor();
+        let _ = update(&mut e, Message::OpenModal(Modal::Help));
+        assert_eq!(e.modal_exit, None);
+        let _ = update(&mut e, Message::Escape);
+        assert_eq!(e.active_modal, Modal::None);
+        let exit = e.modal_exit.expect("exit should be playing");
+        assert_eq!(exit.modal, Modal::Help);
+        let _ = update(&mut e, Message::ModalExitFinished(exit.token));
+        assert_eq!(e.modal_exit, None);
+    }
+
+    /// Close → reopen → close inside one exit: the first close's timer must
+    /// not cut the second exit short.
+    #[test]
+    fn a_stale_exit_timer_cannot_end_a_later_exit() {
+        let mut e = editor();
+        let _ = update(&mut e, Message::OpenModal(Modal::Help));
+        let _ = update(&mut e, Message::CloseModal);
+        let first = e.modal_exit.unwrap().token;
+        let _ = update(&mut e, Message::OpenModal(Modal::Help));
+        assert_eq!(e.modal_exit, None, "re-opening supersedes the exit");
+        let _ = update(&mut e, Message::CloseModal);
+        let _ = update(&mut e, Message::ModalExitFinished(first));
+        assert!(e.modal_exit.is_some(), "stale timer ended the new exit");
+    }
+
+    #[test]
+    fn choosing_a_menu_entry_closes_the_menu_and_runs_the_entry() {
+        let mut e = editor();
+        let generation = e.menu_generation;
+        let _ = update(&mut e, Message::MenuItem(Box::new(Message::OpenModal(Modal::About))));
+        assert_eq!(e.active_modal, Modal::About);
+        assert_ne!(e.menu_generation, generation);
     }
 }

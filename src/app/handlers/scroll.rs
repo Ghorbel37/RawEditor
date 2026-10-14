@@ -25,7 +25,8 @@ use iced::Task;
 
 use crate::app::message::{AppTab, Message};
 use crate::app::state::RawEditor;
-use crate::app::state::Modal;
+use crate::app::state::{GlideTarget, Modal, ScrollGlide};
+use crate::ui::motion::{self, Animated, Spring};
 
 /// Extra multiplier on top of iced's native 60px/line.
 const GRID_MULT: f32 = 4.0;
@@ -77,6 +78,8 @@ pub fn handle_wheel(editor: &mut RawEditor, delta: ScrollDelta) -> Task<Message>
     }
 
     if editor.cursor_over_grid {
+        // The user has taken the wheel: a reveal glide stops where it is.
+        cancel_glide(editor, GlideTarget::Grid);
         return scrollable::scroll_by(
             crate::app::views::library::grid_scroll_id(),
             AbsoluteOffset { x: 0.0, y: -(GRID_MULT - 1.0) * 60.0 * lines },
@@ -98,6 +101,8 @@ pub fn handle_filmstrip_wheel(editor: &mut RawEditor, delta: ScrollDelta) -> Tas
     if lines == 0.0 {
         return Task::none();
     }
+
+    cancel_glide(editor, GlideTarget::Filmstrip);
 
     let now = std::time::Instant::now();
     let raw_dt = editor
@@ -144,8 +149,9 @@ pub fn handle_filmstrip_wheel(editor: &mut RawEditor, delta: ScrollDelta) -> Tas
 }
 
 pub fn handle_kinetic_tick(editor: &mut RawEditor, now: std::time::Instant) -> Task<Message> {
+    let glide = step_glide(editor, now);
     if editor.filmstrip_velocity == 0.0 {
-        return Task::none();
+        return glide;
     }
     // Tab switched mid-glide (the filmstrip may not even be mounted) — stop.
     if editor.current_tab == AppTab::Library {
@@ -172,4 +178,158 @@ pub fn handle_kinetic_tick(editor: &mut RawEditor, now: std::time::Instant) -> T
         crate::ui::filmstrip::scroll_id(),
         AbsoluteOffset { x: step, y: 0.0 },
     )
+}
+
+// ── Reveal glide ───────────────────────────────────────────────────────────
+//
+// Keyboard navigation used to *jump* the grid / filmstrip to bring the new
+// selection into view, which loses the user's sense of where they are. Now it
+// glides there on a critically damped spring, driven by the same per-frame
+// tick as the filmstrip momentum (`subscription` runs it while
+// `scroll_glide` is set).
+
+fn scroll_id(target: GlideTarget) -> scrollable::Id {
+    match target {
+        GlideTarget::Grid => crate::app::views::library::grid_scroll_id(),
+        GlideTarget::Filmstrip => crate::ui::filmstrip::scroll_id(),
+    }
+}
+
+fn current_offset(editor: &RawEditor, target: GlideTarget) -> f32 {
+    match target {
+        GlideTarget::Grid => editor.grid_scroll_y,
+        GlideTarget::Filmstrip => editor.filmstrip_scroll_x,
+    }
+}
+
+/// Record `offset` as the scrollable's position — ahead of its own
+/// `on_scroll` report, so the very next view builds the rows/slots it is
+/// scrolling to.
+fn set_offset(editor: &mut RawEditor, target: GlideTarget, offset: f32) {
+    match target {
+        GlideTarget::Grid => editor.grid_scroll_y = offset,
+        GlideTarget::Filmstrip => editor.filmstrip_scroll_x = offset,
+    }
+}
+
+fn scroll_to(target: GlideTarget, offset: f32) -> Task<Message> {
+    let offset = match target {
+        GlideTarget::Grid => AbsoluteOffset { x: 0.0, y: offset },
+        GlideTarget::Filmstrip => AbsoluteOffset { x: offset, y: 0.0 },
+    };
+    scrollable::scroll_to(scroll_id(target), offset)
+}
+
+/// Where an in-flight glide on `target` will come to rest.
+pub fn glide_destination(editor: &RawEditor, target: GlideTarget) -> Option<f32> {
+    editor.scroll_glide.filter(|g| g.target == target).map(|g| g.offset.target)
+}
+
+/// Scroll `target` to `offset`: a glide, or a jump under reduced motion. A
+/// glide already heading there is re-aimed without losing its speed.
+pub fn glide_to(editor: &mut RawEditor, target: GlideTarget, offset: f32) -> Task<Message> {
+    let offset = offset.max(0.0);
+    if motion::reduced() {
+        editor.scroll_glide = None;
+        set_offset(editor, target, offset);
+        return scroll_to(target, offset);
+    }
+    match &mut editor.scroll_glide {
+        Some(glide) if glide.target == target => glide.offset.set(offset),
+        _ => {
+            let mut position = Animated::new(current_offset(editor, target));
+            position.set(offset);
+            editor.scroll_glide = Some(ScrollGlide { target, offset: position, last_tick: None });
+        }
+    }
+    Task::none()
+}
+
+fn cancel_glide(editor: &mut RawEditor, target: GlideTarget) {
+    if editor.scroll_glide.is_some_and(|g| g.target == target) {
+        editor.scroll_glide = None;
+    }
+}
+
+fn step_glide(editor: &mut RawEditor, now: std::time::Instant) -> Task<Message> {
+    let Some(mut glide) = editor.scroll_glide else {
+        return Task::none();
+    };
+    // The scrollable may not even be mounted any more.
+    let mounted = match glide.target {
+        GlideTarget::Grid => editor.current_tab == AppTab::Library,
+        GlideTarget::Filmstrip => matches!(editor.current_tab, AppTab::Cull | AppTab::Develop),
+    };
+    if !mounted || editor.active_modal != Modal::None {
+        editor.scroll_glide = None;
+        return Task::none();
+    }
+    let dt = motion::frame_dt(glide.last_tick, now);
+    glide.last_tick = Some(now);
+    let moving = glide.offset.step(Spring::SMOOTH, dt);
+    let offset = glide.offset.value.max(0.0);
+    editor.scroll_glide = moving.then_some(glide);
+    set_offset(editor, glide.target, offset);
+    scroll_to(glide.target, offset)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn editor() -> RawEditor {
+        RawEditor::new().0
+    }
+
+    /// Re-aiming a glide keeps one continuous motion rather than restarting.
+    #[test]
+    fn re_aiming_a_glide_keeps_its_speed() {
+        let mut e = editor();
+        e.current_tab = AppTab::Develop;
+        let _ = glide_to(&mut e, GlideTarget::Filmstrip, 1000.0);
+        let start = std::time::Instant::now();
+        for i in 0..6 {
+            let _ = step_glide(&mut e, start + std::time::Duration::from_millis(16 * i));
+        }
+        let speed = e.scroll_glide.unwrap().offset.velocity;
+        assert!(speed > 0.0);
+        let _ = glide_to(&mut e, GlideTarget::Filmstrip, 1200.0);
+        let glide = e.scroll_glide.unwrap();
+        assert_eq!(glide.offset.velocity, speed);
+        assert_eq!(glide.offset.target, 1200.0);
+    }
+
+    #[test]
+    fn a_glide_lands_on_its_target_and_ends() {
+        let mut e = editor();
+        e.current_tab = AppTab::Library;
+        let _ = glide_to(&mut e, GlideTarget::Grid, 640.0);
+        let start = std::time::Instant::now();
+        let mut frames = 0;
+        while e.scroll_glide.is_some() {
+            frames += 1;
+            assert!(frames < 240, "glide never ended");
+            let _ = step_glide(&mut e, start + std::time::Duration::from_micros(16_667 * frames));
+        }
+        assert_eq!(e.grid_scroll_y, 640.0);
+    }
+
+    #[test]
+    fn wheel_input_cancels_a_glide() {
+        let mut e = editor();
+        e.current_tab = AppTab::Develop;
+        let _ = glide_to(&mut e, GlideTarget::Filmstrip, 500.0);
+        let _ = handle_filmstrip_wheel(&mut e, ScrollDelta::Lines { x: 0.0, y: -1.0 });
+        assert!(e.scroll_glide.is_none());
+    }
+
+    #[test]
+    fn leaving_the_tab_drops_the_glide() {
+        let mut e = editor();
+        e.current_tab = AppTab::Develop;
+        let _ = glide_to(&mut e, GlideTarget::Filmstrip, 500.0);
+        e.current_tab = AppTab::Library;
+        let _ = step_glide(&mut e, std::time::Instant::now());
+        assert!(e.scroll_glide.is_none());
+    }
 }

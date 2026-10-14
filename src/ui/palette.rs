@@ -27,3 +27,9 @@ pub fn accent_selection_border() -> Color {
 pub fn accent_text() -> Color {
     Color::from_rgb(0.92, 0.63, 0.34)
 }
+
+/// The electric orange of the design language (`#F97316`), at full strength:
+/// for small, high-signal marks like the active tab's underline.
+pub fn accent() -> Color {
+    Color::from_rgb(0.976, 0.451, 0.086)
+}
