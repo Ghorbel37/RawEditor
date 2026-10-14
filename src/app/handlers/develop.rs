@@ -129,6 +129,21 @@ pub fn handle_tint_changed(editor: &mut RawEditor, v: f32) -> Task<Message> {
     update_pipeline(editor)
 }
 
+pub fn handle_texture_changed(editor: &mut RawEditor, v: f32) -> Task<Message> {
+    editor.current_edit_params.texture = v;
+    update_pipeline(editor)
+}
+
+pub fn handle_clarity_changed(editor: &mut RawEditor, v: f32) -> Task<Message> {
+    editor.current_edit_params.clarity = v;
+    update_pipeline(editor)
+}
+
+pub fn handle_dehaze_changed(editor: &mut RawEditor, v: f32) -> Task<Message> {
+    editor.current_edit_params.dehaze = v;
+    update_pipeline(editor)
+}
+
 pub fn handle_luma_noise_changed(editor: &mut RawEditor, v: f32) -> Task<Message> {
     editor.current_edit_params.luma_noise = v;
     update_pipeline(editor)
@@ -361,6 +376,7 @@ pub fn handle_toggle_copy_category(
         CopyCategory::Tone => c.tone = value,
         CopyCategory::Color => c.color = value,
         CopyCategory::WhiteBalance => c.white_balance = value,
+        CopyCategory::Presence => c.presence = value,
         CopyCategory::Noise => c.noise = value,
         CopyCategory::Detail => c.detail = value,
         CopyCategory::Geometry => c.geometry = value,

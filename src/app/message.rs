@@ -92,6 +92,7 @@ pub enum CopyCategory {
     Tone,
     Color,
     WhiteBalance,
+    Presence,
     Noise,
     Detail,
     Geometry,
@@ -223,6 +224,10 @@ pub enum Message {
     TemperatureChanged(f32),
     /// User changed tint slider (Phase 18)
     TintChanged(f32),
+    /// Presence sliders (see `gpu::local_contrast`, `core::haze`)
+    TextureChanged(f32),
+    ClarityChanged(f32),
+    DehazeChanged(f32),
     /// User changed noise reduction slider (Phase 49)
     LumaNoiseChanged(f32),
     /// Luminance NR detail retention

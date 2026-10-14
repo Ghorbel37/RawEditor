@@ -10,8 +10,9 @@
 ///   4.  (Noise reduction runs before this pass — see gpu/denoise.rs)
 ///   5.  Sharpening       – unsharp mask in sRGB linear
 ///   6.  Temperature/Tint – blue-yellow and green-magenta axes in sRGB space
-///   7.  Highlight clamp  – neutralise near-clipping channels before exposure
-///   8.  Exposure         – linear stop adjustment
+///   7.  Highlight clamp  – neutralise near-clipping channels before exposure,
+///       then Dehaze      – invert the haze model (camera space, scene-linear)
+///   8.  Exposure         – linear stop adjustment, × Texture/Clarity gain
 ///   9.  Highlights/Shadows
 ///  10.  Contrast         – pivoted at 18% gray (perceptual midtone)
 ///  11.  Levels           – whites / blacks
@@ -193,6 +194,8 @@ struct EditParams {
     lens_vig: vec4<f32>,       // PA k1..k3, 1 / output corner radius
     defringe: vec4<f32>,       // purple amount, purple hue°, green amount, green hue°
     defringe_misc: vec4<f32>,  // active, edge radius (texels), -, -
+    presence: vec4<f32>,       // texture, clarity, dehaze, -
+    haze: vec4<f32>,           // airlight (camera-native rgb), haze map present
 }
 
 // One local adjustment mask (112 bytes — uniform array stride must be ×16).
@@ -220,6 +223,56 @@ var brush_layers: texture_2d_array<f32>;
 
 @group(1) @binding(1)
 var<uniform> mask_block: MaskBlock;
+
+// Group 2: Presence, all in sensor UV. The local-contrast bands
+// (gpu/local_contrast.rs): y = B0 (fine), z = B1 (texture base), log2 luma;
+// the Clarity guided-filter coefficients, B2 = a·B1 + b, on a coarse grid;
+// and the dehaze guided-filter coefficients (core/haze.rs), (a, b) per
+// coarse cell — Rg32Float, which is not filterable, hence the manual
+// bilinear in haze_coeffs.
+@group(2) @binding(0)
+var local_tex: texture_2d<f32>;
+
+@group(2) @binding(1)
+var haze_tex: texture_2d<f32>;
+
+@group(2) @binding(2)
+var clarity_tex: texture_2d<f32>;
+
+// Texture / Clarity: stops of gain per stop of band detail at +1 (at −1 the
+// band is removed outright, i.e. ×1), and the soft ceiling on the total.
+const TEXTURE_GAIN: f32 = 1.0;
+const CLARITY_GAIN: f32 = 1.5;
+const LOCAL_LIMIT_EV: f32 = 1.5;
+// Dehaze: share of the estimated haze removed at +1 (He et al.'s ω — a
+// little is kept so distance still reads), the transmission floor (caps the
+// 1/t gain, which also multiplies noise), and how much haze −1 adds.
+const DEHAZE_OMEGA: f32 = 0.95;
+const DEHAZE_T0: f32 = 0.15;
+const HAZE_ADD: f32 = 0.6;
+// Sky tolerance (Wang et al.'s K, relative to the airlight): a pixel within
+// this of the airlight is mostly haze-coloured scene — sky — and its 1/t
+// gain is cut in proportion, or any error in A (and the sky's noise) comes
+// back multiplied by up to 1/T0 as a colour cast.
+const DEHAZE_SKY_K: f32 = 0.15;
+// No pixel may lose more than this share of its darkest (airlight-relative)
+// channel: removing more haze than the pixel itself contains drives it
+// negative, which clamps — crushed, hue-shifted shadows.
+const DEHAZE_KEEP: f32 = 0.9;
+
+// Bilinear (a, b) of the dehaze guided filter at sensor UV.
+fn haze_coeffs(uv: vec2<f32>) -> vec2<f32> {
+    let dims = vec2<i32>(textureDimensions(haze_tex));
+    let p = uv * vec2<f32>(dims) - vec2<f32>(0.5);
+    let i0 = vec2<i32>(floor(p));
+    let f = p - floor(p);
+    let hi = dims - vec2<i32>(1);
+    let c00 = textureLoad(haze_tex, clamp(i0, vec2<i32>(0), hi), 0).xy;
+    let c10 = textureLoad(haze_tex, clamp(i0 + vec2<i32>(1, 0), vec2<i32>(0), hi), 0).xy;
+    let c01 = textureLoad(haze_tex, clamp(i0 + vec2<i32>(0, 1), vec2<i32>(0), hi), 0).xy;
+    let c11 = textureLoad(haze_tex, clamp(i0 + vec2<i32>(1, 1), vec2<i32>(0), hi), 0).xy;
+    return mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
+}
 
 // Log-chromaticity epsilon for colour-range masks. MIRRORED from
 // core::types::MASK_CHROMA_EPS — `shader_mask_constants_match_rust` checks.
@@ -712,11 +765,65 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         color = vec3<f32>(hl_max);
     }
 
+    // ── Step 3b: Dehaze ───────────────────────────────────────────────────────
+    // Haze is additive light: I = J·t + A·(1 − t), A the airlight. Inverted
+    // here, on scene-linear camera values where that model is exact — after
+    // highlight reconstruction (which needs the true clip ceilings) and
+    // before exposure, which it commutes with. The dark channel of I/A reads
+    // 1 − t (core::haze); evaluating the guided filter with this pixel's own
+    // guide value is what keeps the skyline sharp. Normalising by A also
+    // makes all of it independent of the WB sliders.
+    let dehaze = params.presence.z;
+    if (dehaze != 0.0 && params.haze.w > 0.5) {
+        let air = params.haze.rgb * wb3;
+        let nrm = color / max(air, vec3<f32>(1e-6));
+        let ab = haze_coeffs(tex_coords);
+        let dark = clamp(ab.x * (nrm.r + nrm.g + nrm.b) / 3.0 + ab.y, 0.0, 1.0);
+        if (dehaze > 0.0) {
+            var t = 1.0 - DEHAZE_OMEGA * dehaze * dark;
+            let own_dark = min(nrm.r, min(nrm.g, nrm.b));
+            t = max(t, 1.0 - DEHAZE_KEEP * own_dark);
+            let from_air = max(abs(nrm.r - 1.0), max(abs(nrm.g - 1.0), abs(nrm.b - 1.0)));
+            t = min(t * max(DEHAZE_SKY_K / max(from_air, 1e-4), 1.0), 1.0);
+            t = max(t, DEHAZE_T0);
+            color = max((color - air) / t + air, vec3<f32>(0.0));
+        } else {
+            // Adding haze: more where there already is some (distance),
+            // a little everywhere.
+            let t = 1.0 + HAZE_ADD * dehaze * (0.35 + 0.65 * dark);
+            color = color * t + air * (1.0 - t);
+        }
+    }
+
     // ── Step 4: Exposure ──────────────────────────────────────────────────────
     // The lens vignetting gain rides here rather than at sampling: applied
     // before Step 3 it would push brightened corners past the clip thresholds
     // and trigger false highlight reconstruction.
-    let exposure_multiplier = pow(2.0, params.exposure) * lens_gain;
+    //
+    // So do Texture and Clarity: each scales one band of log luminance
+    // (gpu/local_contrast.rs), which is a per-pixel exposure change — hue
+    // and saturation untouched, and scene-linear, so the shoulder below rolls
+    // off whatever it lifts past white. Both fade out in deep shadows, where
+    // log-domain detail is mostly noise; Clarity also leaves the highlights
+    // alone, keeping it a midtone control.
+    var local_ev = 0.0;
+    let texture_amt = params.presence.x;
+    let clarity_amt = params.presence.y;
+    if (texture_amt != 0.0 || clarity_amt != 0.0) {
+        let bands = textureSampleLevel(local_tex, texture_sampler, tex_coords, 0.0);
+        let gf = textureSampleLevel(clarity_tex, texture_sampler, tex_coords, 0.0).xy;
+        let b2 = gf.x * bands.z + gf.y;
+        // Surrounding level after exposure, in stops below sensor white.
+        let base_ev = b2 + params.exposure;
+        let shadow_w = smoothstep(-11.0, -7.0, base_ev);
+        let mid_w = shadow_w * (1.0 - smoothstep(-1.5, 1.0, base_ev));
+        let k_tex = select(TEXTURE_GAIN, 1.0, texture_amt < 0.0);
+        let k_clar = select(CLARITY_GAIN, 1.0, clarity_amt < 0.0);
+        local_ev = texture_amt * k_tex * (bands.y - bands.z) * shadow_w
+                 + clarity_amt * k_clar * (bands.z - b2) * mid_w;
+        local_ev = local_ev / (1.0 + abs(local_ev) / LOCAL_LIMIT_EV);
+    }
+    let exposure_multiplier = pow(2.0, params.exposure) * lens_gain * exp2(local_ev);
     color = color * exposure_multiplier;
 
     // ── Step 5: Camera RGB → sRGB (DCP Pipeline vs Fallback) ────────────────

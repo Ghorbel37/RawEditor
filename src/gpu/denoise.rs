@@ -7,10 +7,14 @@
 //!
 //! ## Space
 //! Camera RGB × as-shot WB, split into an opponent space
-//! (`Y = (r+g+b)/3`, `U = (r−b)/2`, `V = (r+b)/2 − g`) so luma and chroma can
+//! (`Y = (r+2g+b)/4`, `U = (r−b)/2`, `V = (r+b)/2 − g`) so luma and chroma can
 //! be treated separately — chroma noise is blotchy and low-frequency, luma
 //! noise is fine grain, and the eye tolerates smoothing of the first far more
-//! than the second.
+//! than the second. `Y` is green-weighted like perceived luminance, and `U`
+//! and `V` are both orthogonal to it, so smoothing chroma cannot move
+//! brightness. (With an equal-weight `Y`, chroma smoothing traded green for
+//! magenta at constant channel mean and visibly altered luma texture —
+//! measurably worse luma PSNR with colour NR on.)
 //!
 //! Every *weight* is computed in the variance-stabilised space of the image's
 //! own noise model (`core::noise`), where noise has unit variance at every
@@ -24,7 +28,8 @@
 //! |--------------|----------------------------------------------------------|
 //! | `fs_prep`    | camera RGB → (Ys, Y, U, V); Ys = stabilised luma          |
 //! | `fs_nlm`     | non-local means on luma (3×3 patches, 9×9 search)         |
-//! | `fs_chroma`  | edge-avoiding à-trous on U/V, one pass per scale          |
+//! | `fs_scale`   | edge-avoiding à-trous, one pass per scale: U/V, and luma  |
+//! |              | from the second scale up                                  |
 //! | `fs_compose` | blend with the original by the slider amounts → camera RGB|
 //!
 //! Non-local means keeps texture that a bilateral filter would smear: it
@@ -32,6 +37,12 @@
 //! The à-trous chain (B3-spline kernel, step doubling per scale, weights that
 //! stop at luma and chroma edges) reaches blotches tens of pixels wide at
 //! the cost of 25 taps per scale.
+//!
+//! Luma rides the same chain from step 2 up, with an edge stop that tightens
+//! per scale. NLM's 9×9 window only reaches fine grain; at full resolution
+//! (export, 100% zoom) high-ISO luma noise also has a coarse, mottled
+//! component that it leaves behind as blotches in skies and walls. The taps
+//! are already loaded for chroma, so this costs arithmetic only.
 
 use iced_wgpu::wgpu;
 
@@ -62,6 +73,13 @@ pub struct GpuDenoiseParams {
     pub step: i32,
     /// NLM search radius in pixels.
     pub radius: i32,
+    /// À-trous: 1/(2σ²) of the stop for averaging LUMA at this scale, in
+    /// stabilised units — the coarse-grain counterpart of the NLM pass.
+    pub luma_scale_edge: f32,
+    /// À-trous: how much of this scale's luma average is taken (0 = luma
+    /// untouched at this scale).
+    pub luma_scale_mix: f32,
+    pub _pad: [f32; 2],
 }
 
 /// Uniform slot stride — `min_uniform_buffer_offset_alignment` is ≤ 256 on
@@ -100,7 +118,8 @@ impl DenoiseSettings {
 pub enum PassKind {
     Prep,
     Nlm,
-    Chroma,
+    /// One à-trous scale (chroma and/or coarse luma).
+    Scale,
     Compose,
 }
 
@@ -135,6 +154,10 @@ pub fn plan(
     const SIGMA_YS: f32 = 0.5;
     // Tuned on ISO 1600 frames: at 0.5 roughly half the grain goes and fine
     // knit texture survives; only near 1.0 does it approach the smooth look.
+    // Re-checked against ground truth (`gpu::eval_tests::nr_sweep`) once the
+    // noise model stopped counting texture as noise: luma PSNR peaks between
+    // 0.5 (ISO 800) and 0.75 (ISO 12800), so the slider's useful range is its
+    // whole travel rather than its first quarter.
     let f = s.luma;
     base.luma_floor = 2.0 * SIGMA_YS * SIGMA_YS * (0.4 + 1.2 * f);
     let h = SIGMA_YS * (0.35 + 1.3 * f) * (1.5 - s.detail);
@@ -153,7 +176,9 @@ pub fn plan(
     if f > 0.0 {
         passes.push((PassKind::Nlm, base));
     }
-    if g > 0.0 {
+    if g > 0.0 || f > 0.0 {
+        // Blotches have a fixed size on the sensor: fewer scales reach them
+        // on a subsampled preview.
         let extra = stride.max(1.0).log2().round() as i32;
         let levels = (6 - extra).clamp(2, MAX_LEVELS as i32);
         for level in 0..levels {
@@ -162,8 +187,20 @@ pub fn plan(
             // Chroma differences beyond this are real colour edges. Shrinks
             // per scale: each pass has already averaged away noise.
             let sigma_c = (1.0 + 6.0 * g) / (1u32 << level) as f32;
-            p.chroma_edge = 1.0 / (2.0 * sigma_c * sigma_c);
-            passes.push((PassKind::Chroma, p));
+            // 0 = leave chroma alone at this scale (luma-only plan).
+            p.chroma_edge = if g > 0.0 { 1.0 / (2.0 * sigma_c * sigma_c) } else { 0.0 };
+            // Coarse luma from the second scale up (the first is NLM's
+            // territory). Its edge stop is in the same stabilised units as
+            // the NLM's and halves per scale like chroma's; Detail narrows
+            // it exactly as it narrows the NLM. Measured on synthetic ISO
+            // 3200–12800 frames this removes the mottle NLM leaves at full
+            // resolution without costing PSNR on facades and foliage.
+            if f > 0.0 && level >= 1 {
+                let sigma_l = SIGMA_YS * (0.25 + f) * (1.5 - s.detail) / (1u32 << level) as f32;
+                p.luma_scale_edge = 1.0 / (2.0 * sigma_l * sigma_l);
+                p.luma_scale_mix = (f * 1.5).min(1.0);
+            }
+            passes.push((PassKind::Scale, p));
         }
     }
     passes.push((PassKind::Compose, base));
@@ -185,6 +222,10 @@ struct DenoiseParams {
     chroma_edge: f32,
     step: i32,
     radius: i32,
+    luma_scale_edge: f32,
+    luma_scale_mix: f32,
+    pad0: f32,
+    pad1: f32,
 }
 
 @group(0) @binding(0) var src_tex: texture_2d<f32>;
@@ -209,12 +250,12 @@ fn vst(x: vec3<f32>) -> vec3<f32> {
 }
 
 fn to_yuv(c: vec3<f32>) -> vec3<f32> {
-    return vec3<f32>((c.r + c.g + c.b) / 3.0, (c.r - c.b) * 0.5, (c.r + c.b) * 0.5 - c.g);
+    return vec3<f32>(0.25 * c.r + 0.5 * c.g + 0.25 * c.b, (c.r - c.b) * 0.5, (c.r + c.b) * 0.5 - c.g);
 }
 
 fn from_yuv(v: vec3<f32>) -> vec3<f32> {
-    let g = v.x - v.z * (2.0 / 3.0);
-    let rb = v.x + v.z / 3.0;
+    let g = v.x - 0.5 * v.z;
+    let rb = v.x + 0.5 * v.z;
     return vec3<f32>(rb + v.y, g, rb - v.y);
 }
 
@@ -281,27 +322,39 @@ fn b3(i: i32) -> f32 {
     return select(select(1.0 / 16.0, 4.0 / 16.0, a == 1), 6.0 / 16.0, a == 0);
 }
 
-// One scale of edge-avoiding à-trous on chroma: a 5×5 B3 spline with holes
-// of `step`, weighted down across luma edges and across chroma differences
-// larger than noise, so colour does not bleed between objects.
+// One scale of edge-avoiding à-trous: a 5×5 B3 spline with holes of `step`.
+// Chroma is weighted down across luma edges and across chroma differences
+// larger than noise, so colour does not bleed between objects; luma (when
+// `luma_scale_mix` > 0) across stabilised-luma differences larger than this
+// scale's residual noise.
 @fragment
-fn fs_chroma(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+fn fs_scale(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let p = vec2<i32>(pos.xy);
     let c = src(p);
     let cs = stab_chroma(c.yzw);
     var acc = vec2<f32>(0.0);
     var wsum = 0.0;
+    var lacc = vec2<f32>(0.0);
+    var lsum = 0.0;
     for (var j = -2; j <= 2; j++) {
         for (var i = -2; i <= 2; i++) {
             let n = src(p + vec2<i32>(i, j) * np.step);
             let dl = n.x - c.x;
             let dc = stab_chroma(n.yzw) - cs;
-            let w = b3(i) * b3(j) * exp(-dl * dl * np.luma_edge - dot(dc, dc) * np.chroma_edge);
+            let k = b3(i) * b3(j);
+            let w = k * exp(-dl * dl * np.luma_edge - dot(dc, dc) * np.chroma_edge);
             acc += w * n.zw;
             wsum += w;
+            // Luma at this scale: an edge-stopped average of what the NLM
+            // pass left — the coarse mottling its 9×9 window cannot reach.
+            let wl = k * exp(-dl * dl * np.luma_scale_edge);
+            lacc += wl * n.xy;
+            lsum += wl;
         }
     }
-    return vec4<f32>(c.x, c.y, acc / max(wsum, 1e-8));
+    let l = mix(c.xy, lacc / max(lsum, 1e-8), np.luma_scale_mix);
+    let uv = select(c.zw, acc / max(wsum, 1e-8), np.chroma_edge > 0.0);
+    return vec4<f32>(l, uv);
 }
 
 @fragment
@@ -324,7 +377,7 @@ pub struct Denoise {
     layout: wgpu::BindGroupLayout,
     prep: wgpu::RenderPipeline,
     nlm: wgpu::RenderPipeline,
-    chroma: wgpu::RenderPipeline,
+    scale: wgpu::RenderPipeline,
     compose: wgpu::RenderPipeline,
 }
 
@@ -407,7 +460,7 @@ impl Denoise {
         Self {
             prep: make("fs_prep"),
             nlm: make("fs_nlm"),
-            chroma: make("fs_chroma"),
+            scale: make("fs_scale"),
             compose: make("fs_compose"),
             layout,
         }
@@ -499,7 +552,7 @@ impl Denoise {
             let pipeline = match kind {
                 PassKind::Prep => &self.prep,
                 PassKind::Nlm => &self.nlm,
-                PassKind::Chroma => &self.chroma,
+                PassKind::Scale => &self.scale,
                 PassKind::Compose => &self.compose,
             };
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -560,11 +613,29 @@ mod tests {
     }
 
     #[test]
-    fn disabled_halves_add_no_passes() {
+    fn disabled_halves_add_no_work() {
+        // Luma only: NLM runs, and no scale touches chroma.
         let luma_only = plan(settings(0.5, 0.0), &NoiseModel::default(), [1.0; 3], 1.0);
-        assert!(luma_only.iter().all(|(k, _)| *k != PassKind::Chroma));
+        assert!(luma_only.iter().any(|(k, _)| *k == PassKind::Nlm));
+        assert!(luma_only.iter().all(|(_, p)| p.chroma_edge == 0.0));
+        // Chroma only: no NLM, and no scale mixes any luma.
         let chroma_only = plan(settings(0.0, 0.5), &NoiseModel::default(), [1.0; 3], 1.0);
         assert!(chroma_only.iter().all(|(k, _)| *k != PassKind::Nlm));
+        assert!(chroma_only.iter().all(|(_, p)| p.luma_scale_mix == 0.0));
+    }
+
+    /// Coarse luma starts at the second scale (the first is the NLM's) and
+    /// its edge stop tightens per scale, as the residual noise shrinks.
+    #[test]
+    fn coarse_luma_skips_the_first_scale_and_tightens() {
+        let p = plan(settings(0.7, 0.0), &NoiseModel::default(), [1.0; 3], 1.0);
+        let scales: Vec<&GpuDenoiseParams> =
+            p.iter().filter(|(k, _)| *k == PassKind::Scale).map(|(_, p)| p).collect();
+        assert_eq!(scales[0].luma_scale_mix, 0.0);
+        for w in scales[1..].windows(2) {
+            assert!(w[0].luma_scale_mix > 0.0);
+            assert!(w[1].luma_scale_edge > w[0].luma_scale_edge);
+        }
     }
 
     /// Chroma blotches are a fixed size on the sensor, so full resolution
@@ -574,7 +645,7 @@ mod tests {
         let count = |stride| {
             plan(settings(0.0, 0.5), &NoiseModel::default(), [1.0; 3], stride)
                 .iter()
-                .filter(|(k, _)| *k == PassKind::Chroma)
+                .filter(|(k, _)| *k == PassKind::Scale)
                 .count()
         };
         assert!(count(1.0) > count(3.0));
@@ -584,7 +655,7 @@ mod tests {
     #[test]
     fn scales_double_their_step() {
         let p = plan(settings(0.0, 1.0), &NoiseModel::default(), [1.0; 3], 1.0);
-        let steps: Vec<i32> = p.iter().filter(|(k, _)| *k == PassKind::Chroma).map(|(_, p)| p.step).collect();
+        let steps: Vec<i32> = p.iter().filter(|(k, _)| *k == PassKind::Scale).map(|(_, p)| p.step).collect();
         for w in steps.windows(2) {
             assert_eq!(w[1], w[0] * 2);
         }

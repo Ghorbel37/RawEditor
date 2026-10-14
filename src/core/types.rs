@@ -69,6 +69,25 @@ pub struct EditParams {
     /// - -100.0 = grayscale, 0.0 = original, +100.0 = maximum saturation
     pub saturation: f32,
 
+    // ========== Presence ==========
+    /// Texture (-1.0 to +1.0): medium-fine detail — skin, bark, foliage —
+    /// boosted or smoothed without touching pixel-level noise or larger
+    /// structure. See `gpu::local_contrast`. serde default: off, so edits
+    /// saved before this existed load unchanged.
+    #[serde(default)]
+    pub texture: f32,
+
+    /// Clarity (-1.0 to +1.0): mid-scale local contrast, weighted to the
+    /// midtones, edge-aware so strong edges do not halo.
+    #[serde(default)]
+    pub clarity: f32,
+
+    /// Dehaze (-1.0 to +1.0): removes (or adds) atmospheric haze by
+    /// inverting the haze model with a dark-channel transmission estimate.
+    /// See `core::haze`.
+    #[serde(default)]
+    pub dehaze: f32,
+
     // ========== White Balance ==========
     /// Temperature adjustment (-1.0 to +1.0)
     /// - Negative = cooler (bluer)
@@ -384,6 +403,9 @@ impl Default for EditParams {
             black_phase_y: 0, // Phase 39: Black level phase correction
             vibrance: 0.0,
             saturation: 0.0,
+            texture: 0.0,
+            clarity: 0.0,
+            dehaze: 0.0,
             temperature: 0.0,           // Phase 140: As-shot (maps to ~5000K for DCP)
             tint: 0.0,                  // Phase 18: Manual white balance (as-shot)
             luma_noise: 0.0,            // Phase 133: No luma noise reduction by default
@@ -524,6 +546,8 @@ pub struct CopyCategories {
     pub tone: bool,
     pub color: bool,
     pub white_balance: bool,
+    /// Texture, clarity, dehaze.
+    pub presence: bool,
     pub noise: bool,
     pub detail: bool,
     pub geometry: bool,
@@ -547,6 +571,7 @@ impl Default for CopyCategories {
             tone: true,
             color: true,
             white_balance: true,
+            presence: true,
             noise: true,
             detail: true,
             geometry: false,
@@ -565,6 +590,7 @@ impl CopyCategories {
             tone: true,
             color: true,
             white_balance: true,
+            presence: true,
             noise: true,
             detail: true,
             geometry: true,
@@ -580,6 +606,7 @@ impl CopyCategories {
             tone: false,
             color: false,
             white_balance: false,
+            presence: false,
             noise: false,
             detail: false,
             geometry: false,
@@ -636,6 +663,11 @@ pub fn apply_categories(dst: &mut EditParams, src: &EditParams, cats: CopyCatego
     if cats.white_balance {
         dst.temperature = src.temperature;
         dst.tint = src.tint;
+    }
+    if cats.presence {
+        dst.texture = src.texture;
+        dst.clarity = src.clarity;
+        dst.dehaze = src.dehaze;
     }
     if cats.noise {
         dst.luma_noise = src.luma_noise;
@@ -744,6 +776,20 @@ mod tests {
         assert!(restored.is_unedited());
     }
 
+    /// Edits saved before Texture/Clarity/Dehaze existed must load with all
+    /// three off — not as an image-wide change to anyone's catalogue.
+    #[test]
+    fn test_legacy_json_without_presence_defaults_to_off() {
+        let json = EditParams::default().to_json().unwrap();
+        let legacy = json
+            .replace(",\"texture\":0.0", "")
+            .replace(",\"clarity\":0.0", "")
+            .replace(",\"dehaze\":0.0", "");
+        assert!(!legacy.contains("clarity"), "legacy JSON still has the field");
+        let restored = EditParams::from_json(&legacy).unwrap();
+        assert!(restored.is_unedited());
+    }
+
     #[test]
     fn test_mask_makes_edited() {
         let mut params = EditParams::default();
@@ -768,6 +814,9 @@ mod tests {
         p.black_phase_y = 1;
         p.vibrance = 0.3;
         p.saturation = -0.2;
+        p.texture = 0.4;
+        p.clarity = -0.3;
+        p.dehaze = 0.5;
         p.temperature = 0.5;
         p.tint = -0.25;
         p.luma_noise = 0.4;
@@ -820,6 +869,9 @@ mod tests {
         assert_eq!(b.blacks, d.blacks);
         assert_eq!(b.vibrance, d.vibrance);
         assert_eq!(b.saturation, d.saturation);
+        assert_eq!(b.texture, d.texture);
+        assert_eq!(b.clarity, d.clarity);
+        assert_eq!(b.dehaze, d.dehaze);
         assert_eq!(b.temperature, d.temperature);
         assert_eq!(b.tint, d.tint);
         assert_eq!(b.luma_noise, d.luma_noise);
@@ -901,6 +953,13 @@ mod tests {
         assert_eq!(profile.profile_curve, src.profile_curve);
         assert_eq!(profile.exposure, base.exposure);
 
+        let presence = only(|c| c.presence = true);
+        assert_eq!(presence.texture, src.texture);
+        assert_eq!(presence.clarity, src.clarity);
+        assert_eq!(presence.dehaze, src.dehaze);
+        assert_eq!(presence.exposure, base.exposure);
+        assert_eq!(presence.saturation, base.saturation);
+
         let black = only(|c| c.black_levels = true);
         assert_eq!(black.black_offsets, src.black_offsets);
         assert_eq!(black.black_phase_x, src.black_phase_x);
@@ -947,6 +1006,7 @@ mod tests {
         let c: CopyCategories = serde_json::from_str(json).expect("legacy prefs must parse");
         assert!(!c.tone, "existing choices survive");
         assert!(c.lens, "the new category takes its default");
+        assert!(c.presence, "the new category takes its default");
     }
 
     #[test]

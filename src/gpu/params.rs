@@ -170,6 +170,15 @@ pub struct GpuEditParams {
     pub defringe: [f32; 4],
     /// Defringe: active 0/1, edge search radius in texels, unused ×2
     pub defringe_misc: [f32; 4],
+    /// Presence: texture, clarity, dehaze (each −1..1), unused. The bands
+    /// Texture and Clarity scale come from the local-contrast pre-pass
+    /// (`gpu::local_contrast`, bind group 2), which `prepare_stages` keeps
+    /// current whenever either is non-zero — so the amounts alone say
+    /// whether the shader may sample it.
+    pub presence: [f32; 4],
+    /// Dehaze airlight in CAMERA-NATIVE units (the shader multiplies by the
+    /// current WB, like the pixel), and 1 when a haze map exists.
+    pub haze: [f32; 4],
     // The masks themselves live in their own uniform buffer (`GpuMasks`,
     // bind group 1) next to the brush layers they sample.
 }
@@ -182,6 +191,17 @@ impl GpuEditParams {
         self.lens_tca_r = [g.tca_r[0], g.tca_r[1], g.tca_r[2], g.vig_ratio];
         self.lens_tca_b = [g.tca_b[0], g.tca_b[1], g.tca_b[2], g.manual_vig];
         self.lens_vig = [g.vig[0], g.vig[1], g.vig[2], g.inv_corner];
+    }
+
+    /// The dehaze airlight, given in the analysis space of `core::haze`
+    /// (white-balanced by `analysis_wb`); stored camera-native.
+    pub fn set_haze(&mut self, airlight: [f32; 3], analysis_wb: [f32; 3]) {
+        self.haze = [
+            airlight[0] / analysis_wb[0],
+            airlight[1] / analysis_wb[1],
+            airlight[2] / analysis_wb[2],
+            1.0,
+        ];
     }
 
     /// Defringe's edge search radius, in texels of the working texture.
@@ -256,6 +276,14 @@ impl From<&EditParams> for GpuEditParams {
                 params.defringe.green_hue,
             ],
             defringe_misc: [if params.defringe.is_active() { 1.0 } else { 0.0 }, 2.0, 0.0, 0.0],
+            presence: [
+                params.texture.clamp(-1.0, 1.0),
+                params.clarity.clamp(-1.0, 1.0),
+                params.dehaze.clamp(-1.0, 1.0),
+                0.0,
+            ],
+            // Filled per image by `set_haze`.
+            haze: [1.0, 1.0, 1.0, 0.0],
         }
     }
 }
@@ -271,9 +299,29 @@ mod tests {
         assert_eq!(std::mem::size_of::<GpuMask>(), 112);
         assert_eq!(std::mem::size_of::<GpuMasks>(), 8 * 112);
         // 256 (base) + 16 (mask_count, tone_mapper, curve_active, overlay)
-        // + 7 × 16 (lens + defringe)
-        assert_eq!(std::mem::size_of::<GpuEditParams>(), 384);
+        // + 7 × 16 (lens + defringe) + 2 × 16 (presence + haze)
+        assert_eq!(std::mem::size_of::<GpuEditParams>(), 416);
         assert_eq!(std::mem::offset_of!(GpuEditParams, lens_dist), 272);
+        assert_eq!(std::mem::offset_of!(GpuEditParams, presence), 384);
+        assert_eq!(std::mem::offset_of!(GpuEditParams, haze), 400);
+    }
+
+    #[test]
+    fn presence_reaches_the_uniform_clamped() {
+        let p = EditParams { texture: 0.4, clarity: -2.0, dehaze: 0.7, ..EditParams::default() };
+        let g = GpuEditParams::from(&p);
+        assert_eq!(g.presence, [0.4, -1.0, 0.7, 0.0]);
+        assert_eq!(GpuEditParams::from(&EditParams::default()).presence, [0.0; 4]);
+    }
+
+    /// The airlight is measured white-balanced but the shader re-applies the
+    /// CURRENT white balance, so it must be stored camera-native.
+    #[test]
+    fn haze_airlight_is_stored_camera_native() {
+        let mut g = GpuEditParams::from(&EditParams::default());
+        assert_eq!(g.haze[3], 0.0, "no haze map until one is set");
+        g.set_haze([0.8, 0.6, 0.75], [2.0, 1.0, 1.5]);
+        assert_eq!(g.haze, [0.4, 0.6, 0.5, 1.0]);
     }
 
     /// `tone_mapper` claimed a dead pad slot specifically so nothing moved.
