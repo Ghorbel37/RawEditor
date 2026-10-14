@@ -442,6 +442,10 @@ fn view_title_bar(editor: &RawEditor) -> Element<'_, Message> {
     } else {
         column![menus].into()
     };
+    // And an open dropdown must never be handed a widget operation: iced_aw
+    // panics on one (see `ui::widgets::no_operate`), and a scroll task — the
+    // filmstrip still coasting — can arrive at any moment.
+    let menus: Element<'_, Message> = crate::ui::widgets::no_operate::no_operate(menus).into();
 
     // The tabs sit over a highlight that slides (and stretches) between
     // them — `ui::widgets::indicator`. The buttons themselves are transparent

@@ -100,11 +100,25 @@ pub enum GlideTarget {
 /// A spring-driven scroll towards the selection (`handlers::scroll`). A
 /// spring rather than a fixed-length tween so holding an arrow key — a new
 /// target every repeat — keeps one continuous motion instead of restarting.
+///
+/// The spring runs on the *displacement* from `to`, towards zero, not on the
+/// offset itself: offsets reach six figures in a long filmstrip, where `f32`
+/// is too coarse for a spring to settle, and a glide that never ended kept
+/// issuing `scroll_to` every frame (see `ui::motion::Animated`).
 #[derive(Debug, Clone, Copy)]
 pub struct ScrollGlide {
     pub target: GlideTarget,
-    pub offset: crate::ui::motion::Animated,
+    /// Where the glide comes to rest.
+    pub to: f32,
+    /// Current offset minus `to`; springs to 0.
+    pub displacement: crate::ui::motion::Animated,
     pub last_tick: Option<std::time::Instant>,
+}
+
+impl ScrollGlide {
+    pub fn offset(&self) -> f32 {
+        self.to + self.displacement.value
+    }
 }
 
 /// Phase 89: Export Format

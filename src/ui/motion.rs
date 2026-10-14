@@ -236,6 +236,12 @@ impl Spring {
 }
 
 /// A scalar driven by a spring towards a target.
+///
+/// Keep magnitudes small (fractions, segment units). `f32` spacing grows with
+/// magnitude — about 0.016 at 170 000 — so a spring on a large value can
+/// stall a hair off its target, short of any rest threshold, and request
+/// frames forever. Animate a large quantity (a scroll offset) as its
+/// *displacement* from the target, springing towards zero.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Animated {
     pub value: f32,
@@ -270,12 +276,21 @@ impl Animated {
     /// Advance by `dt`; returns `true` while still moving. Lands exactly on
     /// the target once at rest, so callers can compare against it.
     pub fn step(&mut self, spring: Spring, dt: f32) -> bool {
+        self.step_until(spring, dt, REST_DISTANCE)
+    }
+
+    /// [`step`](Self::step), at rest within `rest` of the target (in the
+    /// value's own units) — for pixel quantities, where the default would
+    /// spend a long tail on sub-pixel motion nobody can see.
+    pub fn step_until(&mut self, spring: Spring, dt: f32, rest: f32) -> bool {
         if reduced() {
             self.snap(self.target);
             return false;
         }
         spring.step(&mut self.value, &mut self.velocity, self.target, dt);
-        if self.is_settled() {
+        let at_rest = (self.value - self.target).abs() < rest
+            && self.velocity.abs() < rest * (REST_SPEED / REST_DISTANCE);
+        if at_rest {
             self.snap(self.target);
             false
         } else {

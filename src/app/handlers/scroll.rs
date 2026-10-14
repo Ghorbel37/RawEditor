@@ -222,24 +222,62 @@ fn scroll_to(target: GlideTarget, offset: f32) -> Task<Message> {
 
 /// Where an in-flight glide on `target` will come to rest.
 pub fn glide_destination(editor: &RawEditor, target: GlideTarget) -> Option<f32> {
-    editor.scroll_glide.filter(|g| g.target == target).map(|g| g.offset.target)
+    editor.scroll_glide.filter(|g| g.target == target).map(|g| g.to)
 }
 
-/// Scroll `target` to `offset`: a glide, or a jump under reduced motion. A
-/// glide already heading there is re-aimed without losing its speed.
-pub fn glide_to(editor: &mut RawEditor, target: GlideTarget, offset: f32) -> Task<Message> {
+/// A glide is done once within half a pixel of its destination and barely
+/// moving; anything finer is invisible.
+const GLIDE_REST_PX: f32 = 0.5;
+
+/// Farthest a reveal glides, in viewports. Beyond it a glide is a blur of
+/// thumbnails the user never wanted to see — each one loaded as it passes —
+/// so it jumps instead.
+const GLIDE_MAX_VIEWPORTS: f32 = 1.5;
+
+/// The visible extent of `target` along its scroll axis.
+fn viewport_extent(editor: &RawEditor, target: GlideTarget) -> f32 {
+    let (reported, window) = match target {
+        GlideTarget::Grid => (editor.grid_viewport.1, editor.window_size.height),
+        GlideTarget::Filmstrip => (editor.filmstrip_view_w, editor.window_size.width),
+    };
+    if reported > 0.0 {
+        reported
+    } else {
+        window
+    }
+}
+
+/// Scroll `target` to `offset`: a glide if `animate` and it is a short
+/// move, otherwise a jump (also under reduced motion). A glide already in
+/// flight is re-aimed without losing its speed.
+pub fn glide_to(
+    editor: &mut RawEditor,
+    target: GlideTarget,
+    offset: f32,
+    animate: bool,
+) -> Task<Message> {
     let offset = offset.max(0.0);
-    if motion::reduced() {
+    let from = editor
+        .scroll_glide
+        .filter(|g| g.target == target)
+        .map_or_else(|| current_offset(editor, target), |g| g.offset());
+    let short = (offset - from).abs() <= GLIDE_MAX_VIEWPORTS * viewport_extent(editor, target);
+    if !animate || !short || motion::reduced() {
         editor.scroll_glide = None;
         set_offset(editor, target, offset);
         return scroll_to(target, offset);
     }
     match &mut editor.scroll_glide {
-        Some(glide) if glide.target == target => glide.offset.set(offset),
+        // Re-aim: same position and velocity, measured from the new end.
+        Some(glide) if glide.target == target => {
+            glide.displacement.value = glide.offset() - offset;
+            glide.to = offset;
+        }
         _ => {
-            let mut position = Animated::new(current_offset(editor, target));
-            position.set(offset);
-            editor.scroll_glide = Some(ScrollGlide { target, offset: position, last_tick: None });
+            let mut displacement = Animated::new(current_offset(editor, target) - offset);
+            displacement.set(0.0);
+            editor.scroll_glide =
+                Some(ScrollGlide { target, to: offset, displacement, last_tick: None });
         }
     }
     Task::none()
@@ -266,8 +304,8 @@ fn step_glide(editor: &mut RawEditor, now: std::time::Instant) -> Task<Message> 
     }
     let dt = motion::frame_dt(glide.last_tick, now);
     glide.last_tick = Some(now);
-    let moving = glide.offset.step(Spring::SMOOTH, dt);
-    let offset = glide.offset.value.max(0.0);
+    let moving = glide.displacement.step_until(Spring::SMOOTH, dt, GLIDE_REST_PX);
+    let offset = glide.offset().max(0.0);
     editor.scroll_glide = moving.then_some(glide);
     set_offset(editor, glide.target, offset);
     scroll_to(glide.target, offset)
@@ -286,24 +324,46 @@ mod tests {
     fn re_aiming_a_glide_keeps_its_speed() {
         let mut e = editor();
         e.current_tab = AppTab::Develop;
-        let _ = glide_to(&mut e, GlideTarget::Filmstrip, 1000.0);
+        let _ = glide_to(&mut e, GlideTarget::Filmstrip, 1000.0, true);
         let start = std::time::Instant::now();
         for i in 0..6 {
             let _ = step_glide(&mut e, start + std::time::Duration::from_millis(16 * i));
         }
-        let speed = e.scroll_glide.unwrap().offset.velocity;
-        assert!(speed > 0.0);
-        let _ = glide_to(&mut e, GlideTarget::Filmstrip, 1200.0);
-        let glide = e.scroll_glide.unwrap();
-        assert_eq!(glide.offset.velocity, speed);
-        assert_eq!(glide.offset.target, 1200.0);
+        let before = e.scroll_glide.unwrap();
+        // Displacement shrinks towards 0 from below: moving forwards.
+        assert!(before.displacement.velocity > 0.0);
+        let _ = glide_to(&mut e, GlideTarget::Filmstrip, 1200.0, true);
+        let after = e.scroll_glide.unwrap();
+        assert_eq!(after.displacement.velocity, before.displacement.velocity);
+        assert_eq!(after.to, 1200.0);
+        assert!((after.offset() - before.offset()).abs() < 1e-3, "position jumped");
+    }
+
+    /// The regression behind a crash: at six-figure offsets (a long
+    /// filmstrip) a spring on the raw offset stalled a fraction of a pixel
+    /// short and glided forever, issuing `scroll_to` every frame — which
+    /// panicked iced_aw the moment a dropdown was opened.
+    #[test]
+    fn a_glide_ends_even_at_huge_offsets() {
+        let mut e = editor();
+        e.current_tab = AppTab::Develop;
+        e.filmstrip_scroll_x = 171_000.0;
+        let _ = glide_to(&mut e, GlideTarget::Filmstrip, 172_345.67, true);
+        let start = std::time::Instant::now();
+        let mut frames = 0;
+        while e.scroll_glide.is_some() {
+            frames += 1;
+            assert!(frames < 120, "glide never ended: {:?}", e.scroll_glide);
+            let _ = step_glide(&mut e, start + std::time::Duration::from_micros(16_667 * frames));
+        }
+        assert_eq!(e.filmstrip_scroll_x, 172_345.67);
     }
 
     #[test]
     fn a_glide_lands_on_its_target_and_ends() {
         let mut e = editor();
         e.current_tab = AppTab::Library;
-        let _ = glide_to(&mut e, GlideTarget::Grid, 640.0);
+        let _ = glide_to(&mut e, GlideTarget::Grid, 640.0, true);
         let start = std::time::Instant::now();
         let mut frames = 0;
         while e.scroll_glide.is_some() {
@@ -314,11 +374,30 @@ mod tests {
         assert_eq!(e.grid_scroll_y, 640.0);
     }
 
+    /// A long reveal — or any reveal on a tab switch — jumps rather than
+    /// sweeping past every thumbnail in between.
+    #[test]
+    fn long_or_instant_reveals_jump() {
+        let mut e = editor();
+        e.current_tab = AppTab::Develop;
+        e.filmstrip_view_w = 1600.0;
+        let _ = glide_to(&mut e, GlideTarget::Filmstrip, 50_000.0, true);
+        assert!(e.scroll_glide.is_none());
+        assert_eq!(e.filmstrip_scroll_x, 50_000.0);
+
+        let _ = glide_to(&mut e, GlideTarget::Filmstrip, 50_400.0, false);
+        assert!(e.scroll_glide.is_none());
+        assert_eq!(e.filmstrip_scroll_x, 50_400.0);
+
+        let _ = glide_to(&mut e, GlideTarget::Filmstrip, 51_000.0, true);
+        assert!(e.scroll_glide.is_some(), "a short in-place reveal still glides");
+    }
+
     #[test]
     fn wheel_input_cancels_a_glide() {
         let mut e = editor();
         e.current_tab = AppTab::Develop;
-        let _ = glide_to(&mut e, GlideTarget::Filmstrip, 500.0);
+        let _ = glide_to(&mut e, GlideTarget::Filmstrip, 500.0, true);
         let _ = handle_filmstrip_wheel(&mut e, ScrollDelta::Lines { x: 0.0, y: -1.0 });
         assert!(e.scroll_glide.is_none());
     }
@@ -327,9 +406,10 @@ mod tests {
     fn leaving_the_tab_drops_the_glide() {
         let mut e = editor();
         e.current_tab = AppTab::Develop;
-        let _ = glide_to(&mut e, GlideTarget::Filmstrip, 500.0);
+        let _ = glide_to(&mut e, GlideTarget::Filmstrip, 500.0, true);
         e.current_tab = AppTab::Library;
         let _ = step_glide(&mut e, std::time::Instant::now());
         assert!(e.scroll_glide.is_none());
     }
 }
+

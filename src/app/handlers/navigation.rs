@@ -90,6 +90,18 @@ pub fn handle_image_selected(editor: &mut RawEditor, image_id: i64) -> Task<Mess
 /// selection moved, the view did not. A no-op when the selection is already
 /// in view, so a click never makes anything jump.
 pub fn reveal_selection(editor: &mut RawEditor) -> Task<Message> {
+    reveal(editor, true)
+}
+
+/// [`reveal_selection`] without the glide: for a tab switch, whose grid /
+/// filmstrip has just been rebuilt at offset 0 — gliding from there would
+/// sweep past (and load) every thumbnail between the start and the
+/// selection, and there is no previous position for the eye to follow.
+pub fn reveal_selection_instantly(editor: &mut RawEditor) -> Task<Message> {
+    reveal(editor, false)
+}
+
+fn reveal(editor: &mut RawEditor, animate: bool) -> Task<Message> {
     use crate::app::handlers::scroll::{glide_destination, glide_to};
     use crate::app::state::GlideTarget;
 
@@ -107,7 +119,7 @@ pub fn reveal_selection(editor: &mut RawEditor) -> Task<Message> {
             let geom = crate::app::views::library::GridGeometry::of(editor);
             let from = glide_destination(editor, GlideTarget::Grid).unwrap_or(editor.grid_scroll_y);
             if let Some(y) = geom.scroll_to_reveal(index / geom.columns, from) {
-                return glide_to(editor, GlideTarget::Grid, y);
+                return glide_to(editor, GlideTarget::Grid, y, animate);
             }
         }
         AppTab::Cull | AppTab::Develop => {
@@ -122,7 +134,7 @@ pub fn reveal_selection(editor: &mut RawEditor) -> Task<Message> {
                 // A reveal overrides any momentum glide.
                 editor.filmstrip_velocity = 0.0;
                 editor.last_kinetic_tick = None;
-                return glide_to(editor, GlideTarget::Filmstrip, x);
+                return glide_to(editor, GlideTarget::Filmstrip, x, animate);
             }
         }
         AppTab::Export => {}
@@ -153,7 +165,7 @@ pub fn handle_tab_changed(editor: &mut RawEditor, tab: AppTab) -> Task<Message> 
         editor.last_kinetic_tick = None;
     }
     editor.current_tab = tab;
-    let reveal = reveal_selection(editor);
+    let reveal = reveal_selection_instantly(editor);
     Task::batch([persist, reveal, load_for_tab(editor, tab)])
 }
 

@@ -6,6 +6,7 @@ pub mod collapse;
 pub mod fade_image;
 pub mod indicator;
 pub mod modal;
+pub mod no_operate;
 pub mod profiler_graph;
 pub mod transition;
 
