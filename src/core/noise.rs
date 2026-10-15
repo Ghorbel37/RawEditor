@@ -10,12 +10,35 @@
 //! are expressed in units of the actual noise and one slider position means
 //! the same thing on every image.
 //!
-//! Estimation: at each sampled site, the second difference of same-colour
-//! neighbours two pixels away, `v(x-2) − 2·v(x) + v(x+2)`, cancels any linear
-//! gradient and leaves (mostly) noise with variance `6·σ²(x)`. Sites are binned
-//! by their local mean; a robust (MAD-based) variance per bin rejects the
-//! edges and texture that survive the differencing; a weighted least-squares
-//! line through the bins gives `a` and `b`.
+//! ## Estimation
+//! The hard part is not measuring variance but measuring *only noise*: every
+//! high-pass filter also passes scene texture, and a model that counts
+//! foliage or brickwork as noise makes every NR slider over-smooth by the
+//! same factor. (The previous estimator — a median of second differences per
+//! brightness bin — read a noise-free photo of a city as roughly ISO 10000.)
+//!
+//! So the variance is measured per small block and only the *quietest*
+//! blocks are believed:
+//! 1. Each CFA plane (one colour, every other pixel) is cut into
+//!    `BLOCK`×`BLOCK` blocks. Within a block, Immerkær's 3×3 mask
+//!    (`[1 −2 1; −2 4 −2; 1 −2 1]`) cancels any quadratic surface, so a
+//!    smooth gradient contributes nothing; what is left is noise plus texture,
+//!    with `E[r²] = 36σ²` for pure noise.
+//! 2. Blocks are binned by their mean level. Texture can only *add* variance,
+//!    so the flat blocks (sky, walls, out-of-focus areas) form the bottom of
+//!    each bin's distribution. A low quantile is a first guess, but a biased
+//!    one — if only 20% of blocks are flat, the 10% quantile is their
+//!    *median*. So it is refined as a truncated mean: average the blocks
+//!    below `TRUNC_TAU`·σ², correct by that truncation's known effect on
+//!    pure noise (`TRUNC_MEAN`), repeat. σ² is a fixed point of that
+//!    iteration for any fraction of flat blocks, and textured blocks sitting
+//!    above the cut never enter it.
+//! 3. A weighted fit of `var = a·x + b` through the bins, refitted after
+//!    dropping bins that sit far *above* the line — a bin with no flat block
+//!    at all is still inflated, and only ever upwards.
+//!
+//! Values stay signed (black-subtracted, not clamped): read noise straddles
+//! zero, and clamping it would under-read `b` in exactly the bins that set it.
 
 /// `variance(x) = a·x + b` per colour (R, G, B), in white-balanced unit-range
 /// units — the same units the demosaic writes before un-balancing.
@@ -43,9 +66,27 @@ impl NoiseModel {
     }
 }
 
+/// Block side in samples of one CFA plane (twice that in mosaic pixels).
+const BLOCK: usize = 8;
+/// Brightness bins per colour, uniform in `sqrt(level)` so the shadows —
+/// where `b` is decided and most of a photo usually sits — get as many bins
+/// as the highlights.
 const BINS: usize = 24;
-/// Samples per bin below which the bin's variance is not trusted.
-const MIN_BIN_SAMPLES: usize = 64;
+/// Blocks a bin needs before its quantile is trusted.
+const MIN_BIN_BLOCKS: usize = 24;
+/// The quantile of a bin's block variances used as the starting guess…
+const QUANTILE: f64 = 0.1;
+/// …and that quantile on pure white noise, as a fraction of the true
+/// variance (Monte Carlo over 250k blocks).
+const QUANTILE_RATIO: f64 = 0.536;
+/// Truncated-mean refinement: blocks below `TRUNC_TAU`·σ² are averaged…
+const TRUNC_TAU: f64 = 1.5;
+/// …and on pure noise that average is `TRUNC_MEAN`·σ² (Monte Carlo; the
+/// pure-noise test below fails if either constant drifts).
+const TRUNC_MEAN: f64 = 0.890;
+/// Upper bound on blocks examined per CFA plane: plenty for the fit, and keeps
+/// a 45 MP frame to a few tens of milliseconds.
+const MAX_BLOCKS_PER_PLANE: usize = 40_000;
 
 /// Estimate the noise model of a Bayer mosaic.
 ///
@@ -62,69 +103,72 @@ pub fn estimate(
     scale: [f32; 4],
     ceil: [f32; 3],
 ) -> NoiseModel {
-    if width < 16 || height < 16 || mosaic.len() < width * height {
+    let (pw, ph) = (width / 2, height / 2);
+    let (nbx, nby) = (pw / BLOCK, ph / BLOCK);
+    if nbx < 4 || nby < 4 || mosaic.len() < width * height {
         return NoiseModel::default();
     }
-    let value = |x: usize, y: usize| -> f32 {
-        let k = (y & 1) * 2 + (x & 1);
-        (mosaic[y * width + x] as f32 - black[k]).max(0.0) * scale[k]
-    };
+    // Visit every `skip`-th block along each axis to cap the work.
+    let skip = ((nbx * nby) as f64 / MAX_BLOCKS_PER_PLANE as f64).sqrt().ceil().max(1.0) as usize;
 
-    // Sample on a sparse grid: a few hundred thousand differences are plenty,
-    // and this must stay cheap at 45 MP. Steps are odd so every tile position
-    // (and so every colour) is visited.
-    let target = 400_000usize;
-    let step = ((width * height / target) as f64).sqrt().floor().max(1.0) as usize;
-    let step = if step.is_multiple_of(2) { step + 1 } else { step };
-
-    // Per colour, per bin: |second differences| and the sum of local means.
-    let mut diffs: Vec<Vec<Vec<f32>>> = vec![vec![Vec::new(); BINS]; 3];
+    // Per colour, per bin: block variances and the sum of block means.
+    let mut vars: Vec<Vec<Vec<f32>>> = vec![vec![Vec::new(); BINS]; 3];
     let mut means: Vec<Vec<f64>> = vec![vec![0.0; BINS]; 3];
+    let inner = (BLOCK - 2) * (BLOCK - 2);
+    let mut blk = [[0.0f32; BLOCK]; BLOCK];
 
-    let mut y = 2;
-    while y < height - 2 {
-        let mut x = 2;
-        while x < width - 2 {
-            let k = (y & 1) * 2 + (x & 1);
-            let c = colors[k] as usize;
-            let v0 = value(x, y);
-            for (l, r) in [(value(x - 2, y), value(x + 2, y)), (value(x, y - 2), value(x, y + 2))] {
-                let m = (l + v0 + r) / 3.0;
-                // Bins span this colour's white-balanced range; the top 10%
-                // is clipping-compressed and would bend the fit.
-                let range = ceil[c].max(1e-6);
-                if m <= 0.0 || m >= range * 0.9 {
+    for k in 0..4 {
+        let (ox, oy) = (k & 1, k >> 1);
+        let c = colors[k] as usize;
+        let range = ceil[c].max(1e-6);
+        for by in (0..nby).step_by(skip) {
+            for bx in (0..nbx).step_by(skip) {
+                let (mut sum, mut peak) = (0.0f32, f32::MIN);
+                for (j, row) in blk.iter_mut().enumerate() {
+                    let y = 2 * (by * BLOCK + j) + oy;
+                    for (i, v) in row.iter_mut().enumerate() {
+                        let x = 2 * (bx * BLOCK + i) + ox;
+                        *v = (mosaic[y * width + x] as f32 - black[k]) * scale[k];
+                        sum += *v;
+                        peak = peak.max(*v);
+                    }
+                }
+                let mean = sum / (BLOCK * BLOCK) as f32;
+                // Anything touching the clip ceiling has had its noise cut
+                // off; the top of the range is clipping-compressed anyway.
+                if peak >= range * 0.95 || mean >= range * 0.9 {
                     continue;
                 }
-                let bin = ((m / range) * BINS as f32) as usize;
+                let mut r2 = 0.0f32;
+                for j in 1..BLOCK - 1 {
+                    for i in 1..BLOCK - 1 {
+                        let r = blk[j - 1][i - 1] - 2.0 * blk[j - 1][i] + blk[j - 1][i + 1]
+                            - 2.0 * blk[j][i - 1] + 4.0 * blk[j][i] - 2.0 * blk[j][i + 1]
+                            + blk[j + 1][i - 1] - 2.0 * blk[j + 1][i] + blk[j + 1][i + 1];
+                        r2 += r * r;
+                    }
+                }
+                let bin = ((mean.max(0.0) / range).sqrt() * BINS as f32) as usize;
                 let bin = bin.min(BINS - 1);
-                diffs[c][bin].push((l - 2.0 * v0 + r).abs());
-                means[c][bin] += m as f64;
+                vars[c][bin].push(r2 / (36 * inner) as f32);
+                means[c][bin] += mean as f64;
             }
-            x += step;
         }
-        y += step;
     }
 
     let mut model = NoiseModel::default();
     for c in 0..3 {
-        // (mean, variance, weight) per usable bin.
+        // (mean, variance, blocks) per usable bin.
         let mut pts: Vec<(f64, f64, f64)> = Vec::new();
         for bin in 0..BINS {
-            let d = &mut diffs[c][bin];
-            if d.len() < MIN_BIN_SAMPLES {
+            let v = &mut vars[c][bin];
+            let n = v.len();
+            if n < MIN_BIN_BLOCKS {
                 continue;
             }
-            let n = d.len();
-            let mid = n / 2;
-            let (_, median, _) = d.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
-            // |N(0, s)| has median 0.6745·s; the second difference has
-            // variance 6σ².
-            let s = *median as f64 / 0.6745;
-            let var = s * s / 6.0;
-            pts.push((means[c][bin] / n as f64, var, n as f64));
+            pts.push((means[c][bin] / n as f64, flat_variance(v), n as f64));
         }
-        if let Some((a, b)) = fit_affine(&pts) {
+        if let Some((a, b)) = fit_lower_envelope(&pts) {
             model.a[c] = a as f32;
             model.b[c] = b as f32;
         }
@@ -132,11 +176,61 @@ pub fn estimate(
     model
 }
 
-/// Weighted least squares for `var = a·mean + b`, with `a ≥ 0`, `b ≥ 0`.
+/// Noise variance of one bin's blocks: the low quantile as a first guess,
+/// then the truncated mean of the blocks below `TRUNC_TAU` times the current
+/// estimate until it settles (see the module docs).
+fn flat_variance(v: &mut [f32]) -> f64 {
+    let q = ((v.len() as f64 * QUANTILE) as usize).min(v.len() - 1);
+    let (_, low, _) = v.select_nth_unstable_by(q, |a, b| a.total_cmp(b));
+    let mut s = *low as f64 / QUANTILE_RATIO;
+    for _ in 0..12 {
+        let cut = TRUNC_TAU * s;
+        let (sum, n) = v
+            .iter()
+            .filter(|&&x| (x as f64) < cut)
+            .fold((0.0f64, 0usize), |(sum, n), &x| (sum + x as f64, n + 1));
+        if n < MIN_BIN_BLOCKS / 2 {
+            break;
+        }
+        let next = sum / n as f64 / TRUNC_MEAN;
+        let settled = (next - s).abs() <= 1e-3 * s;
+        s = next;
+        if settled {
+            break;
+        }
+    }
+    s
+}
+
+/// Fit `var = a·mean + b` through the bins, then drop bins well above the
+/// line and refit: a bin with no flat block at all is still inflated by
+/// texture, and texture only ever pushes upwards.
 ///
-/// Bins high in texture inflate their variance; weighting by sample count
-/// and using the median per bin keeps them from dominating. Returns `None`
-/// with fewer than two usable bins.
+/// Weighted by `blocks / var²` — a quantile's error is proportional to the
+/// variance it measures, so this weights each bin by its relative precision
+/// instead of letting the brightest bins dominate. Returns `None` with fewer
+/// than two usable bins.
+fn fit_lower_envelope(pts: &[(f64, f64, f64)]) -> Option<(f64, f64)> {
+    let mut keep: Vec<(f64, f64, f64)> =
+        pts.iter().map(|&(m, v, n)| (m, v, n / (v * v).max(1e-30))).collect();
+    let mut fit = fit_affine(&keep)?;
+    for _ in 0..3 {
+        let kept: Vec<_> = keep
+            .iter()
+            .copied()
+            .filter(|&(m, v, _)| v <= (fit.0 * m + fit.1).max(1e-12) * 1.5)
+            .collect();
+        if kept.len() == keep.len() || kept.len() < 2 {
+            break;
+        }
+        keep = kept;
+        fit = fit_affine(&keep)?;
+    }
+    Some(fit)
+}
+
+/// Weighted least squares for `var = a·mean + b`, with `a ≥ 0`, `b ≥ 0`.
+/// Returns `None` with fewer than two points.
 fn fit_affine(pts: &[(f64, f64, f64)]) -> Option<(f64, f64)> {
     if pts.len() < 2 {
         return None;
@@ -186,46 +280,110 @@ mod tests {
         }
     }
 
-    /// Build an RGGB mosaic of smooth content with known Poisson-Gaussian
-    /// noise, then check the estimate recovers the model.
-    #[test]
-    fn recovers_a_known_noise_model() {
-        let (w, h) = (1200usize, 800usize);
+    const WB: [f32; 3] = [2.0, 1.0, 1.5];
+
+    /// An RGGB mosaic of `signal(x, y)` (unit range, unbalanced) with
+    /// Poisson-Gaussian noise of variance `a·signal + b`, estimated the way
+    /// the GPU path calls it.
+    fn estimate_synthetic(
+        (w, h): (usize, usize),
+        (a_true, b_true): (f64, f64),
+        signal: impl Fn(usize, usize) -> f64,
+    ) -> NoiseModel {
         let (white, blk) = (16383.0f64, 600.0f64);
-        // In normalised (unit-range, unbalanced) units.
-        let (a_true, b_true) = (4e-4f64, 4e-6f64);
-        let wb = [2.0f32, 1.0, 1.5];
         let colors = [0u32, 1, 1, 2];
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
         let mut mosaic = vec![0u16; w * h];
         for y in 0..h {
             for x in 0..w {
-                // Smooth ramps spanning most of the range, different per axis.
-                let signal = 0.03 + 0.85 * ((x as f64 / w as f64) * 0.7 + (y as f64 / h as f64) * 0.3);
-                let sd = (a_true * signal + b_true).sqrt();
-                let v = (signal + sd * rng.gauss()).clamp(0.0, 1.0);
+                let s = signal(x, y);
+                let sd = (a_true * s + b_true).sqrt();
+                let v = (s + sd * rng.gauss()).clamp(-0.03, 1.0);
                 mosaic[y * w + x] = (blk + v * (white - blk)).round() as u16;
             }
         }
         let black = [blk as f32; 4];
         let mut scale = [0.0f32; 4];
         for k in 0..4 {
-            scale[k] = wb[colors[k] as usize] / (white as f32 - blk as f32);
+            scale[k] = WB[colors[k] as usize] / (white as f32 - blk as f32);
         }
-        let m = estimate(&mosaic, w, h, colors, black, scale, wb);
-        // White balance multiplies values by wb: variance scales by wb²,
-        // so in balanced units a_c = wb·a and b_c = wb²·b.
-        for (c, &wbc) in wb.iter().enumerate() {
+        estimate(&mosaic, w, h, colors, black, scale, WB)
+    }
+
+    /// White balance multiplies values by wb, so variance scales by wb²: in
+    /// balanced units `a_c = wb·a` and `b_c = wb²·b`. Returns the worst
+    /// relative error of `a` and of the variance at `probe` (unit range).
+    fn errors(m: &NoiseModel, (a_true, b_true): (f64, f64), probe: f64) -> (f64, f64) {
+        let (mut ea, mut ev) = (0.0f64, 0.0f64);
+        for (c, &wbc) in WB.iter().enumerate() {
             let wbc = wbc as f64;
-            let a_exp = a_true * wbc;
-            let b_exp = b_true * wbc * wbc;
-            let a_err = (m.a[c] as f64 - a_exp).abs() / a_exp;
-            eprintln!("c{c}: a {:.3e} (expect {:.3e}), b {:.3e} (expect {:.3e})", m.a[c], a_exp, m.b[c], b_exp);
-            assert!(a_err < 0.15, "colour {c}: a off by {:.0}%", a_err * 100.0);
-            // b is small next to a·x over most of the range; only require the
-            // right order of magnitude.
-            assert!(m.b[c] as f64 <= b_exp * 4.0 + 2e-6, "colour {c}: b far too large");
+            let (a_exp, b_exp) = (a_true * wbc, b_true * wbc * wbc);
+            let x = probe * wbc;
+            let v_exp = a_exp * x + b_exp;
+            let v_est = m.a[c] as f64 * x + m.b[c] as f64;
+            eprintln!(
+                "c{c}: a {:.3e} (expect {a_exp:.3e}), b {:.3e} (expect {b_exp:.3e})",
+                m.a[c], m.b[c]
+            );
+            if a_exp > 0.0 {
+                ea = ea.max((m.a[c] as f64 - a_exp).abs() / a_exp);
+            }
+            ev = ev.max((v_est - v_exp).abs() / v_exp);
         }
+        (ea, ev)
+    }
+
+    /// Smooth content with known noise: the model must come back.
+    #[test]
+    fn recovers_a_known_noise_model() {
+        let truth = (4e-4, 4e-6);
+        let m = estimate_synthetic((1200, 800), truth, |x, y| {
+            // Smooth ramps spanning most of the range, different per axis.
+            0.03 + 0.85 * ((x as f64 / 1200.0) * 0.7 + (y as f64 / 800.0) * 0.3)
+        });
+        let (ea, ev) = errors(&m, truth, 0.05);
+        assert!(ea < 0.15, "a off by {:.0}%", ea * 100.0);
+        // b is small next to a·x over most of the range; judge it through the
+        // total variance at the dark end of the data, where it matters.
+        assert!(ev < 0.2, "shadow variance off by {:.0}%", ev * 100.0);
+    }
+
+    /// Pure read noise (no shot noise): only `b`. This is also the check on
+    /// `QUANTILE_RATIO` — a wrong constant scales every estimate.
+    #[test]
+    fn quantile_ratio_matches_pure_noise() {
+        let truth = (0.0, 2e-5);
+        let m = estimate_synthetic((1200, 800), truth, |x, _| 0.02 + 0.8 * x as f64 / 1200.0);
+        for (c, &wbc) in WB.iter().enumerate() {
+            let b_exp = truth.1 * (wbc as f64).powi(2);
+            let v = m.a[c] as f64 * 0.4 + m.b[c] as f64;
+            let err = (v - b_exp).abs() / b_exp;
+            assert!(err < 0.12, "colour {c}: variance {v:.3e}, expected {b_exp:.3e}");
+        }
+    }
+
+    /// The failure that motivated the block estimator: fine texture over
+    /// most of the frame must not be read as noise. The old median of second
+    /// differences put this scene's shadow variance several times too high.
+    #[test]
+    fn texture_does_not_inflate_the_estimate() {
+        let truth = (2.5e-4, 1e-6);
+        let (w, h) = (1600usize, 1200usize);
+        let m = estimate_synthetic((w, h), truth, |x, y| {
+            let base = 0.02 + 0.7 * (y as f64 / h as f64).powi(2);
+            // 80% of the frame carries ±40% texture with 5–9 px periods; a
+            // strip down the left is left smooth, as skies and walls are.
+            if x < w / 5 {
+                base
+            } else {
+                let t = (x as f64 * 1.3).sin() * (y as f64 * 0.7).cos() * 0.25
+                    + (x as f64 * 0.71 + y as f64 * 0.9).sin() * 0.15;
+                base * (1.0 + t)
+            }
+        });
+        let (ea, ev) = errors(&m, truth, 0.03);
+        assert!(ea < 0.3, "a off by {:.0}%", ea * 100.0);
+        assert!(ev < 0.35, "shadow variance off by {:.0}%", ev * 100.0);
     }
 
     /// The transform must actually stabilise: noise of unit variance at both

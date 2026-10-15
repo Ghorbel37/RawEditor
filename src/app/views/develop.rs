@@ -204,6 +204,28 @@ fn view_sidebar(editor: &RawEditor) -> iced::widget::Column<'_, Message> {
             1.0,
             Message::SaturationChanged,
         ))
+        .push(text("Presence").size(14))
+        .push(slider_row(
+            "Texture",
+            editor.current_edit_params.texture, d.texture,
+            -1.0..=1.0,
+            0.01,
+            Message::TextureChanged,
+        ))
+        .push(slider_row(
+            "Clarity",
+            editor.current_edit_params.clarity, d.clarity,
+            -1.0..=1.0,
+            0.01,
+            Message::ClarityChanged,
+        ))
+        .push(slider_row(
+            "Dehaze",
+            editor.current_edit_params.dehaze, d.dehaze,
+            -1.0..=1.0,
+            0.01,
+            Message::DehazeChanged,
+        ))
         .push(text("Noise Reduction").size(14))
         .push(slider_row(
             "Luminance",

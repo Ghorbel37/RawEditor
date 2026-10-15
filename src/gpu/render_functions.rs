@@ -107,6 +107,7 @@ fn encode_color_pass(
         render_pass.set_pipeline(&context.pipeline);
         render_pass.set_bind_group(0, &bindings.main, &[]);
         render_pass.set_bind_group(1, &bindings.masks, &[]);
+        render_pass.set_bind_group(2, &bindings.presence, &[]);
         render_pass.draw(0..3, 0..1);
     }
 
@@ -386,6 +387,7 @@ pub async fn render_to_bytes_16bit(
         render_pass.set_pipeline(&context.pipeline_16);
         render_pass.set_bind_group(0, &bindings.main, &[]);
         render_pass.set_bind_group(1, &bindings.masks, &[]);
+        render_pass.set_bind_group(2, &bindings.presence, &[]);
         render_pass.draw(0..3, 0..1);
     }
 

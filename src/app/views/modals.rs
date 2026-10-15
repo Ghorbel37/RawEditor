@@ -826,6 +826,7 @@ pub fn view_copy_settings_modal(editor: &RawEditor) -> Element<'_, Message> {
         ("Tone", "Exposure, contrast, highlights, shadows, whites, blacks, curves".into(), cats.tone, CopyCategory::Tone),
         ("Color", "Vibrance, saturation".into(), cats.color, CopyCategory::Color),
         ("White Balance", "Temperature, tint".into(), cats.white_balance, CopyCategory::WhiteBalance),
+        ("Presence", "Texture, clarity, dehaze".into(), cats.presence, CopyCategory::Presence),
         ("Noise Reduction", "Luminance, detail and color noise".into(), cats.noise, CopyCategory::Noise),
         ("Detail", "Sharpening and masking".into(), cats.detail, CopyCategory::Detail),
         ("Geometry & Crop", "Straighten angle and crop rectangle".into(), cats.geometry, CopyCategory::Geometry),

@@ -10,7 +10,10 @@
 pub mod brush;
 pub mod demosaic;
 pub mod denoise;
+pub mod local_contrast;
 pub mod params;
 pub mod render_functions;
 pub mod shaders;
 pub mod shared;
+#[cfg(test)]
+mod eval_tests;

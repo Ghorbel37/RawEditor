@@ -63,6 +63,9 @@ fn is_slider_change(message: &Message) -> bool {
             | Message::SaturationChanged(_)
             | Message::TemperatureChanged(_)
             | Message::TintChanged(_)
+            | Message::TextureChanged(_)
+            | Message::ClarityChanged(_)
+            | Message::DehazeChanged(_)
             | Message::LumaNoiseChanged(_)
             | Message::LumaDetailChanged(_)
             | Message::ColorNoiseChanged(_)
@@ -155,6 +158,9 @@ fn dispatch(editor: &mut RawEditor, message: Message) -> Task<Message> {
         Message::SaturationChanged(v) => handlers::develop::handle_saturation_changed(editor, v),
         Message::TemperatureChanged(v) => handlers::develop::handle_temperature_changed(editor, v),
         Message::TintChanged(v) => handlers::develop::handle_tint_changed(editor, v),
+        Message::TextureChanged(v) => handlers::develop::handle_texture_changed(editor, v),
+        Message::ClarityChanged(v) => handlers::develop::handle_clarity_changed(editor, v),
+        Message::DehazeChanged(v) => handlers::develop::handle_dehaze_changed(editor, v),
         Message::LumaNoiseChanged(v) => {
             handlers::develop::handle_luma_noise_changed(editor, v)
         }

@@ -29,12 +29,16 @@ pub struct SharedContext {
     pub bind_group_layout: wgpu::BindGroupLayout,
     /// Colour pass group 1: brush layers + mask uniforms.
     pub mask_bind_group_layout: wgpu::BindGroupLayout,
+    /// Colour pass group 2: local-contrast bands + dehaze coefficients.
+    pub presence_bind_group_layout: wgpu::BindGroupLayout,
     /// Rasterises brush strokes into mask layers (see `gpu::brush`).
     pub brush: super::brush::BrushRaster,
     /// Pass 1: RCD demosaic (reads R16Uint, writes Rgba16Float).
     pub demosaic: super::demosaic::Demosaic,
     /// Cached noise-reduction pre-pass (see `gpu::denoise`).
     pub denoise: super::denoise::Denoise,
+    /// Cached Texture/Clarity band pre-pass (see `gpu::local_contrast`).
+    pub local_contrast: super::local_contrast::LocalContrast,
     pub sampler_linear: wgpu::Sampler,
 }
 
@@ -199,14 +203,55 @@ impl SharedContext {
                 },
             ],
         });
+        let presence_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Presence Bind Group Layout"),
+            entries: &[
+                // Local-contrast bands (Rgba16Float, sampled bilinearly).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // Dehaze coefficients (Rg32Float: f16 cannot hold a and b,
+                // which nearly cancel; read with textureLoad).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // Clarity guided-filter coefficients (coarse, sampled
+                // bilinearly — the fast guided filter's upsampling).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
+        });
         let brush = super::brush::BrushRaster::new(&device);
         let demosaic = super::demosaic::Demosaic::new(&device);
         let denoise = super::denoise::Denoise::new(&device);
+        let local_contrast = super::local_contrast::LocalContrast::new(&device);
 
         // Color pipeline (Pass 2 → Rgba8Unorm canvas)
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Color Pipeline Layout"),
-            bind_group_layouts: &[&bind_group_layout, &mask_bind_group_layout],
+            bind_group_layouts: &[&bind_group_layout, &mask_bind_group_layout, &presence_bind_group_layout],
             push_constant_ranges: &[],
         });
 
@@ -281,9 +326,11 @@ impl SharedContext {
             pipeline_16,
             bind_group_layout,
             mask_bind_group_layout,
+            presence_bind_group_layout,
             brush,
             demosaic,
             denoise,
+            local_contrast,
             sampler_linear,
         })
     }
@@ -366,6 +413,13 @@ pub struct ImageResources {
     /// This image's sensor noise model, estimated at load from the mosaic as
     /// uploaded (so a box-filtered preview gets its own, lower, noise).
     pub noise_model: crate::core::noise::NoiseModel,
+    /// Dehaze airlight (analysis units, see `core::haze`), `None` when the
+    /// image was too small to analyse. Its coefficient map is `haze_view`.
+    haze_airlight: Option<[f32; 3]>,
+    /// The as-shot WB the demosaic, noise model and haze analysis work in
+    /// (green-normalised, clamped — `GpuDemosaicParams::ceil`).
+    analysis_wb: [f32; 3],
+    haze_view: wgpu::TextureView,
     pub uniform_buffer: wgpu::Buffer,
     pub width: u32,
     pub height: u32,
@@ -630,12 +684,24 @@ struct StageState {
     brush: Option<super::brush::BrushLayers>,
     /// Group 1 for the colour pass: brush layers (or the placeholder) + masks.
     masks: Arc<wgpu::BindGroup>,
+    /// Which denoise target holds the current output (when `denoise_key`).
+    denoise_out: usize,
+    /// The source the local-contrast bands were last built from, keyed by
+    /// the denoise settings that produced it (`None` = the demosaic);
+    /// `None` outside = never built.
+    local_key: Option<Option<super::denoise::DenoiseSettings>>,
+    /// Allocated the first time Texture or Clarity is used.
+    local: Option<super::local_contrast::LocalTargets>,
+    /// Group 2 for the colour pass: bands and Clarity coefficients (or
+    /// placeholders) + the dehaze map.
+    presence: Arc<wgpu::BindGroup>,
 }
 
-/// The two bind groups a colour pass needs.
+/// The bind groups a colour pass needs.
 pub struct ColorBindings {
     pub main: Arc<wgpu::BindGroup>,
     pub masks: Arc<wgpu::BindGroup>,
+    pub presence: Arc<wgpu::BindGroup>,
 }
 
 fn make_mask_bind_group(
@@ -653,9 +719,60 @@ fn make_mask_bind_group(
     })
 }
 
+fn make_presence_bind_group(
+    context: &SharedContext,
+    bands: &wgpu::TextureView,
+    haze: &wgpu::TextureView,
+    clarity: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    context.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("Presence Bind Group"),
+        layout: &context.presence_bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(bands) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(haze) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(clarity) },
+        ],
+    })
+}
+
+/// Upload a haze analysis as the colour pass's coefficient texture.
+fn haze_texture(context: &SharedContext, haze: &crate::core::haze::HazeModel) -> wgpu::TextureView {
+    let size = wgpu::Extent3d { width: haze.width as u32, height: haze.height as u32, depth_or_array_layers: 1 };
+    let texture = context.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("Dehaze coefficients"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rg32Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    context.queue.write_texture(
+        texture.as_image_copy(),
+        bytemuck::cast_slice(&haze.coeffs),
+        wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(size.width * 8), rows_per_image: None },
+        size,
+    );
+    texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
 impl StageState {
-    fn new(base: Arc<wgpu::BindGroup>, masks: Arc<wgpu::BindGroup>) -> Self {
-        Self { denoise_key: None, denoise: None, active: base, curves: None, brush_key: None, brush: None, masks }
+    fn new(base: Arc<wgpu::BindGroup>, masks: Arc<wgpu::BindGroup>, presence: Arc<wgpu::BindGroup>) -> Self {
+        Self {
+            denoise_key: None,
+            denoise: None,
+            active: base,
+            curves: None,
+            brush_key: None,
+            brush: None,
+            masks,
+            denoise_out: 0,
+            local_key: None,
+            local: None,
+            presence,
+        }
     }
 }
 
@@ -910,12 +1027,35 @@ impl ImageResources {
         );
         tracing::info!("Noise model: a={:?} b={:?}", noise_model.a, noise_model.b);
 
+        // Dehaze's slider-independent half, on the same data and units.
+        let haze = crate::core::haze::analyse(
+            &raw_data[..pixel_count],
+            width as usize,
+            height as usize,
+            super::demosaic::tile_colors(cfa_pattern),
+            demosaic_params.black,
+            demosaic_params.scale,
+        );
+        let analysis_wb = [demosaic_params.ceil[0], demosaic_params.ceil[1], demosaic_params.ceil[2]];
+        let haze_airlight = (haze != crate::core::haze::HazeModel::default()).then_some(haze.airlight);
+        if let Some(a) = haze_airlight {
+            gpu_params.set_haze(a, analysis_wb);
+            context.queue.write_buffer(&uniform_buffer, 0, bytemuck::cast_slice(&[gpu_params]));
+        }
+        let haze_view = haze_texture(context, &haze);
+        let unused = super::local_contrast::placeholder(&context.device);
+        let presence_bind_group = Arc::new(make_presence_bind_group(context, &unused, &haze_view, &unused));
+
         let resources = Self {
             texture,
             texture_view,
             debayer_texture,
             debayer_texture_view,
-            stages: std::sync::Mutex::new(StageState::new(base_bind_group.clone(), mask_bind_group)),
+            stages: std::sync::Mutex::new(StageState::new(
+                base_bind_group.clone(),
+                mask_bind_group,
+                presence_bind_group,
+            )),
             mask_buffer,
             base_bind_group,
             stage_params: std::sync::Mutex::new(*params),
@@ -923,6 +1063,9 @@ impl ImageResources {
             curve_texture,
             curve_view,
             noise_model,
+            haze_airlight,
+            analysis_wb,
+            haze_view,
             uniform_buffer,
             width,
             height,
@@ -1031,16 +1174,23 @@ impl ImageResources {
             }
             st.brush_key = Some(params.brush);
         }
-        let masks = st.masks.clone();
+        let st = &mut *st;
+        self.prepare_denoise(context, st, &params);
+        self.prepare_local_contrast(context, st, &params);
+        ColorBindings { main: st.active.clone(), masks: st.masks.clone(), presence: st.presence.clone() }
+    }
 
-        let settings = super::denoise::DenoiseSettings::from_params(&params);
+    /// Noise reduction: re-run when its settings changed, and point the
+    /// colour pass at the result (or at the demosaic when it is off).
+    fn prepare_denoise(&self, context: &SharedContext, st: &mut StageState, params: &EditParams) {
+        let settings = super::denoise::DenoiseSettings::from_params(params);
         if !settings.is_active() {
             st.denoise_key = None;
             st.active = self.base_bind_group.clone();
-            return ColorBindings { main: st.active.clone(), masks };
+            return;
         }
         if st.denoise_key == Some(settings) {
-            return ColorBindings { main: st.active.clone(), masks };
+            return;
         }
 
         if st.denoise.is_none() {
@@ -1062,17 +1212,66 @@ impl ImageResources {
             });
             st.denoise = Some((targets, groups));
         }
-        let wb = self.wb_multipliers;
-        let g = if wb[1] > 0.0 { wb[1] } else { 1.0 };
-        let wb = [(wb[0] / g).clamp(0.05, 20.0), 1.0, (wb[2] / g).clamp(0.05, 20.0)];
+        let wb = self.analysis_wb;
         let stride = self.original_width as f32 / self.width.max(1) as f32;
         let passes = super::denoise::plan(settings, &self.noise_model, wb, stride);
         if let Some((targets, groups)) = &st.denoise {
             let out = context.denoise.run(&context.device, &context.queue, targets, &passes);
             st.active = groups[out].clone();
+            st.denoise_out = out;
         }
         st.denoise_key = Some(settings);
-        ColorBindings { main: st.active.clone(), masks }
+    }
+
+    /// Texture/Clarity bands: built from whatever the colour pass reads
+    /// (so after `prepare_denoise`), and rebuilt only when that changes —
+    /// never for the Texture or Clarity sliders themselves. Left stale while
+    /// both are zero: the shader does not sample it then.
+    fn prepare_local_contrast(&self, context: &SharedContext, st: &mut StageState, params: &EditParams) {
+        if params.texture == 0.0 && params.clarity == 0.0 {
+            return;
+        }
+        let source_key = st.denoise_key;
+        if st.local_key == Some(source_key) {
+            return;
+        }
+        let size = super::local_contrast::analysis_size(self.width, self.height);
+        if st.local.is_none() {
+            st.local = Some(context.local_contrast.targets(&context.device, &context.sampler_linear, size.0, size.1));
+        }
+        let source = match (&st.denoise, source_key) {
+            (Some((targets, _)), Some(_)) => targets.view(st.denoise_out),
+            _ => &self.debayer_texture_view,
+        };
+        if let Some(targets) = &st.local {
+            let out = context.local_contrast.run(
+                &context.device,
+                &context.queue,
+                &context.sampler_linear,
+                targets,
+                source,
+                self.local_luma_weights(),
+                size,
+            );
+            st.presence = Arc::new(make_presence_bind_group(
+                context,
+                targets.view(out.bands),
+                &self.haze_view,
+                targets.coarse_view(out.clarity),
+            ));
+        }
+        st.local_key = Some(source_key);
+    }
+
+    /// Camera RGB → luma weights for the local-contrast bands, with the
+    /// as-shot WB folded in, and the log floor in `w`: a few σ of this
+    /// image's read noise, so that in log space the noise floor reads as
+    /// flat black rather than as wildly contrasty structure.
+    fn local_luma_weights(&self) -> [f32; 4] {
+        let k = [0.25f32, 0.5, 0.25];
+        let wb = self.analysis_wb;
+        let read_var: f32 = (0..3).map(|c| k[c] * k[c] * self.noise_model.b[c]).sum();
+        [k[0] * wb[0], k[1] * wb[1], k[2] * wb[2], (3.0 * read_var.sqrt()).max(1.0 / 4096.0)]
     }
 
     /// Display-space dimensions of the working (possibly subsampled) texture:
@@ -1192,6 +1391,9 @@ impl ImageResources {
             self.original_height,
         ));
         gpu_params.set_defringe_radius(self.original_width as f32 / self.width.max(1) as f32);
+        if let Some(a) = self.haze_airlight {
+            gpu_params.set_haze(a, self.analysis_wb);
+        }
 
         context
             .queue
