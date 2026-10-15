@@ -456,7 +456,7 @@ fn presence_matches_between_preview_and_export() {
 
 /// Luma of an RGBA render, as f32.
 fn luma_plane(img: &[u8]) -> Vec<f32> {
-    img.chunks_exact(4).map(|p| 0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32).collect()
+    img.as_chunks::<4>().0.iter().map(|p| 0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32).collect()
 }
 
 /// Box blur of radius `r` (clamped window), via an integral image.
