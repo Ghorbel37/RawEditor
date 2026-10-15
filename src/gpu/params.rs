@@ -116,9 +116,11 @@ pub struct GpuEditParams {
     pub view_rect: [f32; 4],
     pub black_levels: [u32; 4],
     pub white_level: u32,
-    _pad_end_1: f32,
-    _pad_end_2: f32,
-    _pad_end_3: f32,
+    /// Highlight-reconstruction correction `(k_r, k_g, k_b)`, CAMERA-NATIVE
+    /// (`core::highlights`; the shader converts it to the current WB). Three
+    /// former pad slots — no offset moved. Filled per image by
+    /// `set_highlights`.
+    highlight_k: [f32; 3],
     black_offsets: [f32; 4],
     black_phase_x: u32,
     black_phase_y: u32,
@@ -193,6 +195,12 @@ impl GpuEditParams {
         self.lens_vig = [g.vig[0], g.vig[1], g.vig[2], g.inv_corner];
     }
 
+    /// The highlight-reconstruction correction of `core::highlights`,
+    /// already camera-native.
+    pub fn set_highlights(&mut self, correction: [f32; 3]) {
+        self.highlight_k = correction;
+    }
+
     /// The dehaze airlight, given in the analysis space of `core::haze`
     /// (white-balanced by `analysis_wb`); stored camera-native.
     pub fn set_haze(&mut self, airlight: [f32; 3], analysis_wb: [f32; 3]) {
@@ -243,9 +251,7 @@ impl From<&EditParams> for GpuEditParams {
             view_rect: FULL_VIEW_RECT,
             black_levels: [0, 0, 0, 0],
             white_level: 65535,
-            _pad_end_1: 0.0,
-            _pad_end_2: 0.0,
-            _pad_end_3: 0.0,
+            highlight_k: [0.0; 3],
             black_offsets: params.black_offsets,
             black_phase_x: params.black_phase_x,
             black_phase_y: params.black_phase_y,

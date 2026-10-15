@@ -420,6 +420,8 @@ pub struct ImageResources {
     /// (green-normalised, clamped — `GpuDemosaicParams::ceil`).
     analysis_wb: [f32; 3],
     haze_view: wgpu::TextureView,
+    /// Highlight-reconstruction correction (`core::highlights`), camera-native.
+    highlight_correction: [f32; 3],
     pub uniform_buffer: wgpu::Buffer,
     pub width: u32,
     pub height: u32,
@@ -1040,9 +1042,25 @@ impl ImageResources {
         let haze_airlight = (haze != crate::core::haze::HazeModel::default()).then_some(haze.airlight);
         if let Some(a) = haze_airlight {
             gpu_params.set_haze(a, analysis_wb);
-            context.queue.write_buffer(&uniform_buffer, 0, bytemuck::cast_slice(&[gpu_params]));
         }
         let haze_view = haze_texture(context, &haze);
+
+        // Highlight reconstruction's per-image half: the colour clipped
+        // highlights are rebuilt in, learned from their unclipped rims.
+        let highlights = crate::core::highlights::analyse(
+            &raw_data[..pixel_count],
+            width as usize,
+            height as usize,
+            super::demosaic::tile_colors(cfa_pattern),
+            demosaic_params.black,
+            demosaic_params.scale,
+            analysis_wb,
+        );
+        let highlight_correction = highlights.correction;
+        gpu_params.set_highlights(highlight_correction);
+        // Both analyses ride the uniform; it was uploaded before them.
+        context.queue.write_buffer(&uniform_buffer, 0, bytemuck::cast_slice(&[gpu_params]));
+
         let unused = super::local_contrast::placeholder(&context.device);
         let presence_bind_group = Arc::new(make_presence_bind_group(context, &unused, &haze_view, &unused));
 
@@ -1066,6 +1084,7 @@ impl ImageResources {
             haze_airlight,
             analysis_wb,
             haze_view,
+            highlight_correction,
             uniform_buffer,
             width,
             height,
@@ -1394,6 +1413,7 @@ impl ImageResources {
         if let Some(a) = self.haze_airlight {
             gpu_params.set_haze(a, self.analysis_wb);
         }
+        gpu_params.set_highlights(self.highlight_correction);
 
         context
             .queue

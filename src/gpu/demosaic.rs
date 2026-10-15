@@ -177,12 +177,19 @@ fn fc(p: vec2<i32>) -> u32 {
     return (dp.colors >> (2u * tile(p))) & 3u;
 }
 
-// White-balanced, unit-range mosaic sample.
+// White-balanced, unit-range mosaic sample, capped at its colour's ceiling.
+// Sensors can read past the metadata white level (a Nikon D3300 piles its
+// clipped photosites up at 4095 against a white of 3880): left uncapped,
+// clipped native sites sat ~6% above the interpolated ones, which ARE
+// capped, so a blown area held a mosaic pattern and its clipped channels
+// read brighter than their ceiling — biasing highlight reconstruction
+// towards whichever channel overshot.
 fn cfa(p: vec2<i32>) -> f32 {
     let q = mirror(p);
     let raw = f32(textureLoad(raw_tex, q, 0).r);
     let k = tile(q);
-    return max(raw - dp.black[k], 0.0) * dp.scale[k];
+    let colour = (dp.colors >> (2u * k)) & 3u;
+    return min(max(raw - dp.black[k], 0.0) * dp.scale[k], dp.ceil[colour]);
 }
 
 fn dirs(p: vec2<i32>) -> vec4<f32> {
