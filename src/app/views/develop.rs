@@ -641,28 +641,24 @@ fn view_main_content<'a>(
                 // Without a badge there is nothing distinguishing "the original"
                 // from "an edit that did nothing" — which is a fair part of why
                 // the old before/after went unnoticed after it broke.
-                // It drops in on a lively spring, so the switch to the
-                // original registers even out of the corner of an eye.
+                // Deliberately not animated: a before/after comparison is
+                // only as good as its switch is instant.
                 let badge: Element<'_, Message> = if peeking {
                     container(
-                        entrance(
-                            container(
-                                text("BEFORE")
-                                    .size(11)
-                                    .font(Font { weight: Weight::Bold, ..Default::default() })
-                                    .style(|_theme| text::Style { color: Some(Color::WHITE) }),
-                            )
-                            .padding([4, 10])
-                            .style(|_theme| container::Style {
-                                background: Some(Background::Color(Color::from_rgb(
-                                    0.98, 0.45, 0.09,
-                                ))),
-                                border: Border { radius: 3.0.into(), ..Default::default() },
-                                ..Default::default()
-                            }),
+                        container(
+                            text("BEFORE")
+                                .size(11)
+                                .font(Font { weight: Weight::Bold, ..Default::default() })
+                                .style(|_theme| text::Style { color: Some(Color::WHITE) }),
                         )
-                        .starting_scale(0.8)
-                        .starting_offset(0.0, -8.0),
+                        .padding([4, 10])
+                        .style(|_theme| container::Style {
+                            background: Some(Background::Color(Color::from_rgb(
+                                0.98, 0.45, 0.09,
+                            ))),
+                            border: Border { radius: 3.0.into(), ..Default::default() },
+                            ..Default::default()
+                        }),
                     )
                     .width(Length::Fill)
                     .height(Length::Fill)
@@ -694,8 +690,7 @@ fn view_main_content<'a>(
         iced::widget::Space::new(Length::Fill, Length::Fill).into()
     };
 
-    // The `I` panels slide down into place; cycling between them keeps the
-    // same widget, so only the first appearance animates.
+    // Instant, like the BEFORE badge: an info toggle is a glance.
     let overlay: Element<'_, Message> = match editor.info_overlay {
         crate::app::state::InfoOverlayState::Hidden => container(column![]).into(),
         // Cache debug: what the loader is actually holding. Previously this
@@ -718,7 +713,7 @@ fn view_main_content<'a>(
                 })
                 .unwrap_or("no selection");
 
-            info_entrance(info_panel(
+            info_panel(
                 column![
                     text("CACHE").size(12).style(|_| text::Style {
                         color: Some(Color::from_rgb(0.98, 0.45, 0.09))
@@ -749,7 +744,8 @@ fn view_main_content<'a>(
                 ]
                 .spacing(2)
                 .into(),
-            ))
+            )
+            .into()
         }
         crate::app::state::InfoOverlayState::Metadata => {
             let mut lines = column![
@@ -764,7 +760,7 @@ fn view_main_content<'a>(
             for line in metadata_lines(editor) {
                 lines = lines.push(info_line(line));
             }
-            info_entrance(info_panel(lines.into()))
+            info_panel(lines.into()).into()
         }
     };
 
@@ -1361,10 +1357,6 @@ fn info_panel<'a>(body: Element<'a, Message>) -> Container<'a, Message> {
             },
             ..Default::default()
         })
-}
-
-fn info_entrance<'a>(panel: Container<'a, Message>) -> Element<'a, Message> {
-    entrance(panel).starting_scale(0.97).starting_offset(0.0, -6.0).into()
 }
 
 /// Camera / lens / exposure lines for the `I` overlay, shared with Cull.

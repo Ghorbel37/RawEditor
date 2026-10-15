@@ -534,10 +534,11 @@ pub fn resolve_context(
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GpuLens {
     pub active: bool,
-    /// Sensor UV offset from centre → calibration units, including the
-    /// constrain scale. Per axis because UV is not isotropic.
+    /// Sensor UV offset from centre → calibration units. Per axis because
+    /// UV is not isotropic.
     pub scale: [f32; 2],
-    /// `r_d / r_u = p0 + p1 r + p2 r² + p3 r³ + p4 r⁴`.
+    /// `r_d / r_u = p0 + p1 r + p2 r² + p3 r³ + p4 r⁴`, with the constrain
+    /// zoom folded in (see `gpu_params`).
     pub dist: [f32; 5],
     /// Red and blue: `r_c / r_d = v + c r + b r²`.
     pub tca_r: [f32; 3],
@@ -633,7 +634,22 @@ pub fn gpu_params(ctx: &LensContext, p: &LensParams, sensor_w: u32, sensor_h: u3
     tca_b[0] *= 1.0 + p.ca_blue.clamp(-1.0, 1.0) * MANUAL_CA;
 
     let geometric = dist != [1.0, 0.0, 0.0, 0.0, 0.0];
-    let scale = if p.constrain && geometric { constrain_scale(&dist, base) } else { 1.0 };
+    let zoom = if p.constrain && geometric { constrain_scale(&dist, base) } else { 1.0 };
+    // The zoom goes into the polynomial, not the UV scale. Zooming the
+    // output by `s` means sampling `(p/s)·f(|p|/s)`; the shader evaluates
+    // `p·f'(|p|)` and converts back to UV with the same scale it came in
+    // by, so a zoom folded into that scale cancels on the way out (which is
+    // how Constrain once did nothing). Folding it in here instead:
+    // f'(r) = f(r/s)/s, i.e. d'ₖ = dₖ / s^(k+1).
+    let dist = {
+        let mut zoomed = dist;
+        let mut s_pow = zoom;
+        for d in &mut zoomed {
+            *d /= s_pow;
+            s_pow *= zoom;
+        }
+        zoomed
+    };
 
     let active = geometric
         || tca_r != [1.0, 0.0, 0.0]
@@ -643,14 +659,14 @@ pub fn gpu_params(ctx: &LensContext, p: &LensParams, sensor_w: u32, sensor_h: u3
 
     GpuLens {
         active,
-        scale: [base[0] / scale, base[1] / scale],
+        scale: base,
         dist,
         tca_r,
         tca_b,
         vig,
         vig_ratio: hugin_mm / vig_mm,
         manual_vig: p.vignetting.clamp(-1.0, 1.0),
-        inv_corner: scale / corner,
+        inv_corner: 1.0 / corner,
     }
 }
 
@@ -672,7 +688,9 @@ fn constrain_scale(dist: &[f32; 5], base: [f32; 2]) -> f32 {
         border.iter().all(|&(x, y)| {
             let (px, py) = (x / s, y / s);
             let f = poly(dist, px.hypot(py));
-            (px * f).abs() <= hx * 1.0005 && (py * f).abs() <= hy * 1.0005
+            // A hair inside rather than on the edge: a sample exactly at
+            // it is one float error from a black pixel.
+            (px * f).abs() <= hx * (1.0 - 1e-5) && (py * f).abs() <= hy * (1.0 - 1e-5)
         })
     };
     let (mut lo, mut hi) = (0.5f32, 2.0f32);
@@ -823,6 +841,100 @@ mod tests {
         // UV half-height (0.5) maps to radius 1.
         assert!((0.5 * g.scale[1] - 1.0).abs() < 1e-3, "{:?}", g.scale);
         assert!((0.5 * g.scale[0] - 1.5).abs() < 1e-3);
+    }
+
+    /// Where the colour shader's Step 0 samples the source for output UV
+    /// `uv` (green channel), computed from the same `GpuLens` fields the
+    /// shader reads. Kept line for line with `shaders.rs`: the bug this
+    /// guards against was a mismatch between what `gpu_params` assumed the
+    /// shader did and what it does.
+    fn shader_source_uv(g: &GpuLens, uv: [f32; 2]) -> [f32; 2] {
+        let p = [(uv[0] - 0.5) * g.scale[0], (uv[1] - 0.5) * g.scale[1]];
+        let ru = p[0].hypot(p[1]);
+        let f = poly(&g.dist, ru);
+        let pd = [p[0] * f, p[1] * f];
+        [pd[0] / g.scale[0] + 0.5, pd[1] / g.scale[1] + 0.5]
+    }
+
+    /// Output UVs all the way round the frame's edge.
+    fn output_border() -> Vec<[f32; 2]> {
+        (0..=64)
+            .flat_map(|i| {
+                let t = i as f32 / 64.0;
+                [[t, 0.0], [t, 1.0], [0.0, t], [1.0, t]]
+            })
+            .collect()
+    }
+
+    fn inside(uv: [f32; 2]) -> bool {
+        (0.0..=1.0).contains(&uv[0]) && (0.0..=1.0).contains(&uv[1])
+    }
+
+    /// The point of Constrain, end to end through the shader's own mapping:
+    /// a correction that pulls the frame's edges inwards leaves empty
+    /// borders without it, and none with it.
+    #[test]
+    fn constrain_leaves_no_empty_border_in_the_shader() {
+        let ctx = LensContext::default();
+        // Manual distortion −1 undoes pincushion: edges sample from further
+        // out than the frame has.
+        for distortion in [-1.0f32, -0.4] {
+            let off = gpu_params(
+                &ctx,
+                &LensParams { distortion, constrain: false, ..Default::default() },
+                6000,
+                4000,
+            );
+            assert!(
+                output_border().iter().any(|&uv| !inside(shader_source_uv(&off, uv))),
+                "test needs a correction that leaves empty borders"
+            );
+            let on = gpu_params(
+                &ctx,
+                &LensParams { distortion, constrain: true, ..Default::default() },
+                6000,
+                4000,
+            );
+            for uv in output_border() {
+                let src = shader_source_uv(&on, uv);
+                assert!(inside(src), "distortion {distortion}: border {uv:?} samples {src:?}");
+            }
+            // And it zooms no further than it has to: some border point
+            // lands on the source's edge.
+            let tightest = output_border()
+                .iter()
+                .map(|&uv| {
+                    let s = shader_source_uv(&on, uv);
+                    s[0].min(1.0 - s[0]).min(s[1]).min(1.0 - s[1])
+                })
+                .fold(f32::MAX, f32::min);
+            assert!(tightest < 1e-3, "over-zoomed: closest border sample {tightest} from the edge");
+        }
+    }
+
+    /// Barrel-correcting pulls nothing in from outside, and constraining it
+    /// zooms *out* to use the frame the correction would otherwise discard.
+    #[test]
+    fn constrain_on_a_barrel_correction_reveals_more_without_borders() {
+        let ctx = LensContext::default();
+        let on = gpu_params(
+            &ctx,
+            &LensParams { distortion: 1.0, constrain: true, ..Default::default() },
+            6000,
+            4000,
+        );
+        let off = gpu_params(
+            &ctx,
+            &LensParams { distortion: 1.0, constrain: false, ..Default::default() },
+            6000,
+            4000,
+        );
+        for uv in output_border() {
+            assert!(inside(shader_source_uv(&on, uv)), "border {uv:?}");
+        }
+        // The corner reaches further into the source than without.
+        let reach = |g: &GpuLens| (shader_source_uv(g, [0.0, 0.0])[0] - 0.5).abs();
+        assert!(reach(&on) > reach(&off) + 1e-3, "on {} off {}", reach(&on), reach(&off));
     }
 
     /// Constrain must leave every border point inside the source.
