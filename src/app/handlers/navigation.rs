@@ -362,23 +362,17 @@ pub fn handle_zoom(editor: &mut RawEditor, d: f32, mut p: Point) -> Task<Message
     }
     editor.canvas_cache.clear();
 
-    // Re-render at zoom-appropriate resolution, and upgrade to full-res debayer
-    // when the user zooms in past the subsampled texture's useful range.
+    // Re-render at zoom-appropriate resolution (which upgrades to the full-res
+    // debayer once the subsampled texture is past its useful range).
     use crate::app::state::EditorReadiness;
     if editor.current_tab == AppTab::Develop
         && matches!(editor.editor_readiness, EditorReadiness::Ready(_))
     {
         // Zoom always re-renders: the window and its resolution both change.
         // Throttled so a stream of scroll events can't pile up GPU tasks.
-        let render_task = throttled_render(editor);
-
-        let upgrade_task = if editor.zoom > 1.5 {
-            crate::app::handlers::loading::trigger_full_res_upgrade(editor)
-        } else {
-            Task::none()
-        };
-
-        return Task::batch(vec![render_task, upgrade_task]);
+        // The render itself asks for full resolution once the view needs it
+        // (`develop::trigger_async_render`).
+        return throttled_render(editor);
     }
     Task::none()
 }
@@ -782,7 +776,10 @@ fn apply_mask_drag(editor: &mut RawEditor, pos: Point, last: Point, h: MaskHandl
 
 fn trigger_image_load(editor: &mut RawEditor, image_id: i64) -> Task<Message> {
     editor.working_preview = None;
-    editor.full_res_upgrading = false;
+    // `full_res_upgrading` is deliberately NOT reset: an upgrade of the
+    // previous image may still be building, and starting this one's
+    // alongside it would hold two full-size working sets. Its result
+    // releases the guard and re-checks this image (`handle_full_res_ready`).
     let develop = editor.current_tab == AppTab::Develop;
     if develop {
         // The outgoing image's GPU resources and render must not stay on

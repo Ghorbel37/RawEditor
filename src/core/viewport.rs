@@ -97,6 +97,66 @@ pub fn visible_view_rect(
     [gu0, gv0, gu1 - gu0, gv1 - gv0]
 }
 
+/// Magnification past which a subsampled develop texture reads as soft, and
+/// the full-resolution rebuild is requested: the screen would draw each of
+/// its source pixels this much larger than one physical pixel. A little
+/// above 1, so a fit view that is a hair larger than the preview does not
+/// pay for a full-resolution build.
+pub const FULL_RES_MAGNIFICATION: f32 = 1.15;
+
+/// What a develop render of the current view needs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RenderTarget {
+    /// The slice of the displayed image to render (`visible_view_rect`).
+    pub view_rect: [f32; 4],
+    /// Target size in pixels: the slice's on-screen physical size, never
+    /// past 1:1 with the source — beyond that there is no detail to resolve.
+    pub width: u32,
+    pub height: u32,
+    /// Physical screen pixels per source pixel across the slice. Above 1 the
+    /// source holds fewer pixels than the screen shows: the render is
+    /// upsampled, and soft.
+    pub magnification: f32,
+}
+
+/// The render target for an `image_w`×`image_h` source (the develop
+/// texture's oriented, crop-aware dims) shown at `zoom`/`offset` in a
+/// `vp_w`×`vp_h` logical viewport on a `scale_factor` display.
+/// `whole_image` renders everything regardless of the view (crop mode,
+/// where the shader reveals the full sensor and zoom/pan are disabled).
+#[allow(clippy::too_many_arguments)]
+pub fn render_target(
+    image_w: u32,
+    image_h: u32,
+    vp_w: f32,
+    vp_h: f32,
+    zoom: f32,
+    offset: cgmath::Vector2<f32>,
+    scale_factor: f32,
+    whole_image: bool,
+) -> RenderTarget {
+    let view_rect = if whole_image {
+        [0.0, 0.0, 1.0, 1.0]
+    } else {
+        visible_view_rect(image_w, image_h, vp_w, vp_h, zoom, offset, RENDER_OVERSCAN)
+    };
+    let ib = image_rect(image_w, image_h, vp_w, vp_h, zoom, offset);
+    // On-screen size of the window, in physical pixels — the resolution it
+    // will actually be displayed at.
+    let screen_w = (view_rect[2] * ib.width * scale_factor).round();
+    let screen_h = (view_rect[3] * ib.height * scale_factor).round();
+    // Source pixels the window spans. `image_w`/`image_h` already account for
+    // the crop, so the window simply spans `view_rect` of them.
+    let source_w = (view_rect[2] * image_w as f32).max(1.0);
+    let source_h = (view_rect[3] * image_h as f32).max(1.0);
+    RenderTarget {
+        view_rect,
+        width: (screen_w.min(source_w).round() as u32).clamp(16, 16384),
+        height: (screen_h.min(source_h).round() as u32).clamp(16, 16384),
+        magnification: (screen_w / source_w).max(screen_h / source_h),
+    }
+}
+
 /// True when `inner` lies entirely within `outer` (both `(u0, v0, du, dv)`).
 ///
 /// Used after a pan to decide whether the already-rendered window still covers
@@ -162,6 +222,55 @@ mod tests {
 
     fn no_offset() -> cgmath::Vector2<f32> {
         cgmath::Vector2::new(0.0, 0.0)
+    }
+
+    // ── render_target ────────────────────────────────────────────────────────
+
+    // A 24 MP frame's develop preview (6016 px subsampled by 3) and the full
+    // resolution, in a 1500×1000 viewport.
+    const PREVIEW: (u32, u32) = (2005, 1338);
+    const FULL: (u32, u32) = (6016, 4016);
+
+    fn target(src: (u32, u32), zoom: f32, scale: f32) -> RenderTarget {
+        render_target(src.0, src.1, 1500.0, 1000.0, zoom, no_offset(), scale, false)
+    }
+
+    #[test]
+    fn the_preview_is_sharp_at_fit_on_a_standard_display() {
+        let t = target(PREVIEW, 1.0, 1.0);
+        assert!(t.magnification < 1.0, "{t:?}");
+        assert!(t.magnification < FULL_RES_MAGNIFICATION);
+    }
+
+    #[test]
+    fn zooming_in_on_the_preview_wants_full_resolution() {
+        // Zoomed in, the screen spans far fewer preview pixels than physical
+        // ones: the render can only upsample. This is what stayed blurry.
+        let t = target(PREVIEW, 3.0, 1.0);
+        assert!(t.magnification > 2.0, "{t:?}");
+        // The target is still clamped to what the source holds.
+        assert!(t.width as f32 <= t.view_rect[2] * PREVIEW.0 as f32 + 1.0, "{t:?}");
+    }
+
+    #[test]
+    fn a_hidpi_display_wants_full_resolution_even_at_fit() {
+        // 1500 logical px at 2× is 3000 physical: more than the preview has.
+        assert!(target(PREVIEW, 1.0, 2.0).magnification > FULL_RES_MAGNIFICATION);
+    }
+
+    #[test]
+    fn full_resolution_is_sharp_until_past_one_to_one() {
+        assert!(target(FULL, 3.0, 1.0).magnification < FULL_RES_MAGNIFICATION);
+        // Past 1:1 there is nothing more to fetch; the target stops growing.
+        let deep = target(FULL, 8.0, 1.0);
+        assert!(deep.magnification > 1.0);
+        assert!(deep.width as f32 <= deep.view_rect[2] * FULL.0 as f32 + 1.0, "{deep:?}");
+    }
+
+    #[test]
+    fn crop_mode_renders_the_whole_image() {
+        let t = render_target(PREVIEW.0, PREVIEW.1, 1500.0, 1000.0, 1.0, no_offset(), 1.0, true);
+        assert_eq!(t.view_rect, [0.0, 0.0, 1.0, 1.0]);
     }
 
     // ── visible_view_rect ────────────────────────────────────────────────────

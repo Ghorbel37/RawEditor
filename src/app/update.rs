@@ -366,6 +366,7 @@ fn dispatch(editor: &mut RawEditor, message: Message) -> Task<Message> {
         Message::ImageResourcesReady(id, res) => {
             handlers::loading::handle_image_resources_ready(editor, id, res)
         }
+        Message::FullResReady(id, res) => handlers::loading::handle_full_res_ready(editor, id, res),
 
         // Scroll boost + filmstrip momentum
         Message::WheelScrolled(delta) => handlers::scroll::handle_wheel(editor, delta),
