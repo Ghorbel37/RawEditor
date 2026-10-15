@@ -530,3 +530,41 @@ fn presence_moves_its_own_band() {
         assert!(tf_neg < 0.95, "negative texture did not smooth fine detail");
     });
 }
+
+/// Lens Constrain through the real shader: a correction that pulls the
+/// frame's edges inwards leaves black borders without it, and none with it.
+/// (The CPU-side tests in `core::lens` mirror the shader's mapping; this is
+/// the check that the mirror and the shader agree.)
+#[test]
+#[ignore]
+fn lens_constrain_leaves_no_black_border() {
+    use crate::core::lens::LensParams;
+    let scene = Scene::default_scene(800);
+    let data = mosaic(&scene, 0.0, 0.0, 1);
+    // Pixels on the outermost ring that the shader blanked (exact black: the
+    // scene itself has no pure-black pixels).
+    let black_border = |img: &[u8], w: u32, h: u32| {
+        let px = |x: u32, y: u32| {
+            let i = ((y * w + x) * 4) as usize;
+            img[i] as u32 + img[i + 1] as u32 + img[i + 2] as u32 == 0
+        };
+        let horizontal = (0..w).filter(|&x| px(x, 0) || px(x, h - 1)).count();
+        let vertical = (0..h).filter(|&y| px(0, y) || px(w - 1, y)).count();
+        horizontal + vertical
+    };
+    runtime().block_on(async {
+        let ctx = SharedContext::new().await.expect("gpu");
+        for distortion in [-1.0f32, -0.4] {
+            let params = |constrain| EditParams {
+                lens: LensParams { distortion, constrain, ..LensParams::default() },
+                ..EditParams::default()
+            };
+            let (off, w, h) = render(&ctx, &data, scene.w, scene.h, &params(false), None).await;
+            let (on, _, _) = render(&ctx, &data, scene.w, scene.h, &params(true), None).await;
+            let (b_off, b_on) = (black_border(&off, w, h), black_border(&on, w, h));
+            eprintln!("distortion {distortion}: black border px without constrain {b_off}, with {b_on}");
+            assert!(b_off > 0, "the correction should leave borders to remove");
+            assert_eq!(b_on, 0, "Constrain left {b_on} black border pixels");
+        }
+    });
+}

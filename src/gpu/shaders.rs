@@ -616,7 +616,9 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // the SOURCE position it comes from (core::lens): geometry first, then
     // per-channel lateral CA on the distorted coordinate, exactly as lensfun's
     // models are defined. `lens_misc.yz` takes a UV offset from centre into
-    // the profile's calibration units (constrain zoom folded in).
+    // the profile's calibration units; the Constrain zoom is folded into the
+    // polynomial on the CPU (core::lens::gpu_params), since a zoom in this
+    // scale would cancel when converting back.
     var uv_r = tex_coords;
     var uv_b = tex_coords;
     var lens_gain = 1.0;
