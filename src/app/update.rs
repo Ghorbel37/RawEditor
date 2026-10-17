@@ -315,6 +315,11 @@ fn dispatch(editor: &mut RawEditor, message: Message) -> Task<Message> {
         Message::ImportFolderPicked(r) => handlers::library::handle_import_folder_picked(editor, r),
         Message::CheckForUpdates => handlers::window::handle_check_for_updates(editor),
         Message::OpenRepository => handlers::window::handle_open_repository(editor),
+        Message::OpenLink(url) => handlers::window::handle_open_link(editor, url),
+        Message::SetPreferencesSection(section) => {
+            handlers::window::handle_set_preferences_section(editor, section)
+        }
+        Message::OpenAppFolder(folder) => handlers::window::handle_open_app_folder(editor, folder),
         Message::ToggleInfoHud => handlers::window::handle_toggle_info_hud(editor),
         Message::SetThumbnailSize(s) => handlers::window::handle_set_thumbnail_size(editor, s),
         Message::SetCacheCapacity(c) => handlers::window::handle_set_cache_capacity(editor, c),

@@ -40,11 +40,7 @@ pub fn init() -> Option<WorkerGuard> {
     #[cfg(not(debug_assertions))]
     {
         // Release mode: Write to rolling log files
-        let Some(data_dir) = dirs::data_dir() else {
-            eprintln!("Failed to find data directory for logging!");
-            return None;
-        };
-        let log_dir = data_dir.join("raw-editor").join("logs");
+        let log_dir = crate::core::paths::data_dir().join("logs");
         // Before `build`: its old-file pruning lists the directory first, and
         // complains on stderr when it does not exist yet (first launch).
         if let Err(e) = std::fs::create_dir_all(&log_dir) {

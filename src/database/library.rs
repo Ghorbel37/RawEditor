@@ -74,13 +74,7 @@ impl Library {
 
     /// Get the path where the database should be stored
     pub fn get_db_path() -> PathBuf {
-        let mut path = dirs::data_dir()
-            .or_else(dirs::home_dir)
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
-
-        path.push("raw-editor");
-        path.push("raw_editor.db");
-        path
+        crate::core::paths::data_dir().join("raw_editor.db")
     }
 
     /// Initialize the database schema.
@@ -637,9 +631,7 @@ fn load_database_blocking() -> Result<Vec<super::models::Image>, String> {
     let lib = Library::new().map_err(|e| format!("Failed to initialize library: {e}"))?;
     if lib.migrate_cache_version().unwrap_or(false) {
         for tier in ["thumb", "instant", "working"] {
-            if let Some(mut dir) = dirs::cache_dir() {
-                dir.push("raw-editor");
-                dir.push(tier);
+            if let Some(dir) = crate::core::paths::cache_dir().map(|d| d.join(tier)) {
                 if let Err(e) = std::fs::remove_dir_all(&dir) {
                     tracing::warn!("Could not clear stale cache tier {tier}: {e}");
                 }

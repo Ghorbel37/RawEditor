@@ -518,11 +518,7 @@ pub fn load_profile_for_camera(make: &str, model: &str) -> Option<std::sync::Arc
 }
 
 pub fn find_profile_for_camera(_make: &str, model: &str) -> Option<PathBuf> {
-    let base = dirs::data_dir()
-        .or_else(dirs::home_dir)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("raw-editor")
-        .join("profiles");
+    let base = crate::core::paths::profiles_dir();
 
     let model_lower = model.to_lowercase();
     let model_nospace = model_lower.replace(' ', "");
@@ -555,11 +551,7 @@ mod tests {
     /// all genuine Adobe profiles use.
     #[test]
     fn parse_installed_profiles() {
-        let base = dirs::data_dir()
-            .or_else(dirs::home_dir)
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("raw-editor")
-            .join("profiles");
+        let base = crate::core::paths::profiles_dir();
 
         let Ok(entries) = std::fs::read_dir(&base) else {
             eprintln!("no profiles dir at {base:?}, skipping");
@@ -598,7 +590,7 @@ mod curve_debug {
 
     #[test]
     fn dump_installed_curve() {
-        let base = dirs::data_dir().unwrap().join("raw-editor").join("profiles");
+        let base = crate::core::paths::profiles_dir();
         let Ok(entries) = std::fs::read_dir(&base) else { return };
         for e in entries.flatten() {
             let p = e.path();

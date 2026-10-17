@@ -104,12 +104,7 @@ impl AppSettings {
     }
 
     pub fn settings_path() -> PathBuf {
-        let mut path = dirs::data_dir()
-            .or_else(dirs::home_dir)
-            .unwrap_or_else(|| PathBuf::from("."));
-        path.push("raw-editor");
-        path.push("settings.json");
-        path
+        crate::core::paths::data_dir().join("settings.json")
     }
 }
 

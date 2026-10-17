@@ -394,6 +394,13 @@ pub enum Message {
     CheckForUpdates,
     /// Open the project page in the default browser.
     OpenRepository,
+    /// Open a URL in the default browser (Preferences › Licenses).
+    OpenLink(&'static str),
+    /// Preferences side menu: show this page.
+    SetPreferencesSection(crate::app::state::PreferencesSection),
+    /// Preferences › Folders: reveal one of RawEditor's folders in the
+    /// system file manager.
+    OpenAppFolder(crate::core::paths::AppFolder),
     /// Enter pressed — routed to whichever modal is open.
     ///
     /// `subscription()` can only emit ONE message per key event, so Enter

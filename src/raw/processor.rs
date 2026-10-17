@@ -43,11 +43,9 @@ const TIER_WORKING: u32 = 1280;
 
 /// `~/.cache/raw-editor/<tier>`, created if missing.
 pub fn cache_dir(tier_name: &str) -> Result<PathBuf, String> {
-    let mut path = dirs::cache_dir()
-        .or_else(dirs::home_dir)
-        .ok_or_else(|| "Could not determine cache directory".to_string())?;
-    path.push("raw-editor");
-    path.push(tier_name);
+    let path = crate::core::paths::cache_dir()
+        .ok_or_else(|| "Could not determine cache directory".to_string())?
+        .join(tier_name);
     fs::create_dir_all(&path)
         .map_err(|e| format!("Failed to create {} cache directory: {}", tier_name, e))?;
     Ok(path)

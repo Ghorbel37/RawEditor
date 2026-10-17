@@ -82,6 +82,31 @@ pub enum Modal {
     RemoveFolder,
 }
 
+/// The pages of the Preferences side menu, in menu order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PreferencesSection {
+    #[default]
+    General,
+    Performance,
+    Memory,
+    Folders,
+    Licenses,
+}
+
+impl PreferencesSection {
+    pub const ALL: [PreferencesSection; 5] = [
+        PreferencesSection::General,
+        PreferencesSection::Performance,
+        PreferencesSection::Memory,
+        PreferencesSection::Folders,
+        PreferencesSection::Licenses,
+    ];
+
+    pub fn index(self) -> usize {
+        Self::ALL.iter().position(|&s| s == self).unwrap_or(0)
+    }
+}
+
 /// A modal on its way out: which one, and a token so a timer from an earlier
 /// close can't cut a later one short.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,6 +289,9 @@ pub struct RawEditor {
     /// Preferences › Reduce motion: every animation jumps to its end state.
     /// Mirrored into `ui::motion::set_reduced`, which the widgets read.
     pub reduce_motion: bool,
+    /// The page Preferences shows. Kept while the app runs, so reopening the
+    /// dialog lands where the user left it; not persisted.
+    pub preferences_section: PreferencesSection,
     /// An in-flight smooth scroll that brings the selection into view.
     pub scroll_glide: Option<ScrollGlide>,
     /// Bumped whenever a title-bar dropdown entry is chosen, which remounts
@@ -748,6 +776,7 @@ impl RawEditor {
                 modal_exit: None,
                 modal_exit_seq: 0,
                 reduce_motion: settings.reduce_motion,
+                preferences_section: PreferencesSection::default(),
                 scroll_glide: None,
                 menu_generation: 0,
                 last_wheel_time: None,

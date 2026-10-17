@@ -30,6 +30,65 @@ fn open_url(url: &str) {
     }
 }
 
+/// Show a folder in the platform's file manager, creating it first (the
+/// cache folder doesn't exist until something has been imported).
+///
+/// Blocking (it touches the disk): run it inside `spawn_blocking`. Windows
+/// gets `explorer` rather than `cmd /c start`, whose parsing mangles paths
+/// containing `&` or `^`.
+fn reveal_folder(path: &std::path::Path) {
+    if let Err(e) = std::fs::create_dir_all(path) {
+        tracing::error!("Failed to create {}: {e}", path.display());
+        return;
+    }
+    let opener = if cfg!(target_os = "windows") {
+        "explorer"
+    } else if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    match std::process::Command::new(opener).arg(path).spawn() {
+        Ok(_) => tracing::info!("Opened {}", path.display()),
+        Err(e) => tracing::error!("Failed to open {}: {e}", path.display()),
+    }
+}
+
+/// Preferences side menu. The new page starts at the top: the content pane is
+/// one scrollable whatever the page, so it would otherwise keep the previous
+/// page's offset.
+pub fn handle_set_preferences_section(
+    editor: &mut RawEditor,
+    section: crate::app::state::PreferencesSection,
+) -> Task<Message> {
+    if editor.preferences_section == section {
+        return Task::none();
+    }
+    editor.preferences_section = section;
+    iced::widget::scrollable::snap_to(
+        crate::app::views::preferences::content_scroll_id(),
+        iced::widget::scrollable::RelativeOffset::START,
+    )
+}
+
+pub fn handle_open_link(editor: &mut RawEditor, url: &'static str) -> Task<Message> {
+    open_url(url);
+    editor.status = format!("Opened {url}");
+    Task::none()
+}
+
+pub fn handle_open_app_folder(
+    editor: &mut RawEditor,
+    folder: crate::core::paths::AppFolder,
+) -> Task<Message> {
+    let Some(path) = folder.path() else {
+        editor.status = "This platform reports no cache folder".to_string();
+        return Task::none();
+    };
+    editor.status = format!("Opened {}", path.display());
+    Task::future(tokio::task::spawn_blocking(move || reveal_folder(&path))).discard()
+}
+
 pub fn handle_open_repository(editor: &mut RawEditor) -> Task<Message> {
     open_url(REPO_URL);
     editor.status = format!("Opened {REPO_URL}");

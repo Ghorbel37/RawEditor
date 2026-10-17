@@ -1,5 +1,6 @@
 //! The sliding highlight behind a row of equal-width segments (the title
-//! bar's tabs).
+//! bar's tabs), or — `.vertical()` — a column of equal-height ones (the
+//! Preferences side menu), with the accent bar on the leading edge.
 //!
 //! The two edges are separate springs. When the selection moves, the leading
 //! edge sets off on a quick spring and the trailing edge follows on a heavier
@@ -39,8 +40,11 @@ pub struct Appearance {
 pub struct Indicator {
     count: usize,
     active: usize,
+    /// Segment extent along the axis: width in a row, height in a column.
     segment_width: f32,
-    height: Length,
+    /// Extent across the axis.
+    cross: Length,
+    vertical: bool,
     appearance: Appearance,
 }
 
@@ -49,8 +53,23 @@ pub fn indicator(count: usize, active: usize, segment_width: f32, appearance: Ap
         count: count.max(1),
         active: active.min(count.saturating_sub(1)),
         segment_width,
-        height: Length::Fill,
+        cross: Length::Fill,
+        vertical: false,
         appearance,
+    }
+}
+
+impl Indicator {
+    /// Stack the segments top to bottom; `segment_width` is then each one's
+    /// height, and the accent bar runs down the highlight's left edge
+    /// (`accent_height` is its thickness, `accent_inset` its vertical inset).
+    pub fn vertical(mut self) -> Self {
+        self.vertical = true;
+        self
+    }
+
+    fn along(&self) -> f32 {
+        self.segment_width * self.count as f32
     }
 }
 
@@ -128,11 +147,20 @@ impl<Message> Widget<Message, Theme, Renderer> for Indicator {
     }
 
     fn size(&self) -> Size<Length> {
-        Size { width: Length::Fixed(self.segment_width * self.count as f32), height: self.height }
+        let along = Length::Fixed(self.along());
+        if self.vertical {
+            Size { width: self.cross, height: along }
+        } else {
+            Size { width: along, height: self.cross }
+        }
     }
 
     fn layout(&self, _tree: &mut Tree, _renderer: &Renderer, limits: &layout::Limits) -> layout::Node {
-        layout::atomic(limits, self.segment_width * self.count as f32, self.height)
+        if self.vertical {
+            layout::atomic(limits, self.cross, self.along())
+        } else {
+            layout::atomic(limits, self.along(), self.cross)
+        }
     }
 
     fn on_event(
@@ -170,26 +198,37 @@ impl<Message> Widget<Message, Theme, Renderer> for Indicator {
         use iced::advanced::Renderer as _;
         let edges = tree.state.downcast_ref::<Edges>();
         let bounds = layout.bounds();
-        let x0 = bounds.x + edges.left.value * self.segment_width;
-        let x1 = bounds.x + edges.right.value * self.segment_width;
         let a = self.appearance;
+        // `left`/`right` are the edges along the axis (top/bottom when
+        // vertical). Work in (along, across) and map to x/y at the end.
+        let (origin, cross_origin, cross) = if self.vertical {
+            (bounds.y, bounds.x, bounds.width)
+        } else {
+            (bounds.x, bounds.y, bounds.height)
+        };
+        let s0 = origin + edges.left.value * self.segment_width;
+        let s1 = origin + edges.right.value * self.segment_width;
+        let rect = |along0: f32, along_len: f32, across0: f32, across_len: f32| {
+            if self.vertical {
+                Rectangle { x: across0, y: along0, width: across_len, height: along_len }
+            } else {
+                Rectangle { x: along0, y: across0, width: along_len, height: across_len }
+            }
+        };
 
         renderer.fill_quad(
             renderer::Quad {
-                bounds: Rectangle { x: x0, y: bounds.y, width: x1 - x0, height: bounds.height },
+                bounds: rect(s0, s1 - s0, cross_origin, cross),
                 ..renderer::Quad::default()
             },
             a.fill,
         );
-        let inset = a.accent_inset.min((x1 - x0) / 3.0);
+        // Horizontal: along the bottom edge. Vertical: down the left edge.
+        let inset = a.accent_inset.min((s1 - s0) / 3.0);
+        let bar_across = if self.vertical { cross_origin } else { cross_origin + cross - a.accent_height };
         renderer.fill_quad(
             renderer::Quad {
-                bounds: Rectangle {
-                    x: x0 + inset,
-                    y: bounds.y + bounds.height - a.accent_height,
-                    width: (x1 - x0 - 2.0 * inset).max(0.0),
-                    height: a.accent_height,
-                },
+                bounds: rect(s0 + inset, (s1 - s0 - 2.0 * inset).max(0.0), bar_across, a.accent_height),
                 border: Border { radius: (a.accent_height / 2.0).into(), ..Border::default() },
                 ..renderer::Quad::default()
             },

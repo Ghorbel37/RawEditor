@@ -152,8 +152,8 @@ pub struct LensContext {
 /// Where lensfun databases live, in priority order.
 pub fn search_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
+    dirs.push(crate::core::paths::data_dir().join("lensfun"));
     if let Some(data) = dirs::data_dir() {
-        dirs.push(data.join("raw-editor").join("lensfun"));
         dirs.push(data.join("lensfun").join("updates").join("version_1"));
         dirs.push(data.join("lensfun").join("version_1"));
     }

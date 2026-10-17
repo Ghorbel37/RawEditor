@@ -14,8 +14,9 @@ use super::develop::view_develop;
 use super::export::view_export;
 use super::modals::{
     modal_overlay, view_about_modal, view_copy_settings_modal, view_delete_modal,
-    view_export_modal, view_help_modal, view_preferences_modal, view_remove_folder_modal,
+    view_export_modal, view_help_modal, view_remove_folder_modal,
 };
+use super::preferences::view_preferences_modal;
 
 /// Height of the custom title bar. Module-level because the menu bar has to be
 /// given this height explicitly — see `view_title_bar`.
