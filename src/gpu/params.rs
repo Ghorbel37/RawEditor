@@ -78,8 +78,12 @@ pub struct GpuEditParams {
     pub saturation: f32,
     pub temperature: f32,
     pub tint: f32,
-    padding1: f32,
-    padding2: f32,
+    /// With `src_scale`, maps full-image sensor UV to the INPUT texture's UV:
+    /// `src_uv = uv * src_scale + src_offset`. The identity — `(1, 1)`,
+    /// `(0, 0)`, exact in floating point — for every render except the
+    /// detail loupe (`gpu::loupe`), whose input is a full-resolution crop.
+    /// Two former pad slots; no offset moved.
+    pub src_offset: [f32; 2],
     pub wb_multipliers: [f32; 4],
     /// Camera RGB → working space, one row per field (the shader rebuilds it
     /// with `transpose(mat3x3(...))`, so these are ROWS, not columns).
@@ -95,12 +99,10 @@ pub struct GpuEditParams {
     _padding4: f32,
     pub forward_matrix_2: [f32; 3],
     _padding5: f32,
-    /// Vestigial (Phase 25). Zoom and pan are applied by the viewport shader's
-    /// projection matrix, not here; these have been written as 1.0/0.0/0.0
-    /// since the viewport took over. Kept only so every later field's byte
-    /// offset stays put — see `view_rect` below.
-    pub zoom: f32,
-    pub pan_x: f32,
+    /// See `src_offset`. Occupies the vestigial Phase-25 `zoom`/`pan_x`
+    /// slots (the viewport shader's projection owns zoom and pan); `pan_y`
+    /// is still dead and only holds later offsets in place.
+    pub src_scale: [f32; 2],
     pub pan_y: f32,
     pub cfa_pattern: u32,
     /// Sub-region of the displayed image this render covers, as
@@ -128,7 +130,7 @@ pub struct GpuEditParams {
     color_noise: f32,
     sharpening: f32,
     sharpen_masking: f32,
-    rotation: f32,
+    pub rotation: f32,
     _pad_phase_1: f32,
     pub crop: [f32; 4],
     pub is_cropping: u32,
@@ -233,8 +235,7 @@ impl From<&EditParams> for GpuEditParams {
             saturation: params.saturation,
             temperature: params.temperature,
             tint: params.tint,
-            padding1: 0.0,
-            padding2: 0.0,
+            src_offset: [0.0, 0.0],
             wb_multipliers: [1.0, 1.0, 1.0, 1.0],
             forward_matrix_0: [1.0, 0.0, 0.0],
             _padding3: 0.0,
@@ -242,8 +243,7 @@ impl From<&EditParams> for GpuEditParams {
             _padding4: 0.0,
             forward_matrix_2: [0.0, 0.0, 1.0],
             _padding5: 0.0,
-            zoom: 1.0,
-            pan_x: 0.0,
+            src_scale: [1.0, 1.0],
             pan_y: 0.0,
             cfa_pattern: 0,
             // Whole image by default; the windowed render path overwrites just
@@ -369,6 +369,26 @@ mod tests {
         assert_eq!(off % 16, 0);
         // And it must not have pushed black_levels off its own boundary.
         assert_eq!(std::mem::offset_of!(GpuEditParams, black_levels), off + 16);
+    }
+
+    /// The loupe's source mapping took two pairs of dead slots; WGSL reads
+    /// each pair as a `vec2<f32>`, which needs 8-byte alignment, and nothing
+    /// around them may move.
+    #[test]
+    fn source_mapping_occupies_old_pad_slots() {
+        assert_eq!(std::mem::offset_of!(GpuEditParams, src_offset), 40);
+        assert_eq!(std::mem::offset_of!(GpuEditParams, wb_multipliers), 48);
+        assert_eq!(std::mem::offset_of!(GpuEditParams, src_scale), 112);
+        assert_eq!(std::mem::offset_of!(GpuEditParams, pan_y), 120);
+        assert_eq!(std::mem::offset_of!(GpuEditParams, cfa_pattern), 124);
+    }
+
+    /// Every render except the loupe samples its input in full-image UV.
+    #[test]
+    fn default_source_mapping_is_the_identity() {
+        let g = GpuEditParams::from(&EditParams::default());
+        assert_eq!(g.src_scale, [1.0, 1.0]);
+        assert_eq!(g.src_offset, [0.0, 0.0]);
     }
 
     #[test]

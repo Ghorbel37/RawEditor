@@ -154,9 +154,10 @@ pub fn handle_image_resources_ready(editor: &mut RawEditor, image_id: i64, resul
 
             editor.sync_tool_flags();
             if let Some(ctx) = &editor.gpu_context {
+                let params = editor.view_params();
                 let (interpolated, wb_override) =
-                    crate::app::handlers::develop::resolve_wb_and_dcp(editor, &editor.current_edit_params);
-                resources.update_uniforms(ctx, &editor.current_edit_params, interpolated.as_deref(), wb_override);
+                    crate::app::handlers::develop::resolve_wb_and_dcp(editor, &params);
+                resources.update_uniforms(ctx, &params, interpolated.as_deref(), wb_override);
             }
 
             // A full-resolution upgrade keeps the preview it replaces: renders
@@ -451,11 +452,18 @@ mod tests {
         assert!(e.image_resources.as_ref().is_some_and(|r| Arc::ptr_eq(r, &full)));
         assert!(e.preview_resources.as_ref().is_some_and(|p| Arc::ptr_eq(p, &preview)), "preview dropped");
 
-        // Zoomed in, an NR drag renders from the preview; its release goes
-        // back to full resolution.
+        // Zoomed in, an NR drag holds the main view's noise reduction (the
+        // detail loupe shows it live); when the drag pauses the main view
+        // catches up from the preview, whose stage costs per SOURCE pixel,
+        // and the release goes back to full resolution.
         e.is_rendering = false;
         let _ = crate::app::handlers::develop::handle_luma_noise_changed(&mut e, 0.5);
-        assert!(e.display_from_drag_preview, "the drag rendered at full resolution");
+        assert!(e.held_noise.is_some(), "a drag tick re-ran noise reduction on the main view");
+        assert!(!e.is_rendering, "a held drag tick rendered the main view");
+        let token = e.noise_settle_token;
+        let _ = crate::app::handlers::loupe::handle_noise_settled(&mut e, token);
+        assert!(e.held_noise.is_none());
+        assert!(e.display_from_drag_preview, "the paused drag rendered at full resolution");
         e.is_rendering = false;
         let _ = crate::app::handlers::develop::handle_commit_edit(&mut e);
         assert!(!e.stage_drag);

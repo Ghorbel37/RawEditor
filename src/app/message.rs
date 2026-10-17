@@ -81,6 +81,8 @@ pub enum DefringeParam {
 /// Collapsible Develop sidebar sections (UI state only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SidebarSection {
+    /// The 1:1 detail loupe above Noise Reduction.
+    DetailPreview,
     ToneCurve,
     Lens,
     Defringe,
@@ -394,6 +396,19 @@ pub enum Message {
     CheckForUpdates,
     /// Open the project page in the default browser.
     OpenRepository,
+    /// The detail loupe for an image was prepared (or could not be).
+    LoupeReady(i64, Result<std::sync::Arc<crate::gpu::loupe::Loupe>, String>),
+    /// A detail-loupe render finished.
+    LoupeRendered(i64, Result<crate::gpu::loupe::LoupeFrame, String>),
+    /// Dragging inside the loupe, by this many logical pixels.
+    LoupePan(f32, f32),
+    /// Arm or disarm "click the image to place the loupe".
+    ToggleLoupeTarget,
+    /// The image was clicked while placing the loupe (display-space UV).
+    LoupeTargetPicked(f32, f32),
+    /// A noise-reduction drag paused: let the main view catch up, if this is
+    /// still the latest tick's timer.
+    NoiseSettled(u64),
     /// Open a URL in the default browser (Preferences › Licenses).
     OpenLink(&'static str),
     /// Preferences side menu: show this page.

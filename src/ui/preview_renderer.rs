@@ -489,6 +489,8 @@ pub struct CropOverlay {
     pub brush: Option<(f32, f32)>,
     /// Colour-range eyedropper armed: a click emits `MaskColorPicked`.
     pub is_color_picking: bool,
+    /// Placing the detail loupe: a click emits `LoupeTargetPicked`.
+    pub is_loupe_targeting: bool,
 }
 
 /// Canvas state: last seen size (for resize sensing) and an in-progress
@@ -843,6 +845,7 @@ impl canvas::Program<Message> for CropOverlay {
             && !self.is_wb_picking
             && !self.is_mask_placing
             && !self.is_color_picking
+            && !self.is_loupe_targeting
             && self.selected_mask.is_none()
         {
             return (canvas::event::Status::Ignored, None);
@@ -861,6 +864,19 @@ impl canvas::Program<Message> for CropOverlay {
                 let v = (cursor_position.y - image_bounds.y) / image_bounds.height.max(1.0);
                 if (0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v) {
                     return (canvas::event::Status::Captured, Some(Message::WbPicked(u, v)));
+                }
+            }
+            return (canvas::event::Status::Ignored, None);
+        }
+
+        // Loupe placement: same contract as the WB picker.
+        if self.is_loupe_targeting {
+            if let canvas::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)) = event {
+                let image_bounds = self.image_bounds(bounds.width, bounds.height);
+                let u = (cursor_position.x - image_bounds.x) / image_bounds.width.max(1.0);
+                let v = (cursor_position.y - image_bounds.y) / image_bounds.height.max(1.0);
+                if (0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v) {
+                    return (canvas::event::Status::Captured, Some(Message::LoupeTargetPicked(u, v)));
                 }
             }
             return (canvas::event::Status::Ignored, None);
@@ -969,7 +985,7 @@ impl canvas::Program<Message> for CropOverlay {
         bounds: Rectangle,
         cursor: Cursor,
     ) -> iced::mouse::Interaction {
-        if self.is_wb_picking || self.is_mask_placing || self.is_color_picking {
+        if self.is_wb_picking || self.is_mask_placing || self.is_color_picking || self.is_loupe_targeting {
             return iced::mouse::Interaction::Crosshair;
         }
         if self.brush.is_some() && cursor.position_in(bounds).is_some() {

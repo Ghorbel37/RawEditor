@@ -123,6 +123,29 @@ pub enum PassKind {
     Compose,
 }
 
+/// NLM search radius, in pixels.
+const NLM_RADIUS: i32 = 4;
+/// NLM patch half-size (3×3 patches).
+const NLM_PATCH: i32 = 1;
+
+/// À-trous scale count for a working texture subsampled by `stride`.
+/// Chroma blotches have a fixed size on the sensor: fewer scales reach them
+/// on a subsampled preview.
+fn scale_levels(stride: f32) -> i32 {
+    let extra = stride.max(1.0).log2().round() as i32;
+    (6 - extra).clamp(2, MAX_LEVELS as i32)
+}
+
+/// How far, in pixels, an output pixel's value can depend on: NLM's search
+/// window plus its patch, then each à-trous scale's 5×5 kernel at a step that
+/// doubles. Denoising a window padded by this much gives exactly the pixels a
+/// whole-image run gives inside it — what lets the detail loupe
+/// (`gpu::loupe`) denoise a crop.
+pub fn reach(stride: f32) -> u32 {
+    let scales: i32 = (0..scale_levels(stride)).map(|level| 2 * (1 << level)).sum();
+    (NLM_RADIUS + NLM_PATCH + scales) as u32
+}
+
 /// Turn slider settings + the image's noise model into the pass list.
 ///
 /// `stride` is how far the working texture is subsampled from the sensor
@@ -165,7 +188,7 @@ pub fn plan(
     // Blending a little of the original back reads as fine grain rather
     // than the waxy flatness of a fully averaged result.
     base.luma_amount = (f * 1.5).min(1.0);
-    base.radius = 4;
+    base.radius = NLM_RADIUS;
 
     let g = s.color;
     base.chroma_amount = (g * 2.0).min(1.0);
@@ -177,11 +200,7 @@ pub fn plan(
         passes.push((PassKind::Nlm, base));
     }
     if g > 0.0 || f > 0.0 {
-        // Blotches have a fixed size on the sensor: fewer scales reach them
-        // on a subsampled preview.
-        let extra = stride.max(1.0).log2().round() as i32;
-        let levels = (6 - extra).clamp(2, MAX_LEVELS as i32);
-        for level in 0..levels {
+        for level in 0..scale_levels(stride) {
             let mut p = base;
             p.step = 1 << level;
             // Chroma differences beyond this are real colour edges. Shrinks
@@ -650,6 +669,23 @@ mod tests {
         };
         assert!(count(1.0) > count(3.0));
         assert!(count(1.0) <= MAX_LEVELS);
+    }
+
+    /// 5 (NLM window + patch) + 2·(1+2+4+8+16+32) at full resolution; the
+    /// subsampled preview runs fewer scales and so reaches less far.
+    #[test]
+    fn reach_covers_nlm_and_every_scale() {
+        assert_eq!(reach(1.0), 5 + 126);
+        assert_eq!(reach(3.0), 5 + 30);
+        // And it agrees with the plan it describes.
+        let model = NoiseModel::default();
+        let s = DenoiseSettings { luma: 0.5, detail: 0.5, color: 0.5 };
+        let steps: i32 = plan(s, &model, [1.0; 3], 1.0)
+            .iter()
+            .filter(|(k, _)| *k == PassKind::Scale)
+            .map(|(_, p)| 2 * p.step)
+            .sum();
+        assert_eq!(reach(1.0) as i32, NLM_RADIUS + NLM_PATCH + steps);
     }
 
     #[test]

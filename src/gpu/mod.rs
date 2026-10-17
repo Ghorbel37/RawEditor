@@ -7,10 +7,12 @@
 /// - `shaders.rs`  — WGSL shader source
 /// - `shared.rs`   — Shared GPU context + ImageResources (the live render path)
 /// - `render_functions.rs` — Standalone rendering functions (used by develop + export)
+/// - `loupe.rs`    — the 1:1 detail loupe: a full-resolution crop through the same passes
 pub mod brush;
 pub mod demosaic;
 pub mod denoise;
 pub mod local_contrast;
+pub mod loupe;
 pub mod params;
 pub mod render_functions;
 pub mod shaders;

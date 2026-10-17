@@ -150,7 +150,12 @@ fn dispatch(editor: &mut RawEditor, message: Message) -> Task<Message> {
             if !editor.collapsed_sections.remove(&section) {
                 editor.collapsed_sections.insert(section);
             }
-            Task::none()
+            // Opening the loupe renders it (it does nothing while folded).
+            if section == crate::app::message::SidebarSection::DetailPreview {
+                handlers::loupe::request(editor)
+            } else {
+                Task::none()
+            }
         }
         Message::ToneMapperChanged(m) => {
             handlers::develop::handle_tone_mapper_changed(editor, m)
@@ -318,6 +323,12 @@ fn dispatch(editor: &mut RawEditor, message: Message) -> Task<Message> {
         Message::ImportFolderPicked(r) => handlers::library::handle_import_folder_picked(editor, r),
         Message::CheckForUpdates => handlers::window::handle_check_for_updates(editor),
         Message::OpenRepository => handlers::window::handle_open_repository(editor),
+        Message::LoupeReady(id, r) => handlers::loupe::handle_ready(editor, id, r),
+        Message::LoupeRendered(id, r) => handlers::loupe::handle_rendered(editor, id, r),
+        Message::LoupePan(dx, dy) => handlers::loupe::handle_pan(editor, dx, dy),
+        Message::ToggleLoupeTarget => handlers::loupe::handle_toggle_target(editor),
+        Message::LoupeTargetPicked(u, v) => handlers::loupe::handle_target_picked(editor, u, v),
+        Message::NoiseSettled(token) => handlers::loupe::handle_noise_settled(editor, token),
         Message::OpenLink(url) => handlers::window::handle_open_link(editor, url),
         Message::SetPreferencesSection(section) => {
             handlers::window::handle_set_preferences_section(editor, section)

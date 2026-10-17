@@ -461,9 +461,10 @@ pub fn handle_mouse_released(editor: &mut RawEditor) -> Task<Message> {
     {
         editor.commit_current_state();
         if let (Some(ctx), Some(res)) = (&editor.gpu_context, &editor.image_resources) {
+            let params = editor.view_params();
             let (interpolated, wb_override) =
-                crate::app::handlers::develop::resolve_wb_and_dcp(editor, &editor.current_edit_params);
-            res.update_uniforms(ctx, &editor.current_edit_params, interpolated.as_deref(), wb_override);
+                crate::app::handlers::develop::resolve_wb_and_dcp(editor, &params);
+            res.update_uniforms(ctx, &params, interpolated.as_deref(), wb_override);
         }
     }
     editor.is_dragging = false;
@@ -636,9 +637,10 @@ fn apply_crop_drag(editor: &mut RawEditor, pos: Point, last: Point, h: CropHandl
     editor.edits_dirty = true;
 
     if let Some(ctx) = &editor.gpu_context {
+        let params = editor.view_params();
         let (interpolated, wb_override) =
-            crate::app::handlers::develop::resolve_wb_and_dcp(editor, &editor.current_edit_params);
-        resources.update_uniforms(ctx, &editor.current_edit_params, interpolated.as_deref(), wb_override);
+            crate::app::handlers::develop::resolve_wb_and_dcp(editor, &params);
+        resources.update_uniforms(ctx, &params, interpolated.as_deref(), wb_override);
     }
 }
 

@@ -144,22 +144,18 @@ pub fn handle_dehaze_changed(editor: &mut RawEditor, v: f32) -> Task<Message> {
     update_pipeline(editor)
 }
 
+// Noise reduction is held back on the main view while these move, and shown
+// live in the detail loupe — see `handlers::loupe`.
 pub fn handle_luma_noise_changed(editor: &mut RawEditor, v: f32) -> Task<Message> {
-    editor.current_edit_params.luma_noise = v;
-    editor.stage_drag = true;
-    update_pipeline(editor)
+    crate::app::handlers::loupe::handle_noise_changed(editor, |p| p.luma_noise = v)
 }
 
 pub fn handle_luma_detail_changed(editor: &mut RawEditor, v: f32) -> Task<Message> {
-    editor.current_edit_params.luma_detail = v;
-    editor.stage_drag = true;
-    update_pipeline(editor)
+    crate::app::handlers::loupe::handle_noise_changed(editor, |p| p.luma_detail = v)
 }
 
 pub fn handle_color_noise_changed(editor: &mut RawEditor, v: f32) -> Task<Message> {
-    editor.current_edit_params.color_noise = v;
-    editor.stage_drag = true;
-    update_pipeline(editor)
+    crate::app::handlers::loupe::handle_noise_changed(editor, |p| p.color_noise = v)
 }
 
 pub fn handle_sharpening_changed(editor: &mut RawEditor, v: f32) -> Task<Message> {
@@ -199,6 +195,7 @@ pub fn handle_toggle_crop(editor: &mut RawEditor) -> Task<Message> {
     editor.selected_mask = None;
     editor.brush_armed = false;
     editor.color_picking_mask = None;
+    editor.loupe.targeting = false;
     editor.is_cropping = !editor.is_cropping;
     if editor.is_cropping {
         editor.drag_mode = DragMode::Crop;
@@ -231,10 +228,14 @@ pub fn handle_commit_edit(editor: &mut RawEditor) -> Task<Message> {
     finish_stage_drag(editor)
 }
 
-/// A noise-reduction drag just ended: if it was shown from the subsampled
-/// preview (`RawEditor::stage_drag`), render the view at full resolution.
+/// A noise-reduction drag just ended: apply what the main view held back
+/// (`handlers::loupe`); or, if a mid-drag pause already did, from the
+/// subsampled preview (`RawEditor::stage_drag`), render it at full resolution.
 pub fn finish_stage_drag(editor: &mut RawEditor) -> Task<Message> {
-    if editor.display_from_drag_preview {
+    if editor.held_noise.is_some() {
+        // `stage_drag` is already clear, so this render is full resolution.
+        crate::app::handlers::loupe::release_noise(editor)
+    } else if editor.display_from_drag_preview {
         crate::app::handlers::navigation::throttled_render(editor)
     } else {
         Task::none()
@@ -537,13 +538,17 @@ pub fn handle_render_finished(
     });
     editor.profiler_cache.clear();
 
+    // A new image, a full-resolution swap or a DPI change re-render the main
+    // view without pushing params; the loupe catches up here.
+    let loupe = crate::app::handlers::loupe::refresh_if_stale(editor);
+
     editor.is_rendering = false;
     if editor.pending_render {
         editor.is_rendering = true;
         editor.pending_render = false;
-        return Task::batch([save, trigger_async_render(editor)]);
+        return Task::batch([save, loupe, trigger_async_render(editor)]);
     }
-    save
+    Task::batch([save, loupe])
 }
 
 /// What a develop render of the current view needs: window, target size,
@@ -615,9 +620,11 @@ pub fn trigger_async_render(editor: &mut RawEditor) -> Task<Message> {
         // `current_edit_params` whenever neither is active — every change to
         // them is pushed to the GPU as it happens.
         // The mask overlay tints the render, so it disqualifies too.
+        // So does one whose noise reduction is held back mid-drag.
         let edit = (!editor.before_peek
             && !editor.is_cropping
-            && editor.current_edit_params.mask_overlay == 0)
+            && editor.current_edit_params.mask_overlay == 0
+            && editor.held_noise.is_none())
             .then_some(editor.current_edit_params);
 
         // A subsampled texture shown larger than its own pixels is soft
@@ -722,6 +729,7 @@ pub fn handle_toggle_wb_picker(editor: &mut RawEditor) -> Task<Message> {
         editor.selected_mask = None;
         editor.brush_armed = false;
         editor.color_picking_mask = None;
+        editor.loupe.targeting = false;
         editor.status = "WB picker: click a neutral grey/white area".to_string();
     } else {
         editor.status.clear();
@@ -954,15 +962,20 @@ pub(crate) fn push_uniforms_and_render(
         editor.canvas_cache.clear();
     }
 
+    // The detail loupe follows every edit (it costs ~0.3 ms when the noise
+    // settings haven't changed).
+    let loupe = crate::app::handlers::loupe::request(editor);
+
     // Phase 106: Throttling
-    if editor.is_rendering {
+    let render = if editor.is_rendering {
         editor.pending_render = true;
         Task::none()
     } else {
         editor.is_rendering = true;
         editor.pending_render = false;
         trigger_async_render(editor)
-    }
+    };
+    Task::batch([render, loupe])
 }
 
 pub(crate) fn update_pipeline(editor: &mut RawEditor) -> Task<Message> {
@@ -973,7 +986,7 @@ pub(crate) fn update_pipeline(editor: &mut RawEditor) -> Task<Message> {
     editor.mark_edits_dirty();
     editor.sync_tool_flags();
     // EditParams is Copy, so this sidesteps the borrow conflict for free.
-    let params = editor.current_edit_params;
+    let params = editor.view_params();
     push_uniforms_and_render(editor, &params)
 }
 
@@ -987,7 +1000,7 @@ pub(crate) fn refresh_for_peek_state(editor: &mut RawEditor) -> Task<Message> {
     let params = if editor.before_peek {
         editor.current_edit_params.before_reference()
     } else {
-        editor.current_edit_params
+        editor.view_params()
     };
     push_uniforms_and_render(editor, &params)
 }

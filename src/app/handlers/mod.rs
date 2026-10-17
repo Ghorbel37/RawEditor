@@ -9,3 +9,4 @@ pub mod window;
 pub mod loading;
 pub mod delete;
 pub mod proxy;
+pub mod loupe;

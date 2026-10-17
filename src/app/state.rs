@@ -82,6 +82,63 @@ pub enum Modal {
     RemoveFolder,
 }
 
+/// Noise-reduction settings the main view keeps showing while a drag on one
+/// of its sliders is in progress — the stage is too slow to re-run per tick
+/// (`handlers::loupe`). Tagged with its image so it can never leak onto
+/// another one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HeldNoise {
+    pub image_id: Option<i64>,
+    pub luma: f32,
+    pub detail: f32,
+    pub color: f32,
+}
+
+/// The last frame the detail loupe rendered.
+#[derive(Debug, Clone)]
+pub struct LoupeView {
+    pub image_id: i64,
+    pub handle: iced::widget::image::Handle,
+    /// Its view-UV window — what a drag in loupe pixels moves.
+    pub window: [f32; 4],
+    /// Physical pixels per side.
+    pub size: u32,
+}
+
+/// The Develop sidebar's 1:1 detail loupe (`handlers::loupe`, `gpu::loupe`).
+#[derive(Debug)]
+pub struct LoupeState {
+    /// Where it looks, in view UV (the post-crop display image). Kept across
+    /// images, like the zoom.
+    pub center: [f32; 2],
+    pub gpu: Option<std::sync::Arc<crate::gpu::loupe::Loupe>>,
+    /// The image whose loupe is being prepared (RAW read, noise model).
+    pub building: Option<i64>,
+    /// An image whose loupe could not be prepared, and why — not retried.
+    pub failed: Option<(i64, String)>,
+    pub frame: Option<LoupeView>,
+    /// One render at a time; `pending` asks for another when it lands.
+    pub in_flight: bool,
+    pub pending: bool,
+    /// The next click on the image places it.
+    pub targeting: bool,
+}
+
+impl Default for LoupeState {
+    fn default() -> Self {
+        Self {
+            center: [0.5, 0.5],
+            gpu: None,
+            building: None,
+            failed: None,
+            frame: None,
+            in_flight: false,
+            pending: false,
+            targeting: false,
+        }
+    }
+}
+
 /// The pages of the Preferences side menu, in menu order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PreferencesSection {
@@ -573,6 +630,12 @@ pub struct RawEditor {
     /// The on-screen render came from `preview_resources` only because of a
     /// `stage_drag`, so it is softer than the view calls for.
     pub display_from_drag_preview: bool,
+    /// See [`HeldNoise`]. `Some` from a noise slider's first tick until the
+    /// drag pauses (`NOISE_SETTLE`) or ends.
+    pub held_noise: Option<HeldNoise>,
+    /// Matches the settle timer to the latest noise-slider tick.
+    pub noise_settle_token: u64,
+    pub loupe: LoupeState,
 
     // ── Scroll boost + filmstrip momentum ──────────────────────────────────
     /// True while the cursor is over the library grid, from the grid's own
@@ -784,6 +847,9 @@ impl RawEditor {
                 full_res_failed: None,
                 stage_drag: false,
                 display_from_drag_preview: false,
+                held_noise: None,
+                noise_settle_token: 0,
+                loupe: LoupeState::default(),
                 cursor_over_grid: false,
                 grid_scroll_y: 0.0,
                 grid_viewport: (0.0, 0.0),
@@ -850,6 +916,20 @@ impl RawEditor {
         } else {
             None
         }
+    }
+
+    /// The params the main view renders: the user's edit, except that noise
+    /// reduction stays where it was while a drag on its sliders is held back
+    /// (`held_noise`). Everything that pushes the edit to the GPU uses this;
+    /// what is saved, exported and undone is `current_edit_params`.
+    pub fn view_params(&self) -> crate::core::types::EditParams {
+        let mut p = self.current_edit_params;
+        if let Some(h) = self.held_noise.filter(|h| h.image_id == self.selected_image_id) {
+            p.luma_noise = h.luma;
+            p.luma_detail = h.detail;
+            p.color_noise = h.color;
+        }
+        p
     }
 
     /// Helper to push current state to history.

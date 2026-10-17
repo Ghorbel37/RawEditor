@@ -105,8 +105,9 @@ struct EditParams {
     saturation: f32,      // -100.0 to +100.0
     temperature: f32,     // -1.0 to +1.0
     tint: f32,            // -1.0 to +1.0
-    padding1: f32,
-    padding2: f32,
+    // Full-image sensor UV → input-texture UV: uv * src_scale + src_offset.
+    // The identity except for the detail loupe, whose input is a crop.
+    src_offset: vec2<f32>,
     // Phase 14: Color science metadata
     wb_multipliers: vec4<f32>,  // White balance [R, G, B, G2]
     // Camera RGB → working space, ROWS (rebuilt via transpose() below).
@@ -118,10 +119,8 @@ struct EditParams {
     padding4: f32,
     forward_matrix_2: vec3<f32>,  // row 2
     padding5: f32,
-    // Phase 25: Zoom & Pan
-    zoom: f32,
-    pan_x: f32,
-    pan_y: f32,
+    src_scale: vec2<f32>,
+    pan_y: f32,           // vestigial; holds later offsets in place
     // Phase 34: CFA Pattern
     cfa_pattern: u32,
 
@@ -597,8 +596,9 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     var tex_coords = input.tex_coords;
 
     if (abs(params.rotation) > 0.01) {
-        let dimensions_r = textureDimensions(input_texture);
-        var aspect = f32(dimensions_r.x) / f32(dimensions_r.y);
+        // The whole image's aspect, also when the input is a loupe crop.
+        let dimensions_r = vec2<f32>(textureDimensions(input_texture)) * params.src_scale;
+        var aspect = dimensions_r.x / dimensions_r.y;
         if (params.orientation == 6u || params.orientation == 8u) {
             aspect = 1.0 / aspect;
         }
@@ -683,9 +683,16 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
 
+    // `tex_coords`, `uv_r` and `uv_b` stay in full-image sensor UV (the
+    // local-contrast bands and haze map are whole-image textures); only reads
+    // of the input go through the source mapping. Exact identity outside the
+    // loupe: x * 1.0 + 0.0 == x.
+    let src_uv = tex_coords * params.src_scale + params.src_offset;
+    let src_uv_r = uv_r * params.src_scale + params.src_offset;
+    let src_uv_b = uv_b * params.src_scale + params.src_offset;
     let pixel_coords = vec2<i32>(
-        i32(tex_coords.x * f32(dimensions.x)),
-        i32(tex_coords.y * f32(dimensions.y))
+        i32(src_uv.x * f32(dimensions.x)),
+        i32(src_uv.y * f32(dimensions.y))
     );
 
     // ── Step 1: Read debayered camera-native linear RGB from intermediate ────
@@ -696,12 +703,12 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     var color: vec3<f32>;
     if (lens_on) {
         color = vec3<f32>(
-            textureSampleLevel(input_texture, texture_sampler, uv_r, 0.0).r,
-            textureSampleLevel(input_texture, texture_sampler, tex_coords, 0.0).g,
-            textureSampleLevel(input_texture, texture_sampler, uv_b, 0.0).b,
+            textureSampleLevel(input_texture, texture_sampler, src_uv_r, 0.0).r,
+            textureSampleLevel(input_texture, texture_sampler, src_uv, 0.0).g,
+            textureSampleLevel(input_texture, texture_sampler, src_uv_b, 0.0).b,
         );
     } else {
-        color = textureSample(input_texture, texture_sampler, tex_coords).rgb;
+        color = textureSample(input_texture, texture_sampler, src_uv).rgb;
     }
     // Camera-native colour, for colour-range masks (exposure- and
     // WB-independent by construction).
@@ -1169,8 +1176,10 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // A crop term used to live here to cancel the non-uniform stretch the
     // old full-aspect target produced. Re-adding one would double-apply the
     // crop and shear rotated ellipses. Keep in sync with
-    // core::viewport::mask_uv_aspect, the CPU side of this.
-    var mask_aspect = f32(dimensions.x) / f32(dimensions.y);
+    // core::viewport::mask_uv_aspect, the CPU side of this. Scaled by
+    // `src_scale` so a loupe crop still uses the whole frame's aspect.
+    let mask_dims = vec2<f32>(dimensions) * params.src_scale;
+    var mask_aspect = mask_dims.x / mask_dims.y;
     if (params.orientation == 6u || params.orientation == 8u) {
         mask_aspect = 1.0 / mask_aspect;
     }

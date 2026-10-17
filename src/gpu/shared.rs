@@ -1306,6 +1306,25 @@ impl ImageResources {
     /// image's uniforms and stages currently render. Lets a second resource
     /// set for the same image (the develop preview kept beside a
     /// full-resolution upgrade) be brought to exactly the same state.
+    /// A colour-pass bind group reading `source` with `uniform_buffer`, but
+    /// this image's LUTs (DCP, tone, point curves). The detail loupe renders
+    /// its own crop through it, so its look can't drift from the main view's.
+    pub(crate) fn color_bind_group_with(
+        &self,
+        context: &SharedContext,
+        source: &wgpu::TextureView,
+        uniform_buffer: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        make_color_bind_group(
+            context,
+            source,
+            uniform_buffer,
+            &self.hsv_lut_view,
+            &self.tone_curve_view,
+            &self.curve_view,
+        )
+    }
+
     pub fn pushed_params(&self) -> EditParams {
         *self.stage_params.lock().unwrap_or_else(|e| e.into_inner())
     }

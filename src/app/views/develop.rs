@@ -226,6 +226,12 @@ fn view_sidebar(editor: &RawEditor) -> iced::widget::Column<'_, Message> {
             0.01,
             Message::DehazeChanged,
         ))
+        .push(collapsible_section(
+            editor,
+            "Detail Preview",
+            SidebarSection::DetailPreview,
+            loupe_section(editor),
+        ))
         .push(text("Noise Reduction").size(14))
         .push(slider_row(
             "Luminance",
@@ -633,6 +639,7 @@ fn view_main_content<'a>(
                     brush: (!peeking && editor.brush_armed && editor.selected_mask.is_some())
                         .then_some((editor.brush_settings.size, editor.brush_settings.feather)),
                     is_color_picking: !peeking && editor.color_picking_mask.is_some(),
+                    is_loupe_targeting: !peeking && editor.loupe.targeting,
                 })
                 .width(Length::Fill)
                 .height(Length::Fill)
@@ -1109,6 +1116,64 @@ fn section_header<'a>(editor: &RawEditor, title: &'a str, section: SidebarSectio
         ..Default::default()
     })
     .on_press(Message::ToggleSection(section))
+    .into()
+}
+
+/// The 1:1 detail loupe (`handlers::loupe`). Noise reduction is held back on
+/// the main view while its sliders move; this is where it shows live, at the
+/// sensor's own resolution — the only scale grain can be judged at.
+fn loupe_section(editor: &RawEditor) -> Element<'_, Message> {
+    use crate::app::handlers::loupe::LOUPE_SIZE;
+    let frame = editor.loupe.frame.as_ref().filter(|f| Some(f.image_id) == editor.selected_image_id);
+    let picture: Element<'_, Message> = match frame {
+        Some(f) => stack![
+            iced::widget::image(f.handle.clone())
+                .width(Length::Fixed(LOUPE_SIZE))
+                .height(Length::Fixed(LOUPE_SIZE)),
+            iced::widget::canvas::Canvas::new(ui::loupe::LoupeDrag)
+                .width(Length::Fixed(LOUPE_SIZE))
+                .height(Length::Fixed(LOUPE_SIZE)),
+        ]
+        .into(),
+        None => {
+            let failed = editor.loupe.failed.as_ref().filter(|(id, _)| Some(*id) == editor.selected_image_id);
+            let message = match failed {
+                Some((_, e)) => format!("Unavailable: {e}"),
+                None => "Preparing 1:1 preview…".to_string(),
+            };
+            container(hint(message))
+                .width(Length::Fixed(LOUPE_SIZE))
+                .height(Length::Fixed(LOUPE_SIZE))
+                .center_x(Length::Fixed(LOUPE_SIZE))
+                .center_y(Length::Fixed(LOUPE_SIZE))
+                .into()
+        }
+    };
+    let framed = container(picture).padding(1).style(|_theme| container::Style {
+        background: Some(Background::Color(Color::from_rgb(0.1, 0.1, 0.1))),
+        border: Border { color: Color::from_rgb(0.3, 0.3, 0.3), width: 1.0, radius: 0.0.into() },
+        ..Default::default()
+    });
+
+    let targeting = editor.loupe.targeting;
+    let pick = button(
+        row![
+            text("\u{f05b}").font(ICON_FONT).size(12), // crosshairs
+            text(if targeting { "Click the image…" } else { "Pick Point" }).size(11),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center),
+    )
+    .style(if targeting { ui::styles::AccentButton::style } else { ui::styles::NeutralButton::style })
+    .on_press(Message::ToggleLoupeTarget)
+    .padding([4, 8]);
+
+    column![
+        container(framed).center_x(Length::Fill),
+        pick,
+        hint("Shown at 1:1 — drag to move it. Noise reduction reaches the main image when its slider pauses.".to_string()),
+    ]
+    .spacing(6)
     .into()
 }
 

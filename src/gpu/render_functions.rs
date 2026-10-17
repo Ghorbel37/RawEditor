@@ -72,6 +72,17 @@ fn encode_color_pass(
     height: u32,
 ) -> (wgpu::CommandBuffer, Readback) {
     let bindings = resources.prepare_stages(context);
+    encode_color_pass_with(context, &bindings, width, height)
+}
+
+/// [`encode_color_pass`] with the bind groups supplied — the detail loupe's
+/// group 0 reads its own crop.
+fn encode_color_pass_with(
+    context: &SharedContext,
+    bindings: &super::shared::ColorBindings,
+    width: u32,
+    height: u32,
+) -> (wgpu::CommandBuffer, Readback) {
     let output_texture = context.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("Output Texture"),
         size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
@@ -141,6 +152,26 @@ fn encode_color_pass(
         encoder.finish(),
         Readback { buffer: readback_buffer, bytes_per_row, width, height },
     )
+}
+
+/// Render with explicit bindings (whose group 0 carries its own uniform
+/// buffer) and read the result back. `None` if the readback failed to map.
+pub(crate) async fn render_with_bindings(
+    context: &SharedContext,
+    bindings: &super::shared::ColorBindings,
+    width: u32,
+    height: u32,
+) -> Option<Vec<u8>> {
+    let (cb, readback) = encode_color_pass_with(context, bindings, width, height);
+    context.queue.submit(Some(cb));
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    readback.buffer.slice(..).map_async(wgpu::MapMode::Read, move |res| {
+        let _ = tx.send(res);
+    });
+    tokio::task::block_in_place(|| {
+        context.device.poll(wgpu::Maintain::Wait);
+    });
+    matches!(rx.await, Ok(Ok(()))).then(|| readback.unpad())
 }
 
 /// Like [`render_to_bytes`] but hands back the `Vec` directly.
