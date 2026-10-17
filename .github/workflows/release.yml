@@ -34,6 +34,27 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
 
+      # The tag is the source of truth for the version: write it into
+      # Cargo.toml so env!("CARGO_PKG_VERSION") (About, Preferences, EXIF
+      # Software tag) matches the release. Cargo needs semver, so a letter
+      # suffix becomes a pre-release: v0.9.8E -> 0.9.8-E.
+      - name: Set version from tag
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME#[vV]}"
+          if [[ "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            VERSION="$TAG"
+          elif [[ "$TAG" =~ ^([0-9]+\.[0-9]+\.[0-9]+)([0-9A-Za-z.]+)$ ]]; then
+            VERSION="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}"
+          else
+            echo "::error::Tag '$GITHUB_REF_NAME' is not a version (expected vX.Y.Z)"
+            exit 1
+          fi
+          # Only the first `version =` line, which is [package]'s.
+          sed -i.bak "1,/^version *=/ s/^version *=.*/version = \"$VERSION\"/" Cargo.toml
+          rm Cargo.toml.bak
+          grep -m1 '^version' Cargo.toml
+
       - name: Build release
         if: matrix.os != 'macos-14'
         run: cargo build --release
