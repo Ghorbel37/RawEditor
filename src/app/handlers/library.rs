@@ -339,6 +339,7 @@ pub fn handle_remove_folder_confirmed(editor: &mut RawEditor) -> Task<Message> {
         editor.working_preview_bytes = None;
         editor.rendered_preview_bytes = None;
         editor.image_resources = None;
+        editor.preview_resources = None;
     }
     // The filter would otherwise point at a folder that no longer exists.
     if editor.library_folder_filter.as_deref() == Some(folder.as_str()) {
