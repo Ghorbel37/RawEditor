@@ -766,6 +766,8 @@ pub const RAW_PRELOAD_AHEAD_MAX: usize = 20;
 /// Upper bound for the free-RAM headroom slider. Above this the setting would
 /// pause exports permanently on any ordinary machine.
 pub const MIN_FREE_RAM_MB_MAX: u32 = 16384;
+/// Shortest time the startup splash stays on screen.
+pub const SPLASH_MIN: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl RawEditor {
     pub fn title(&self) -> String {
@@ -947,7 +949,18 @@ impl RawEditor {
                 pending_raw_loads: HashSet::new(),
                 queued_raw_loads: Vec::new(),
             },
-            Task::perform(database::library::load_database(), Message::DatabaseLoaded),
+            // The splash stays up for at least SPLASH_MIN, however fast the
+            // database opens: on a small catalogue it otherwise flashed for a
+            // frame. The load runs meanwhile, so a slow one costs nothing extra.
+            Task::perform(
+                async {
+                    let shown_until = tokio::time::Instant::now() + SPLASH_MIN;
+                    let loaded = database::library::load_database().await;
+                    tokio::time::sleep_until(shown_until).await;
+                    loaded
+                },
+                Message::DatabaseLoaded,
+            ),
         )
     }
 
