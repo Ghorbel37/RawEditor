@@ -74,10 +74,10 @@ fn load_raw_data_blocking(path: &str) -> Result<RawDataResult, String> {
     let params = rawler::decoders::RawDecodeParams::default();
     let mut raw_image = rawler::decode(&source, &params)
         .map_err(|e| format!("Failed to decode RAW: {:?}", e))?;
-    let lens_desc = rawler::get_decoder(&source)
+    let raw_metadata = rawler::get_decoder(&source)
         .and_then(|d| d.raw_metadata(&source, &params))
-        .ok()
-        .and_then(|m| m.lens);
+        .ok();
+    let lens_desc = raw_metadata.as_ref().and_then(|m| m.lens.clone());
 
     // The debayer pass reads one sample per photosite from a 2×2 CFA.
     // Anything else — X-Trans's 6×6 pattern, linear DNGs with three samples
@@ -309,9 +309,13 @@ fn load_raw_data_blocking(path: &str) -> Result<RawDataResult, String> {
     //     black_levels[0], black_levels[1], black_levels[2], black_levels[3]
     // );
 
-    // Phase 119: EXIF metadata via kamadak-exif (rawler's Exif is internal to its decoders)
-    let exif = extract_metadata_kamadak(path.to_str().unwrap_or_default());
-    let orientation = normalize_orientation(exif.orientation);
+    // EXIF via kamadak-exif, with rawler's own parse filling whatever it
+    // could not read (see `ExifInfo::fill_from`).
+    let mut exif = extract_metadata_kamadak(path.to_str().unwrap_or_default());
+    if let Some(meta) = &raw_metadata {
+        exif.fill_from(&meta.exif);
+    }
+    let orientation = normalize_orientation(exif.orientation.unwrap_or(1));
     let (iso, shutter_speed, aperture) = (exif.iso, exif.shutter, exif.aperture);
 
     // Lens: EXIF LensModel where the camera writes one, else the maker-note
@@ -402,10 +406,53 @@ struct ExifInfo {
     aperture: String,
     lens_make: Option<String>,
     lens_model: Option<String>,
-    orientation: u32,
+    orientation: Option<u32>,
     focal: Option<f32>,
     focal_35mm: Option<f32>,
     fnumber: Option<f32>,
+}
+
+impl ExifInfo {
+    /// Fill what kamadak-exif left out from rawler's parse of the same file.
+    /// kamadak only opens standard TIFF containers, so RW2 (`IIU`) and ORF
+    /// (`IIRO`) come back empty — no focal length meant no lens profile, and
+    /// no orientation left portrait shots sideways. Never overrides a value
+    /// kamadak read.
+    fn fill_from(&mut self, e: &rawler::exif::Exif) {
+        use rawler::formats::tiff::Rational;
+        let value = |r: &Rational| (r.d != 0).then(|| r.n as f64 / r.d as f64).filter(|v| *v > 0.0);
+        if self.iso == "---" {
+            if let Some(iso) = e.iso_speed_ratings.map(u32::from).or(e.iso_speed).or(e.recommended_exposure_index) {
+                self.iso = iso.to_string();
+            }
+        }
+        if self.shutter == "---" {
+            // kamadak's own format: whole seconds, or 1/x below one.
+            if let Some(t) = e.exposure_time.filter(|t| t.n != 0 && t.d != 0) {
+                self.shutter = if t.n >= t.d {
+                    (t.n as f64 / t.d as f64).to_string()
+                } else {
+                    format!("1/{}", t.d as f64 / t.n as f64)
+                };
+            }
+        }
+        if self.fnumber.is_none() {
+            if let Some(f) = e.fnumber.as_ref().and_then(value) {
+                self.fnumber = Some(f as f32);
+                self.aperture = f.to_string();
+            }
+        }
+        if self.focal.is_none() {
+            self.focal = e.focal_length.as_ref().and_then(value).map(|f| f as f32);
+        }
+        if self.lens_model.is_none() {
+            self.lens_model = e.lens_model.clone().filter(|m| !m.trim().is_empty());
+            self.lens_make = self.lens_make.take().or_else(|| e.lens_make.clone());
+        }
+        if self.orientation.is_none() {
+            self.orientation = e.orientation.map(u32::from);
+        }
+    }
 }
 
 /// Phase 119: EXIF extraction via kamadak-exif only (rexif removed)
@@ -416,7 +463,7 @@ fn extract_metadata_kamadak(path: &str) -> ExifInfo {
         aperture: "---".to_string(),
         lens_make: None,
         lens_model: None,
-        orientation: 1,
+        orientation: None,
         focal: None,
         focal_35mm: None,
         fnumber: None,
@@ -463,9 +510,7 @@ fn extract_metadata_kamadak(path: &str) -> ExifInfo {
                 info.focal_35mm = number(field);
             }
             if let Some(field) = get(exif::Tag::Orientation) {
-                if let Some(v) = field.value.get_uint(0) {
-                    info.orientation = v;
-                }
+                info.orientation = field.value.get_uint(0);
             }
         }
     }

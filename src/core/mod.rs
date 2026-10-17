@@ -1,6 +1,8 @@
 pub mod brush;
 pub mod camera_profiles;
 pub mod curves;
+#[cfg(target_os = "linux")]
+pub mod desktop;
 pub mod haze;
 pub mod highlights;
 pub mod histogram;

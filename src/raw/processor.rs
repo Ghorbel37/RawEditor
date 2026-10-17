@@ -104,17 +104,24 @@ fn apply_orientation(img: image::DynamicImage, orientation: u32) -> image::Dynam
 }
 
 /// Container-level EXIF orientation from the RAW's bytes (no image decode).
+/// Formats kamadak-exif cannot open (RW2, ORF) ask rawler's metadata parse,
+/// as the loader does — or the grid would show a portrait shot sideways that
+/// Develop shows upright.
 fn exif_orientation(file: &[u8]) -> u32 {
-    let Ok(exif_data) =
-        exif::Reader::new().read_from_container(&mut std::io::Cursor::new(file))
-    else {
-        return 1;
+    let orientation = match exif::Reader::new().read_from_container(&mut std::io::Cursor::new(file)) {
+        Ok(exif_data) => exif_data
+            .get_field(exif::Tag::Orientation, exif::In::PRIMARY)
+            .and_then(|f| f.value.get_uint(0)),
+        Err(_) => {
+            let source = rawler::rawsource::RawSource::new_from_slice(file);
+            rawler::get_decoder(&source)
+                .and_then(|d| d.raw_metadata(&source, &rawler::decoders::RawDecodeParams::default()))
+                .ok()
+                .and_then(|m| m.exif.orientation)
+                .map(u32::from)
+        }
     };
-    let orientation = exif_data
-        .get_field(exif::Tag::Orientation, exif::In::PRIMARY)
-        .and_then(|f| f.value.get_uint(0))
-        .unwrap_or(1);
-    crate::raw::loader::normalize_orientation(orientation)
+    crate::raw::loader::normalize_orientation(orientation.unwrap_or(1))
 }
 
 fn resize_to_width(img: &image::DynamicImage, target_width: u32, filter: FilterType) -> image::DynamicImage {

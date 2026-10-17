@@ -13,9 +13,43 @@ use crate::app::message::Message;
 
 pub struct LoupeDrag;
 
+#[derive(Debug, Default)]
+pub struct DragState {
+    /// The pointer's last position in window coordinates — the
+    /// `CursorMoved` event's own. Never `cursor.position()`: inside the
+    /// sidebar's scrollable that is shifted by the scroll offset, so mixing
+    /// the two made every drag's first move jump by it.
+    pointer: Option<Point>,
+    dragging: bool,
+}
+
+impl DragState {
+    /// Feed one event; the pan it makes, in logical pixels, if any.
+    fn on(&mut self, event: &mouse::Event, over: bool) -> Option<Option<(f32, f32)>> {
+        match *event {
+            mouse::Event::ButtonPressed(mouse::Button::Left) if over => {
+                self.dragging = true;
+                Some(None)
+            }
+            // Followed past the loupe's edge too: the canvas sees every move.
+            mouse::Event::CursorMoved { position } => {
+                let last = self.pointer.replace(position);
+                if !self.dragging {
+                    return None;
+                }
+                Some(last.map(|l| (position.x - l.x, position.y - l.y)))
+            }
+            mouse::Event::ButtonReleased(mouse::Button::Left) if self.dragging => {
+                self.dragging = false;
+                Some(None)
+            }
+            _ => None,
+        }
+    }
+}
+
 impl canvas::Program<Message> for LoupeDrag {
-    /// The pointer's last position while a drag is in progress.
-    type State = Option<Point>;
+    type State = DragState;
 
     fn update(
         &self,
@@ -25,21 +59,10 @@ impl canvas::Program<Message> for LoupeDrag {
         cursor: Cursor,
     ) -> (canvas::event::Status, Option<Message>) {
         use canvas::event::Status;
-        match event {
-            canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) if cursor.is_over(bounds) => {
-                *state = cursor.position();
-                (Status::Captured, None)
-            }
-            // Followed past the loupe's edge too: the canvas sees every move.
-            canvas::Event::Mouse(mouse::Event::CursorMoved { position }) if state.is_some() => {
-                let last = state.replace(position).unwrap_or(position);
-                (Status::Captured, Some(Message::LoupePan(position.x - last.x, position.y - last.y)))
-            }
-            canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) if state.is_some() => {
-                *state = None;
-                (Status::Captured, None)
-            }
-            _ => (Status::Ignored, None),
+        let canvas::Event::Mouse(event) = event else { return (Status::Ignored, None) };
+        match state.on(&event, cursor.is_over(bounds)) {
+            Some(pan) => (Status::Captured, pan.map(|(dx, dy)| Message::LoupePan(dx, dy))),
+            None => (Status::Ignored, None),
         }
     }
 
@@ -55,12 +78,43 @@ impl canvas::Program<Message> for LoupeDrag {
     }
 
     fn mouse_interaction(&self, state: &Self::State, bounds: Rectangle, cursor: Cursor) -> mouse::Interaction {
-        if state.is_some() {
+        if state.dragging {
             mouse::Interaction::Grabbing
         } else if cursor.is_over(bounds) {
             mouse::Interaction::Grab
         } else {
             mouse::Interaction::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn moved(x: f32, y: f32) -> mouse::Event {
+        mouse::Event::CursorMoved { position: Point::new(x, y) }
+    }
+
+    /// A drag moves by exactly what the pointer moved, from its first move —
+    /// whatever the press's `cursor` said (a scrolled sidebar shifts it).
+    #[test]
+    fn a_drag_pans_by_the_pointer_movement_only() {
+        let mut s = DragState::default();
+        assert_eq!(s.on(&moved(100.0, 200.0), false), None, "hovering emitted");
+        assert_eq!(s.on(&mouse::Event::ButtonPressed(mouse::Button::Left), true), Some(None));
+        assert_eq!(s.on(&moved(103.0, 198.0), true), Some(Some((3.0, -2.0))));
+        // Past the loupe's edge, still followed.
+        assert_eq!(s.on(&moved(90.0, 250.0), false), Some(Some((-13.0, 52.0))));
+        assert_eq!(s.on(&mouse::Event::ButtonReleased(mouse::Button::Left), false), Some(None));
+        assert_eq!(s.on(&moved(0.0, 0.0), false), None);
+    }
+
+    /// A press outside the loupe is someone else's.
+    #[test]
+    fn a_press_elsewhere_is_ignored() {
+        let mut s = DragState::default();
+        assert_eq!(s.on(&mouse::Event::ButtonPressed(mouse::Button::Left), false), None);
+        assert_eq!(s.on(&moved(5.0, 5.0), false), None);
     }
 }

@@ -96,6 +96,15 @@ jobs:
           cp -r assets "$BUNDLE/Contents/Resources/"
           cp README.md LICENSE "$BUNDLE/Contents/Resources/" 2>/dev/null || true
 
+          # Dock / Finder icon: every size iconutil expects, from the one PNG.
+          ICONSET="$RUNNER_TEMP/RawEditor.iconset"
+          mkdir -p "$ICONSET"
+          for s in 16 32 128 256 512; do
+            sips -z $s $s assets/icon.png --out "$ICONSET/icon_${s}x${s}.png" >/dev/null
+            sips -z $((s * 2)) $((s * 2)) assets/icon.png --out "$ICONSET/icon_${s}x${s}@2x.png" >/dev/null
+          done
+          iconutil -c icns "$ICONSET" -o "$BUNDLE/Contents/Resources/RawEditor.icns"
+
           cat > "$BUNDLE/Contents/Info.plist" <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -105,6 +114,7 @@ jobs:
             <key>CFBundleDisplayName</key><string>RawEditor</string>
             <key>CFBundleIdentifier</key><string>io.github.happyslappyface.raweditor</string>
             <key>CFBundleExecutable</key><string>$APP</string>
+            <key>CFBundleIconFile</key><string>RawEditor</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleShortVersionString</key><string>${VERSION#v}</string>
             <key>CFBundleVersion</key><string>${VERSION#v}</string>

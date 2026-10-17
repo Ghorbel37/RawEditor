@@ -252,8 +252,8 @@ impl LensDb {
     /// overlap.
     pub fn find(&self, maker: &str, model: &str) -> Option<&LensCalibration> {
         let mut query = tokens(model);
-        let maker_tokens = tokens(maker);
-        query.extend(maker_tokens.iter().cloned());
+        query.extend(tokens(maker));
+        let maker_tokens = maker_words(maker);
         let (q_num, q_words) = split_numeric(&query);
         if q_num.is_empty() {
             return None;
@@ -268,7 +268,7 @@ impl LensDb {
                     return None;
                 }
                 // A known maker must agree (Sigma's 17-50 is not Nikon's).
-                let lm = tokens(&l.maker);
+                let lm = maker_words(&l.maker);
                 if !maker_tokens.is_empty() && !lm.is_empty() && !lm.iter().any(|t| maker_tokens.contains(t)) {
                     return None;
                 }
@@ -300,13 +300,49 @@ impl LensDb {
     }
 }
 
+/// Brand names a lens maker is also known by, as a maker word → the word
+/// lensfun files it under. Panasonic's lenses report "Lumix" (rawler's lens
+/// table, which is where RW2 lens names come from); Rokinon sells Samyang's
+/// lenses and Laowa is Venus Optics'; HD Pentax lenses are Ricoh's now, and
+/// OM Digital Solutions makes Olympus's.
+const MAKER_ALIASES: &[(&str, &str)] =
+    &[("lumix", "panasonic"), ("rokinon", "samyang"), ("laowa", "venus"), ("ricoh", "pentax"), ("om", "olympus")];
+
+/// A maker's words for comparing makers, aliases included.
+fn maker_words(maker: &str) -> TokenSet {
+    let mut words = tokens(maker);
+    for (alias, maker) in MAKER_ALIASES {
+        if words.contains(*alias) {
+            words.insert(maker.to_string());
+        }
+    }
+    words
+}
+
+/// Latin letters with diacritics → their base letter, so "Voigtländer"
+/// (lensfun) and "Voigtlander" (EXIF) are one word.
+fn fold(c: char) -> char {
+    match c {
+        'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' => 'a',
+        'ç' => 'c',
+        'è' | 'é' | 'ê' | 'ë' => 'e',
+        'ì' | 'í' | 'î' | 'ï' => 'i',
+        'ñ' => 'n',
+        'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' => 'o',
+        'ù' | 'ú' | 'û' | 'ü' => 'u',
+        'ý' | 'ÿ' => 'y',
+        _ => c,
+    }
+}
+
 /// Lower-cased alphanumeric runs, split at letter/digit boundaries, with
-/// decimals kept whole: "AF-S 18-55mm f/3.5-5.6G" → af s 18 55 mm f 3.5 5.6 g.
+/// decimals kept whole and diacritics dropped: "AF-S 18-55mm f/3.5-5.6G" →
+/// af s 18 55 mm f 3.5 5.6 g.
 pub(crate) fn tokens(s: &str) -> std::collections::BTreeSet<String> {
     let mut out = std::collections::BTreeSet::new();
     let mut cur = String::new();
     let mut cur_digit = false;
-    let chars: Vec<char> = s.to_lowercase().chars().collect();
+    let chars: Vec<char> = s.to_lowercase().chars().map(fold).collect();
     for (i, &c) in chars.iter().enumerate() {
         let is_decimal_point =
             c == '.' && cur_digit && chars.get(i + 1).is_some_and(|n| n.is_ascii_digit());
@@ -801,6 +837,30 @@ mod tests {
         assert!(l.model.contains("17-50"));
         assert!(db.find("Sigma", "17-50mm F4").is_none(), "aperture must match");
         assert!(db.find("Nikon", "17-50mm F2.8 EX DC OS HSM").is_none(), "maker must match");
+    }
+
+    /// RW2 lens names come from rawler's table, which calls Panasonic's
+    /// lenses "Lumix" — lensfun files them under "Panasonic", and spells
+    /// apertures "f/3.5" where the camera says "F3.5". Accents differ too.
+    #[test]
+    fn finds_lenses_under_another_brand_name_or_spelling() {
+        let (lenses, cameras) = parse(
+            r#"<lensdatabase>
+            <lens><maker>Panasonic</maker><model>Lumix G Vario 12-32mm f/3.5-5.6 Asph. Mega OIS</model>
+                <mount>Micro 4/3 System</mount><cropfactor>2</cropfactor></lens>
+            <lens><maker>Panasonic</maker><model>Lumix G Vario 14-42mm f/3.5-5.6 II Asph. Mega OIS</model>
+                <mount>Micro 4/3 System</mount><cropfactor>2</cropfactor></lens>
+            <lens><maker>Voigtländer</maker><model>Voigtlander Nokton 58mm F1.4 SLII</model>
+                <mount>Nikon F AF</mount><cropfactor>1</cropfactor></lens>
+            </lensdatabase>"#,
+        );
+        let db = LensDb { lenses, cameras, sources: Vec::new() };
+        let l = db.find("Lumix", "G Vario 12-32mm F3.5-5.6 Asph. Mega OIS").expect("Lumix is Panasonic");
+        assert!(l.model.contains("12-32mm"));
+        assert!(db.find("Voigtlander", "Nokton 58mm F1.4 SLII").is_some(), "the umlaut kept them apart");
+        // Aliases widen the maker, never the numbers.
+        assert!(db.find("Lumix", "G Vario 12-60mm F3.5-5.6 Asph. Power OIS").is_none());
+        assert!(db.find("Olympus", "G Vario 12-32mm F3.5-5.6 Asph. Mega OIS").is_none(), "maker must match");
     }
 
     #[test]
