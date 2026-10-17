@@ -4,9 +4,11 @@
 //!
 //! ## Profiles
 //! The lensfun database (CC-BY-SA, shipped by darktable/RawTherapee/the
-//! `lensfun` package) is read at runtime from the usual install locations, or
-//! from `~/.local/share/raw-editor/lensfun/`. Nothing is bundled: without it
-//! only the manual controls are available.
+//! `lensfun` package) is read at runtime from the user's own folder
+//! (`paths::lensfun_dir`), the copy the app downloads on request
+//! (`core::lensfun`, into `paths::lensfun_updates_dir`), and the usual system
+//! install locations. Nothing is bundled: without it only the manual
+//! controls are available.
 //!
 //! ## Coordinates
 //! lensfun stores coefficients in Hugin's convention: radius 1 = half the
@@ -24,7 +26,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, RwLock};
 
 /// The user's lens settings. Lives in `EditParams`.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
@@ -115,12 +117,26 @@ pub struct CameraEntry {
     pub crop_factor: f32,
 }
 
-static DB: OnceLock<LensDb> = OnceLock::new();
+/// The process-wide database. `None` until first needed; replaced by
+/// [`LensDb::reload`] after a download or when the user rescans.
+static DB: RwLock<Option<Arc<LensDb>>> = RwLock::new(None);
 
 #[derive(Debug, Default)]
 pub struct LensDb {
     pub lenses: Vec<LensCalibration>,
     pub cameras: Vec<CameraEntry>,
+    /// Every folder that contributed, in search order.
+    pub sources: Vec<DbSource>,
+}
+
+/// One folder the database was read from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DbSource {
+    pub dir: PathBuf,
+    pub files: usize,
+    /// lensfun's `timestamp.txt` (seconds since the epoch), written by its
+    /// own updater and by `core::lensfun`; absent for packaged copies.
+    pub timestamp: Option<i64>,
 }
 
 /// Profile coefficients interpolated to one shot's focal length and aperture.
@@ -151,8 +167,7 @@ pub struct LensContext {
 
 /// Where lensfun databases live, in priority order.
 pub fn search_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    dirs.push(crate::core::paths::data_dir().join("lensfun"));
+    let mut dirs = vec![crate::core::paths::lensfun_dir(), crate::core::paths::lensfun_updates_dir()];
     if let Some(data) = dirs::data_dir() {
         dirs.push(data.join("lensfun").join("updates").join("version_1"));
         dirs.push(data.join("lensfun").join("version_1"));
@@ -167,22 +182,32 @@ pub fn search_dirs() -> Vec<PathBuf> {
 impl LensDb {
     /// The process-wide database, loaded on first use. Reads files: call it
     /// only off the UI thread (the RAW loader does, inside `spawn_blocking`).
-    pub fn global() -> &'static LensDb {
-        DB.get_or_init(|| {
-            let db = LensDb::load(&search_dirs());
-            tracing::info!(
-                "lens database: {} lenses, {} cameras",
-                db.lenses.len(),
-                db.cameras.len()
-            );
-            db
-        })
+    pub fn global() -> Arc<LensDb> {
+        if let Some(db) = Self::loaded() {
+            return db;
+        }
+        Self::reload()
     }
 
-    /// Lenses in the database, if it has been loaded already — never loads
-    /// it, so the UI thread can ask.
+    /// Read the search folders again and make the result the process-wide
+    /// database — after a download, or when the user has added files.
+    /// Blocking, like [`global`](Self::global).
+    pub fn reload() -> Arc<LensDb> {
+        let db = Arc::new(LensDb::load(&search_dirs()));
+        tracing::info!("lens database: {} lenses, {} cameras", db.lenses.len(), db.cameras.len());
+        *DB.write().unwrap_or_else(|e| e.into_inner()) = Some(db.clone());
+        db
+    }
+
+    /// The database if it has been loaded already — never reads a file, so
+    /// the UI thread can ask.
+    pub fn loaded() -> Option<Arc<LensDb>> {
+        DB.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Lenses in the database, if it has been loaded already (see `loaded`).
     pub fn loaded_count() -> Option<usize> {
-        DB.get().map(|db| db.lenses.len())
+        Self::loaded().map(|db| db.lenses.len())
     }
 
     /// Load every `*.xml` in the first directory that has any; later
@@ -197,6 +222,12 @@ impl LensDb {
                 .filter(|p| p.extension().is_some_and(|x| x == "xml"))
                 .collect();
             files.sort();
+            if !files.is_empty() {
+                let timestamp = std::fs::read_to_string(dir.join("timestamp.txt"))
+                    .ok()
+                    .and_then(|t| t.trim().parse().ok());
+                db.sources.push(DbSource { dir: dir.clone(), files: files.len(), timestamp });
+            }
             for f in files {
                 match std::fs::read_to_string(&f) {
                     Ok(xml) => {
@@ -744,7 +775,7 @@ mod tests {
 
     fn db() -> LensDb {
         let (lenses, cameras) = parse(XML);
-        LensDb { lenses, cameras }
+        LensDb { lenses, cameras, sources: Vec::new() }
     }
 
     #[test]

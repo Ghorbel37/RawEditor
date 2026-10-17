@@ -409,6 +409,17 @@ pub enum Message {
     /// A noise-reduction drag paused: let the main view catch up, if this is
     /// still the latest tick's timer.
     NoiseSettled(u64),
+    /// Ask lensfun what database it currently publishes.
+    LensfunCheck,
+    LensfunChecked(Result<crate::core::lensfun::Remote, String>),
+    /// Download (or update) the lensfun database.
+    LensfunDownload,
+    LensfunInstalled(Result<crate::core::lensfun::Installed, String>),
+    /// Re-read the lens folders — after adding XML files by hand.
+    LensfunRescan,
+    /// The lens database was (re)loaded in the background. `true` when it
+    /// may have changed, so the open image's profile lookup is stale.
+    LensDbLoaded(bool),
     /// Open a URL in the default browser (Preferences › Licenses).
     OpenLink(&'static str),
     /// Preferences side menu: show this page.

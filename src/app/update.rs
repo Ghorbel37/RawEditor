@@ -329,6 +329,12 @@ fn dispatch(editor: &mut RawEditor, message: Message) -> Task<Message> {
         Message::ToggleLoupeTarget => handlers::loupe::handle_toggle_target(editor),
         Message::LoupeTargetPicked(u, v) => handlers::loupe::handle_target_picked(editor, u, v),
         Message::NoiseSettled(token) => handlers::loupe::handle_noise_settled(editor, token),
+        Message::LensfunCheck => handlers::lensfun::handle_check(editor),
+        Message::LensfunChecked(r) => handlers::lensfun::handle_checked(editor, r),
+        Message::LensfunDownload => handlers::lensfun::handle_download(editor),
+        Message::LensfunInstalled(r) => handlers::lensfun::handle_installed(editor, r),
+        Message::LensfunRescan => handlers::lensfun::handle_rescan(editor),
+        Message::LensDbLoaded(changed) => handlers::lensfun::handle_db_loaded(editor, changed),
         Message::OpenLink(url) => handlers::window::handle_open_link(editor, url),
         Message::SetPreferencesSection(section) => {
             handlers::window::handle_set_preferences_section(editor, section)

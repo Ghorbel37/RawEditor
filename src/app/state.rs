@@ -139,6 +139,27 @@ impl Default for LoupeState {
     }
 }
 
+/// A lens-database job in progress (`handlers::lensfun`). One at a time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LensfunJob {
+    /// Asking lensfun what it currently publishes.
+    Checking,
+    Downloading,
+    /// Re-reading the lens folders (files added by hand).
+    Rescanning,
+}
+
+/// Lens-profile database downloads and checks, for Preferences › Lens
+/// Profiles and the Lens Corrections panel.
+#[derive(Debug, Default)]
+pub struct LensfunState {
+    pub busy: Option<LensfunJob>,
+    /// The last check's answer.
+    pub remote: Option<Result<crate::core::lensfun::Remote, String>>,
+    /// The last download's outcome.
+    pub installed: Option<Result<crate::core::lensfun::Installed, String>>,
+}
+
 /// The pages of the Preferences side menu, in menu order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PreferencesSection {
@@ -146,15 +167,17 @@ pub enum PreferencesSection {
     General,
     Performance,
     Memory,
+    LensProfiles,
     Folders,
     Licenses,
 }
 
 impl PreferencesSection {
-    pub const ALL: [PreferencesSection; 5] = [
+    pub const ALL: [PreferencesSection; 6] = [
         PreferencesSection::General,
         PreferencesSection::Performance,
         PreferencesSection::Memory,
+        PreferencesSection::LensProfiles,
         PreferencesSection::Folders,
         PreferencesSection::Licenses,
     ];
@@ -636,6 +659,7 @@ pub struct RawEditor {
     /// Matches the settle timer to the latest noise-slider tick.
     pub noise_settle_token: u64,
     pub loupe: LoupeState,
+    pub lensfun: LensfunState,
 
     // ── Scroll boost + filmstrip momentum ──────────────────────────────────
     /// True while the cursor is over the library grid, from the grid's own
@@ -850,6 +874,7 @@ impl RawEditor {
                 held_noise: None,
                 noise_settle_token: 0,
                 loupe: LoupeState::default(),
+                lensfun: LensfunState::default(),
                 cursor_over_grid: false,
                 grid_scroll_y: 0.0,
                 grid_viewport: (0.0, 0.0),

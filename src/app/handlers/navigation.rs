@@ -776,6 +776,22 @@ fn apply_mask_drag(editor: &mut RawEditor, pos: Point, last: Point, h: MaskHandl
     }
 }
 
+/// Decode the selected image again. Its lens profile is looked up when the
+/// RAW is read, so after the lens database changes the loaded one is stale.
+/// The edits are untouched — only the decode is redone.
+pub fn reload_selected_image(editor: &mut RawEditor) -> Task<Message> {
+    let Some(image_id) = editor.selected_image_id else { return Task::none() };
+    if editor.current_tab == AppTab::Develop {
+        trigger_image_load(editor, image_id)
+    } else {
+        // Not on screen: entering Develop decodes it afresh.
+        editor.image_resources = None;
+        editor.preview_resources = None;
+        editor.editor_readiness = EditorReadiness::NoSelection;
+        Task::none()
+    }
+}
+
 fn trigger_image_load(editor: &mut RawEditor, image_id: i64) -> Task<Message> {
     editor.working_preview = None;
     // `full_res_upgrading` is deliberately NOT reset: an upgrade of the

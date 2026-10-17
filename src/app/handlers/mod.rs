@@ -10,3 +10,4 @@ pub mod loading;
 pub mod delete;
 pub mod proxy;
 pub mod loupe;
+pub mod lensfun;

@@ -76,6 +76,14 @@ tiff = "0.9"
 half = { version = "2.7.1", features = ["bytemuck"] }
 trash = "5.2.6"
 
+# Lens-profile download (Preferences › Lens Profiles): the lensfun database is
+# fetched on request from lensfun.github.io — the app makes no other network
+# requests. Blocking HTTP (run in `spawn_blocking`) over rustls, so no OpenSSL
+# on any platform; pure-Rust bzip2 and tar for the `version_N.tar.bz2` archive.
+ureq = { version = "3.4", default-features = false, features = ["rustls"] }
+bzip2-rs = "0.1.2"
+tar = { version = "0.4.46", default-features = false }
+
 
 [dev-dependencies]
 # Shader compile-time validation in unit tests (same version wgpu 0.19 uses)

@@ -36,6 +36,19 @@ pub fn profiles_dir() -> PathBuf {
     data_dir().join("profiles")
 }
 
+/// The user's own lensfun XML files. Searched before everything else, so a
+/// hand-made calibration overrides the downloaded one.
+pub fn lensfun_dir() -> PathBuf {
+    data_dir().join("lensfun")
+}
+
+/// The lensfun database as downloaded by the app (`core::lensfun`). Owned
+/// by the app — replaced wholesale on update — which is why it is not
+/// `lensfun_dir` itself, where the user's files live.
+pub fn lensfun_updates_dir() -> PathBuf {
+    lensfun_dir().join("updates")
+}
+
 /// One of the folders Preferences › Folders can open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppFolder {
@@ -43,6 +56,8 @@ pub enum AppFolder {
     Data,
     /// [`cache_dir`]
     Cache,
+    /// [`lensfun_dir`]
+    Lensfun,
 }
 
 impl AppFolder {
@@ -50,6 +65,7 @@ impl AppFolder {
         match self {
             AppFolder::Data => Some(data_dir()),
             AppFolder::Cache => cache_dir(),
+            AppFolder::Lensfun => Some(lensfun_dir()),
         }
     }
 }

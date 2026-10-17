@@ -4,6 +4,7 @@ pub mod haze;
 pub mod highlights;
 pub mod histogram;
 pub mod lens;
+pub mod lensfun;
 pub mod logging;
 pub mod memory;
 pub mod noise;

@@ -65,10 +65,18 @@ pub fn handle_set_preferences_section(
         return Task::none();
     }
     editor.preferences_section = section;
-    iced::widget::scrollable::snap_to(
-        crate::app::views::preferences::content_scroll_id(),
-        iced::widget::scrollable::RelativeOffset::START,
-    )
+    let status = if section == crate::app::state::PreferencesSection::LensProfiles {
+        crate::app::handlers::lensfun::ensure_loaded()
+    } else {
+        Task::none()
+    };
+    Task::batch([
+        status,
+        iced::widget::scrollable::snap_to(
+            crate::app::views::preferences::content_scroll_id(),
+            iced::widget::scrollable::RelativeOffset::START,
+        ),
+    ])
 }
 
 pub fn handle_open_link(editor: &mut RawEditor, url: &'static str) -> Task<Message> {
@@ -162,9 +170,18 @@ pub fn handle_drag_window(editor: &mut RawEditor) -> Task<Message> {
 
 pub fn handle_open_modal(editor: &mut RawEditor, modal: Modal) -> Task<Message> {
     editor.active_modal = modal;
+    // Preferences reopens on its last page; Lens Profiles shows what the
+    // database holds, which may not have been read yet.
+    let status = if modal == Modal::Preferences
+        && editor.preferences_section == crate::app::state::PreferencesSection::LensProfiles
+    {
+        crate::app::handlers::lensfun::ensure_loaded()
+    } else {
+        Task::none()
+    };
     // A modal takes the keyboard, so Space will never deliver its release
     // edge — leave the before/after peek before it can get stranded.
-    crate::app::handlers::develop::clear_before_peek(editor)
+    Task::batch([status, crate::app::handlers::develop::clear_before_peek(editor)])
 }
 
 /// Enter — route to whichever modal is open.

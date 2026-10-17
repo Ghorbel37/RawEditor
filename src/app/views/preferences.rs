@@ -19,7 +19,7 @@ use crate::ui;
 use crate::ui::icons::ICON_FONT;
 use crate::ui::widgets::button;
 
-const MENU_WIDTH: f32 = 168.0;
+const MENU_WIDTH: f32 = 184.0;
 const MENU_ROW: f32 = 34.0;
 const BODY_HEIGHT: f32 = 460.0;
 const CARD_WIDTH: f32 = 700.0;
@@ -38,6 +38,7 @@ impl PreferencesSection {
             PreferencesSection::General => "General",
             PreferencesSection::Performance => "Performance",
             PreferencesSection::Memory => "Memory",
+            PreferencesSection::LensProfiles => "Lens Profiles",
             PreferencesSection::Folders => "Folders",
             PreferencesSection::Licenses => "Licenses",
         }
@@ -49,6 +50,7 @@ impl PreferencesSection {
             PreferencesSection::General => "\u{f013}",     // cog
             PreferencesSection::Performance => "\u{f0e4}", // tachometer
             PreferencesSection::Memory => "\u{f2db}",      // microchip
+            PreferencesSection::LensProfiles => "\u{f030}", // camera
             PreferencesSection::Folders => ui::icons::FOLDER,
             PreferencesSection::Licenses => "\u{f24e}",    // balance scale
         }
@@ -62,6 +64,7 @@ pub fn view_preferences_modal(editor: &RawEditor) -> Element<'_, Message> {
         PreferencesSection::General => general(editor),
         PreferencesSection::Performance => performance(editor),
         PreferencesSection::Memory => memory(editor),
+        PreferencesSection::LensProfiles => lens_profiles(editor),
         PreferencesSection::Folders => folders(),
         PreferencesSection::Licenses => licenses(),
     };
@@ -300,6 +303,166 @@ fn memory(editor: &RawEditor) -> Element<'_, Message> {
     .into()
 }
 
+// ── lens profiles ───────────────────────────────────────────────────────────
+
+/// The lensfun database: what is installed and where from, downloading and
+/// updating it (`handlers::lensfun`), and the folder for the user's own files.
+fn lens_profiles(editor: &RawEditor) -> Element<'_, Message> {
+    use crate::app::state::LensfunJob;
+    use crate::core::lensfun::format_date;
+
+    let db = crate::core::lens::LensDb::loaded();
+    let state = &editor.lensfun;
+    let busy = state.busy;
+    let own_dir = crate::core::paths::lensfun_dir();
+    let downloaded_dir = crate::core::paths::lensfun_updates_dir();
+
+    // What is installed, folder by folder.
+    let installed: Element<'_, Message> = match &db {
+        None => hint("Reading the lens folders…"),
+        Some(db) if db.lenses.is_empty() => hint(
+            "No lens profiles are installed yet. Download the lensfun database below — or add XML files by hand.",
+        ),
+        Some(db) => {
+            let sources = db.sources.iter().fold(column![].spacing(6), |list, s| {
+                let origin = if s.dir == own_dir {
+                    "Your own files"
+                } else if s.dir == downloaded_dir {
+                    "Downloaded by RawEditor"
+                } else {
+                    "Installed on this system"
+                };
+                let files = if s.files == 1 { "1 file".to_string() } else { format!("{} files", s.files) };
+                let detail = match s.timestamp {
+                    Some(t) => format!("{files} · published {}", format_date(t)),
+                    None => files,
+                };
+                list.push(
+                    column![
+                        row![
+                            text(origin).size(12).style(|_| text::Style {
+                                color: Some(Color::from_rgb(0.8, 0.8, 0.8))
+                            }),
+                            Space::with_width(Length::Fill),
+                            text(detail).size(11).style(|_| text::Style {
+                                color: Some(Color::from_rgb(0.5, 0.5, 0.5))
+                            }),
+                        ]
+                        .align_y(Alignment::Center),
+                        text(s.dir.display().to_string()).size(11).style(|_| text::Style {
+                            color: Some(ui::palette::accent_text())
+                        }),
+                    ]
+                    .spacing(2),
+                )
+            });
+            column![
+                readout(format!("{} lenses · {} cameras", db.lenses.len(), db.cameras.len())),
+                sources,
+            ]
+            .spacing(10)
+            .into()
+        }
+    };
+
+    // The newest copy on disk, for "up to date?".
+    let newest_local = db.as_ref().and_then(|d| d.sources.iter().filter_map(|s| s.timestamp).max());
+    let has_download = db.as_ref().is_some_and(|d| d.sources.iter().any(|s| s.dir == downloaded_dir));
+    let warn = Color::from_rgb(0.9, 0.55, 0.3);
+    let ok = Color::from_rgb(0.55, 0.75, 0.55);
+    let status: Option<(String, Color)> = match busy {
+        Some(LensfunJob::Checking) => Some(("Checking lensfun.github.io…".into(), ok)),
+        Some(LensfunJob::Downloading) => Some(("Downloading…".into(), ok)),
+        Some(LensfunJob::Rescanning) => Some(("Reading the lens folders…".into(), ok)),
+        None => match (&state.installed, &state.remote) {
+            (Some(Err(e)), _) => Some((format!("Download failed: {e}"), warn)),
+            (Some(Ok(i)), _) => Some((
+                format!("Installed {} lenses, published {}", i.lenses, format_date(i.timestamp)),
+                ok,
+            )),
+            (None, Some(Err(e))) => Some((format!("Couldn't check: {e}"), warn)),
+            (None, Some(Ok(r))) if newest_local.is_some_and(|t| t >= r.timestamp) => {
+                Some((format!("Up to date — the newest database was published {}", format_date(r.timestamp)), ok))
+            }
+            (None, Some(Ok(r))) => Some((
+                format!("A newer database is available, published {}", format_date(r.timestamp)),
+                ui::palette::accent_text(),
+            )),
+            (None, None) => None,
+        },
+    };
+    let idle = busy.is_none();
+    let download = button(
+        row![
+            text("\u{f019}").font(ICON_FONT).size(13), // download
+            text(if has_download { "Update Now" } else { "Download Lens Profiles" }).size(13),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
+    )
+    .on_press_maybe(idle.then_some(Message::LensfunDownload))
+    .padding([6, 12])
+    .style(ui::styles::AccentButton::style);
+    let check = button(text("Check for Updates").size(13))
+        .on_press_maybe(idle.then_some(Message::LensfunCheck))
+        .padding([6, 12])
+        .style(ui::styles::NeutralButton::style);
+    let mut updates = column![
+        card_title("Download & Updates"),
+        row![download, check].spacing(8),
+    ]
+    .spacing(10);
+    if let Some((line, color)) = status {
+        updates = updates.push(text(line).size(12).style(move |_| text::Style { color: Some(color) }));
+    }
+    updates = updates.push(hint(
+        "About 0.4 MB from the lensfun project's site (lensfun.github.io). RawEditor goes online only when you click.",
+    ));
+
+    let rescan = button(text("Rescan").size(13))
+        .on_press_maybe(idle.then_some(Message::LensfunRescan))
+        .padding([6, 12])
+        .style(ui::styles::NeutralButton::style);
+    let open = button(
+        row![text(ui::icons::FOLDER_OPEN).font(ICON_FONT).size(13), text("Open Folder").size(13)]
+            .spacing(8)
+            .align_y(Alignment::Center),
+    )
+    .on_press(Message::OpenAppFolder(AppFolder::Lensfun))
+    .padding([6, 12])
+    .style(ui::styles::NeutralButton::style);
+
+    column![
+        heading("Lens Profiles"),
+        hint("Profile corrections for distortion, vignetting and chromatic aberration use calibrations from the open lensfun database."),
+        card(column![card_title("Installed"), installed].spacing(10)),
+        card(updates),
+        card(
+            column![
+                row![card_title("Your Own Profiles"), Space::with_width(Length::Fill), rescan, open]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                text(own_dir.display().to_string()).size(12).style(|_| text::Style {
+                    color: Some(ui::palette::accent_text())
+                }),
+                hint("Put lensfun XML files here — they take priority over the downloaded database. Rescan after adding them."),
+            ]
+            .spacing(10),
+        ),
+        hint("Lens profiles © the lensfun contributors, CC BY-SA 3.0."),
+    ]
+    .spacing(12)
+    .into()
+}
+
+fn card_title(title: &str) -> Element<'_, Message> {
+    text(title)
+        .size(14)
+        .font(bold())
+        .style(|_| text::Style { color: Some(Color::from_rgb(0.88, 0.88, 0.88)) })
+        .into()
+}
+
 fn folders() -> Element<'static, Message> {
     column![
         heading("Folders"),
@@ -311,7 +474,7 @@ fn folders() -> Element<'static, Message> {
                 ("raw_editor.db", "The catalogue: imported images, ratings, flags and edits"),
                 ("settings.json", "These preferences"),
                 ("profiles/", "DCP camera profiles — put Adobe .dcp files here"),
-                ("lensfun/", "Extra lensfun lens-profile XML files"),
+                ("lensfun/", "Your own lens profiles; the downloaded database is in lensfun/updates/"),
                 ("logs/", "Diagnostic logs"),
             ],
             "Back this folder up to keep your edits.",
@@ -433,6 +596,7 @@ const BUNDLED: &[Credit] = &[
 /// the app's heaviest work), alphabetical.
 const LIBRARIES: &[Credit] = &[
     credit("bytemuck", &["bytemuck"], "Zlib OR Apache-2.0 OR MIT", "GPU buffer layout", "https://github.com/Lokathor/bytemuck"),
+    credit("bzip2-rs", &["bzip2-rs"], "MIT OR Apache-2.0", "Unpacking the lens-profile download", "https://github.com/paolobarbolini/bzip2-rs"),
     credit("cgmath", &["cgmath"], "Apache-2.0", "Matrix maths", "https://github.com/rustgd/cgmath"),
     credit("chrono", &["chrono"], "MIT OR Apache-2.0", "Dates and times", "https://github.com/chronotope/chrono"),
     credit("dirs", &["dirs"], "MIT OR Apache-2.0", "Platform folder locations", "https://github.com/soc/dirs-rs"),
@@ -445,15 +609,20 @@ const LIBRARIES: &[Credit] = &[
     credit("lru", &["lru"], "MIT", "Preview cache", "https://github.com/jeromefroe/lru-rs"),
     credit("rawler", &["rawler"], "LGPL-2.1", "RAW decoding, from the dnglab project", "https://github.com/dnglab/dnglab"),
     credit("rfd", &["rfd"], "MIT", "Native file dialogs", "https://github.com/PolyMeilex/rfd"),
+    credit("ring", &[], "Apache-2.0 AND ISC", "Cryptography for HTTPS", "https://github.com/briansmith/ring"),
     credit("roxmltree", &["roxmltree"], "MIT OR Apache-2.0", "lensfun XML parsing", "https://github.com/RazrFalcon/roxmltree"),
     credit("rusqlite", &["rusqlite"], "MIT", "SQLite bindings", "https://github.com/rusqlite/rusqlite"),
+    credit("rustls", &[], "Apache-2.0 OR ISC OR MIT", "HTTPS for the lens-profile download", "https://github.com/rustls/rustls"),
     credit("serde · serde_json", &["serde", "serde_json"], "MIT OR Apache-2.0", "Settings and edit storage", "https://github.com/serde-rs/serde"),
+    credit("tar", &["tar"], "MIT OR Apache-2.0", "Unpacking the lens-profile download", "https://github.com/composefs/tar-rs"),
     credit("thiserror", &["thiserror"], "MIT OR Apache-2.0", "Error types", "https://github.com/dtolnay/thiserror"),
     credit("tiff", &["tiff"], "MIT", "TIFF export, DCP parsing", "https://github.com/image-rs/image-tiff"),
     credit("tokio", &["tokio"], "MIT", "Background work", "https://github.com/tokio-rs/tokio"),
     credit("tracing", &["tracing", "tracing-subscriber", "tracing-appender"], "MIT", "Logging", "https://github.com/tokio-rs/tracing"),
     credit("trash", &["trash"], "MIT", "Moving files to the system trash", "https://github.com/ArturKovacs/trash"),
+    credit("ureq", &["ureq"], "MIT OR Apache-2.0", "Downloading lens profiles", "https://github.com/algesten/ureq"),
     credit("walkdir", &["walkdir"], "Unlicense OR MIT", "Folder import", "https://github.com/BurntSushi/walkdir"),
+    credit("webpki-roots", &[], "CDLA-Permissive-2.0", "Mozilla's trusted root certificates, for HTTPS", "https://github.com/rustls/webpki-roots"),
     credit("wgpu", &[], "MIT OR Apache-2.0", "GPU rendering", "https://github.com/gfx-rs/wgpu"),
     credit("zune-jpeg", &["zune-jpeg", "zune-core"], "MIT OR Apache-2.0 OR Zlib", "Fast JPEG decoding (fast-jpeg builds)", "https://github.com/etemesi254/zune-image"),
 ];
@@ -464,7 +633,7 @@ const EXTERNAL: &[Credit] = &[
         "Lensfun database",
         &[],
         "CC BY-SA 3.0",
-        "Lens profiles, read from your system or the lensfun folder",
+        "Lens profiles — downloaded when you ask, or read from your system",
         "https://lensfun.github.io",
     ),
     Credit {
@@ -506,7 +675,7 @@ fn licenses() -> Element<'static, Message> {
         hint("This software is based in part on the work of the Independent JPEG Group."),
         group_label("Used if installed"),
         list(EXTERNAL),
-        hint("Neither is bundled: RawEditor only reads them from your disk."),
+        hint("Neither is bundled. Lens profiles are downloaded only when you ask (Lens Profiles page); DCP profiles are yours to add."),
     ]
     .spacing(8)
     .into()

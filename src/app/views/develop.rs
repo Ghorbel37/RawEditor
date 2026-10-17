@@ -1177,6 +1177,41 @@ fn loupe_section(editor: &RawEditor) -> Element<'_, Message> {
     .into()
 }
 
+/// No lensfun database at all: offer the one-click download, and say how to
+/// install it by hand instead (`handlers::lensfun`).
+fn missing_database_prompt(editor: &RawEditor) -> Element<'_, Message> {
+    use crate::app::state::LensfunJob;
+    let downloading = editor.lensfun.busy == Some(LensfunJob::Downloading);
+    let download = button(
+        row![
+            text("\u{f019}").font(ICON_FONT).size(13), // download
+            text(if downloading { "Downloading…" } else { "Download Lens Profiles" }).size(12),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center),
+    )
+    .style(ui::styles::AccentButton::style)
+    .on_press_maybe(editor.lensfun.busy.is_none().then_some(Message::LensfunDownload))
+    .padding([5, 10]);
+    let mut col = column![
+        hint("No lens profiles are installed.".to_string()),
+        download,
+        hint(format!(
+            "About 0.4 MB from the lensfun project. Or install the `lensfun` package, or put its XML files in {}",
+            crate::core::paths::lensfun_dir().display()
+        )),
+    ]
+    .spacing(6);
+    if let Some(Err(e)) = &editor.lensfun.installed {
+        col = col.push(
+            text(format!("Download failed: {e}"))
+                .size(10)
+                .style(|_theme| text::Style { color: Some(Color::from_rgb(0.9, 0.55, 0.3)) }),
+        );
+    }
+    col.into()
+}
+
 fn hint<'a>(s: String) -> Element<'a, Message> {
     text(s)
         .size(10)
@@ -1195,18 +1230,22 @@ fn lens_section(editor: &RawEditor) -> Element<'_, Message> {
         .and_then(|c| c.lens_name.clone())
         .unwrap_or_else(|| "Unknown lens".to_string());
     let has_profile = ctx.as_ref().is_some_and(|c| c.profile.is_some());
-    let status = match (has_profile, crate::core::lens::LensDb::loaded_count()) {
-        (true, _) => format!(
+    let no_database = crate::core::lens::LensDb::loaded_count() == Some(0);
+    let status: Element<'_, Message> = match (has_profile, no_database) {
+        (true, _) => hint(format!(
             "Profile: {}",
             ctx.as_ref().and_then(|c| c.profile.as_ref()).map(|p| p.lens_name.as_str()).unwrap_or("")
+        )),
+        (false, true) => missing_database_prompt(editor),
+        (false, false) => hint(
+            "No profile for this lens in the lensfun database — Preferences › Lens Profiles can check for a newer one."
+                .to_string(),
         ),
-        (false, Some(0)) => "No lensfun database found — install `lensfun`, or put its XML files in ~/.local/share/raw-editor/lensfun".to_string(),
-        (false, _) => "No profile for this lens in the lensfun database".to_string(),
     };
 
     let mut col = column![
         text(lens_name).size(12),
-        hint(status),
+        status,
         checkbox("Enable profile corrections", l.profile)
             .on_toggle_maybe(has_profile.then_some(|on| Message::LensToggled(LensToggle::Profile, on)))
             .size(16)
