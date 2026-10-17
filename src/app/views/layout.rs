@@ -40,14 +40,20 @@ fn logo() -> Handle {
 ///
 /// A bare relative path only resolved when the app was launched from the
 /// repository root; started any other way (a desktop launcher, the release
-/// zip) the splash was simply blank. Not embedded: it is ~10 MB.
+/// zip) the splash was simply blank. Not embedded: it is ~10 MB. Inside a
+/// macOS `.app` the executable sits in `Contents/MacOS` and the assets in
+/// `Contents/Resources`, so that sibling is tried too.
 fn splash() -> Handle {
     static SPLASH: std::sync::LazyLock<Handle> = std::sync::LazyLock::new(|| {
         let relative = std::path::Path::new("assets").join("splash.png");
         let beside_exe = std::env::current_exe()
             .ok()
-            .and_then(|exe| exe.parent().map(|dir| dir.join(&relative)))
-            .filter(|path| path.exists());
+            .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+            .and_then(|dir| {
+                [dir.join(&relative), dir.join("../Resources").join(&relative)]
+                    .into_iter()
+                    .find(|path| path.exists())
+            });
         Handle::from_path(beside_exe.unwrap_or(relative))
     });
     SPLASH.clone()
