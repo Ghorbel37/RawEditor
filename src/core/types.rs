@@ -222,6 +222,12 @@ pub struct EditParams {
     /// Brush strokes for all masks (each stroke names its mask).
     #[serde(default)]
     pub brush: crate::core::brush::BrushData,
+
+    /// Camera colour profile (DCP) this image uses (`core::camera_profiles`).
+    /// Applied when the image's GPU resources are built, so changing it
+    /// rebuilds them; `Auto` follows the per-camera default.
+    #[serde(default)]
+    pub camera_profile: crate::core::camera_profiles::ProfileChoice,
 }
 
 /// Maximum number of local adjustment masks per image.
@@ -426,6 +432,7 @@ impl Default for EditParams {
             masks: [MaskParams::default(); MAX_MASKS], // No local masks by default
             mask_count: 0,
             brush: crate::core::brush::BrushData::default(),
+            camera_profile: crate::core::camera_profiles::ProfileChoice::AUTO,
         }
     }
 }
@@ -537,6 +544,9 @@ impl EditParams {
             black_offsets: self.black_offsets,
             black_phase_x: self.black_phase_x,
             black_phase_y: self.black_phase_y,
+            // Not a look you compare against: switching it rebuilds the GPU
+            // resources, which a momentary peek must not do.
+            camera_profile: self.camera_profile,
             ..Self::default()
         }
     }
@@ -695,6 +705,7 @@ pub fn apply_categories(dst: &mut EditParams, src: &EditParams, cats: CopyCatego
         dst.profile_curve = src.profile_curve;
         dst.tone_mapper = src.tone_mapper;
         dst.gt = src.gt;
+        dst.camera_profile = src.camera_profile;
     }
     if cats.masks {
         // Together, always: `masks` without `mask_count` (or vice versa)
@@ -848,6 +859,7 @@ mod tests {
         p.mask_count = 1;
         p.brush.begin(0, false, 0.05, 0.5, 1.0);
         p.brush.extend([0.2, 0.2], 1.5);
+        p.camera_profile = crate::core::camera_profiles::ProfileChoice::named("Test.dcp").unwrap();
         p
     }
 

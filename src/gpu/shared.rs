@@ -454,6 +454,10 @@ pub struct ImageResources {
     /// `Camera` tone operator is active; every other operator supplies its own
     /// curve regardless of what the profile carries.
     pub dcp_has_curve: bool,
+    /// The camera profile these resources were built with, and what chose
+    /// it. `None` for paths that don't record it (tests); set by the app's
+    /// loaders before the resources are shared.
+    pub profile_use: Option<crate::core::camera_profiles::ProfileUse>,
     /// Normalised EXIF orientation (1/3/6/8). Sensor textures stay landscape;
     /// the color pass maps display UVs to sensor space, and render targets are
     /// sized to `oriented_*` dims.
@@ -1111,6 +1115,7 @@ impl ImageResources {
             tone_curve_view,
             has_dcp,
             dcp_has_curve,
+            profile_use: None,
             orientation,
             // None → the first update_uniforms after load re-uploads the LUTs
             // once with the anchored-kelvin interpolation (cheap, ~90 KB).

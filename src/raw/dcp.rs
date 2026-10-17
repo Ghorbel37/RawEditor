@@ -13,11 +13,22 @@ const TAG_COLOR_MATRIX_1:              u16 = 50721;
 const TAG_COLOR_MATRIX_2:             u16 = 50722;
 const TAG_FORWARD_MATRIX_1:           u16 = 50964;
 const TAG_FORWARD_MATRIX_2:           u16 = 50965;
-const TAG_PROFILE_HUE_SAT_MAP_DIMS:   u16 = 50981; // WAS WRONG: was 50937
-const TAG_PROFILE_HUE_SAT_MAP_DATA_1: u16 = 50982; // WAS WRONG: was 50938
-const TAG_PROFILE_HUE_SAT_MAP_DATA_2: u16 = 50983; // WAS WRONG: was 50939
+// A profile carries up to two 3D hue/sat/value tables. Camera-matching
+// profiles (like the D3300 "Camera Standard" this was calibrated on) ship a
+// LookTable and no HueSatMap; open-source ones (RawTherapee's) ship a
+// dual-illuminant HueSatMap and no LookTable. The pipeline has one table
+// slot: the LookTable when there is one — what it always used — else the
+// HueSatMap. (Reading 50981 as "the HueSatMap" was this code's old name for
+// the LookTable, and is why profiles without one rendered black.)
+const TAG_PROFILE_HUE_SAT_MAP_DIMS:   u16 = 50937;
+const TAG_PROFILE_HUE_SAT_MAP_DATA_1: u16 = 50938;
+const TAG_PROFILE_HUE_SAT_MAP_DATA_2: u16 = 50939;
+const TAG_PROFILE_LOOK_TABLE_DIMS:    u16 = 50981;
+const TAG_PROFILE_LOOK_TABLE_DATA:    u16 = 50982;
 const TAG_PROFILE_TONE_CURVE:         u16 = 50940;
 const TAG_BASELINE_EXPOSURE_OFFSET:   u16 = 51109;
+const TAG_UNIQUE_CAMERA_MODEL:        u16 = 50708;
+const TAG_PROFILE_NAME:               u16 = 50936;
 
 // TIFF type sizes in bytes
 fn tiff_type_size(typ: u16) -> u32 {
@@ -146,6 +157,13 @@ fn tag_u32s(tag: &RawTag, le: bool) -> Vec<u32> {
     }
 }
 
+/// An ASCII (or UTF-8, as some tools write) tag, NUL-terminated.
+fn tag_string(tag: &RawTag) -> Option<String> {
+    let bytes = tag.data.split(|b| *b == 0).next()?;
+    let s = String::from_utf8_lossy(bytes).trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
 fn tag_matrix(tag: &RawTag, le: bool) -> Option<[f32; 9]> {
     let v = tag_floats(tag, le);
     if v.len() >= 9 {
@@ -171,6 +189,10 @@ pub struct DcpProfile {
     /// it to cancel Adobe's per-camera baseline so the render matches the
     /// in-camera JPEG brightness (this D3300 profile: -0.35 EV).
     pub baseline_exposure_offset: f32,
+    /// UniqueCameraModel: the camera it was made for ("Nikon D3300").
+    pub camera_model: Option<String>,
+    /// ProfileName: what it calls itself ("Camera Standard").
+    pub profile_name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -228,29 +250,48 @@ pub fn parse_dcp(path: &Path) -> Result<DcpProfile, String> {
         .and_then(|t| tag_u32s(t, le).into_iter().next())
         .unwrap_or(21);
 
-    let hue_sat_dims = map.get(&TAG_PROFILE_HUE_SAT_MAP_DIMS)
-        .map(|t| { let v = tag_u32s(t, le); (v[0], v[1], v[2]) })
-        .unwrap_or((0, 0, 0));
-
+    let dims_of = |tag: u16| {
+        map.get(&tag)
+            .map(|t| tag_u32s(t, le))
+            .filter(|v| v.len() == 3 && v.iter().all(|&d| d > 0))
+            .map(|v| (v[0], v[1], v[2]))
+    };
     let parse_hsm = |tag: &RawTag| -> Vec<[f32; 3]> {
         tag_floats(tag, le).chunks(3)
             .filter(|c| c.len() == 3)
             .map(|c| [c[0], c[1], c[2]])
             .collect()
     };
-    let hue_sat_data_1 = map.get(&TAG_PROFILE_HUE_SAT_MAP_DATA_1).map(parse_hsm);
-    let hue_sat_data_2 = map.get(&TAG_PROFILE_HUE_SAT_MAP_DATA_2).map(parse_hsm);
+    // See the tag constants: the LookTable if present, else the HueSatMap.
+    let (hue_sat_dims, hue_sat_data_1, hue_sat_data_2) = match (
+        dims_of(TAG_PROFILE_LOOK_TABLE_DIMS).zip(map.get(&TAG_PROFILE_LOOK_TABLE_DATA)),
+        dims_of(TAG_PROFILE_HUE_SAT_MAP_DIMS),
+    ) {
+        (Some((dims, data)), _) => (dims, Some(parse_hsm(data)), None),
+        (None, Some(dims)) => (
+            dims,
+            map.get(&TAG_PROFILE_HUE_SAT_MAP_DATA_1).map(parse_hsm),
+            map.get(&TAG_PROFILE_HUE_SAT_MAP_DATA_2).map(parse_hsm),
+        ),
+        (None, None) => ((0, 0, 0), None, None),
+    };
 
     let baseline_exposure_offset = map.get(&TAG_BASELINE_EXPOSURE_OFFSET)
         .and_then(|t| tag_floats(t, le).into_iter().next())
         .unwrap_or(0.0);
 
+    // An identity curve (RawTherapee's profiles carry (0,0)–(1,1)) says "no
+    // tone shaping". Read as a curve it is not neutral here: this pipeline
+    // treats the profile curve as linear → display-encoded, so the identity
+    // would darken the image by a whole gamma. No curve leaves the default
+    // rendering in charge, which is what the profile means.
     let tone_curve = map.get(&TAG_PROFILE_TONE_CURVE).map(|t| {
         tag_floats(t, le).chunks(2)
             .filter(|c| c.len() == 2)
             .map(|c| (c[0], c[1]))
-            .collect()
-    });
+            .collect::<Vec<_>>()
+    })
+    .filter(|points| !points.iter().all(|(x, y)| (x - y).abs() < 1e-4));
 
     tracing::info!(
         "DCP parsed: illuminants=({},{}) fm1={} fm2={} hsm_dims={:?} hsm1_len={:?} curve_pts={:?}",
@@ -269,6 +310,8 @@ pub fn parse_dcp(path: &Path) -> Result<DcpProfile, String> {
         hue_sat_data_1, hue_sat_data_2,
         tone_curve,
         baseline_exposure_offset,
+        camera_model: map.get(&TAG_UNIQUE_CAMERA_MODEL).and_then(tag_string),
+        profile_name: map.get(&TAG_PROFILE_NAME).and_then(tag_string),
     })
 }
 
@@ -356,6 +399,14 @@ pub fn interpolate_at_temperature(
     } else {
         vec![]
     };
+    // No table at all (or an unusable one): a single identity entry, so the
+    // GPU still gets a valid 3D texture to sample. A zero-sized one is an
+    // invalid texture, and the colour pass renders black.
+    let (hue_sat_dims, hue_sat_lut) = if hue_sat_lut.is_empty() {
+        ((1, 1, 1), vec![[0.0, 1.0, 1.0]])
+    } else {
+        (profile.hue_sat_dims, hue_sat_lut)
+    };
 
     let has_tone_curve = profile.tone_curve.is_some();
     // `bake_tone_curve` handles the no-points case itself, so a profile with
@@ -370,7 +421,7 @@ pub fn interpolate_at_temperature(
         camera_to_prophoto,
         hue_sat_lut,
         tone_curve: baked_curve,
-        hue_sat_dims: profile.hue_sat_dims,
+        hue_sat_dims,
         has_tone_curve,
     }
 }
@@ -476,13 +527,27 @@ pub fn bake_tone_curve(points: &[(f32, f32)], tone: ToneSettings) -> Vec<f32> {
 /// still takes effect without a restart. A file that fails to parse is
 /// remembered too, rather than re-failing (and re-logging) on every image.
 pub fn load_profile_for_camera(make: &str, model: &str) -> Option<std::sync::Arc<DcpProfile>> {
+    // The automatic choice; an image's own choice and the per-camera default
+    // are applied where its GPU resources are built (`core::camera_profiles`).
+    crate::core::camera_profiles::resolve(
+        make,
+        model,
+        crate::core::camera_profiles::ProfileChoice::AUTO,
+        &HashMap::new(),
+    )
+    .map(|(_, profile)| profile)
+}
+
+/// The DCP at `path`, parsed at most once per modification (see
+/// `load_profile_for_camera`). Blocking.
+pub fn load_profile(path: &Path) -> Option<std::sync::Arc<DcpProfile>> {
     use std::sync::{Arc, Mutex, OnceLock};
     use std::time::SystemTime;
 
     type Entry = (Option<SystemTime>, Option<Arc<DcpProfile>>);
     static CACHE: OnceLock<Mutex<HashMap<PathBuf, Entry>>> = OnceLock::new();
 
-    let path = find_profile_for_camera(make, model)?;
+    let path = path.to_path_buf();
     let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
     let cache = CACHE.get_or_init(Default::default);
 
@@ -517,34 +582,100 @@ pub fn load_profile_for_camera(make: &str, model: &str) -> Option<std::sync::Arc
     profile
 }
 
-pub fn find_profile_for_camera(_make: &str, model: &str) -> Option<PathBuf> {
-    let base = crate::core::paths::profiles_dir();
-
-    let model_lower = model.to_lowercase();
-    let model_nospace = model_lower.replace(' ', "");
-
-    let mut matches = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&base) {
-        for entry in entries.flatten() {
-            let fname = entry.file_name().to_string_lossy().to_lowercase();
-            let fname_nospace = fname.replace(' ', "");
-            if fname.ends_with(".dcp")
-                && (fname.contains(&model_lower) || fname_nospace.contains(&model_nospace))
-            {
-                matches.push(entry.path());
-            }
-        }
-    }
-
-    matches.iter()
-        .find(|p| p.file_name().unwrap_or_default().to_string_lossy().to_lowercase().contains("adobe standard"))
-        .or_else(|| matches.first())
-        .cloned()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A minimal little-endian DCP with these `(tag, type, payload)` entries.
+    fn synthetic_dcp(entries: &[(u16, u16, Vec<u8>)]) -> std::path::PathBuf {
+        let mut entries = entries.to_vec();
+        entries.sort_by_key(|e| e.0);
+        let ifd_len = 2 + entries.len() * 12 + 4;
+        let mut out = Vec::new();
+        out.extend_from_slice(b"IIRC");
+        out.extend_from_slice(&8u32.to_le_bytes());
+        let mut data = Vec::new();
+        let mut ifd = (entries.len() as u16).to_le_bytes().to_vec();
+        for (tag, typ, payload) in &entries {
+            let count = payload.len() as u32 / tiff_type_size(*typ);
+            ifd.extend_from_slice(&tag.to_le_bytes());
+            ifd.extend_from_slice(&typ.to_le_bytes());
+            ifd.extend_from_slice(&count.to_le_bytes());
+            if payload.len() <= 4 {
+                let mut v = payload.clone();
+                v.resize(4, 0);
+                ifd.extend_from_slice(&v);
+            } else {
+                ifd.extend_from_slice(&((8 + ifd_len + data.len()) as u32).to_le_bytes());
+                data.extend_from_slice(payload);
+            }
+        }
+        ifd.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&ifd);
+        out.extend_from_slice(&data);
+        let path = std::env::temp_dir().join(format!(
+            "raw-editor-synthetic-{}-{}.dcp",
+            std::process::id(),
+            entries.iter().map(|e| e.0 as u64).sum::<u64>()
+        ));
+        std::fs::write(&path, out).unwrap();
+        path
+    }
+
+    fn floats(v: &[f32]) -> Vec<u8> {
+        v.iter().flat_map(|f| f.to_le_bytes()).collect()
+    }
+
+    fn longs(v: &[u32]) -> Vec<u8> {
+        v.iter().flat_map(|f| f.to_le_bytes()).collect()
+    }
+
+    /// Open-source profiles carry a HueSatMap and no LookTable: it must be
+    /// read (it used to be ignored — and the empty table rendered black),
+    /// and their identity tone curve must not count as a curve.
+    #[test]
+    fn hue_sat_map_profiles_parse_and_identity_curves_are_dropped() {
+        let n = 2 * 2; // hue × sat × 1 value division
+        let table = |v: f32| floats(&(0..n).flat_map(|_| [v, 1.0, 1.0]).collect::<Vec<_>>());
+        let path = synthetic_dcp(&[
+            (TAG_PROFILE_HUE_SAT_MAP_DIMS, 4, longs(&[2, 2, 1])),
+            (TAG_PROFILE_HUE_SAT_MAP_DATA_1, 11, table(10.0)),
+            (TAG_PROFILE_HUE_SAT_MAP_DATA_2, 11, table(20.0)),
+            (TAG_PROFILE_TONE_CURVE, 11, floats(&[0.0, 0.0, 1.0, 1.0])),
+        ]);
+        let p = parse_dcp(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(p.hue_sat_dims, (2, 2, 1));
+        assert_eq!(p.hue_sat_data_1.as_ref().map(Vec::len), Some(n));
+        assert!(p.hue_sat_data_2.is_some(), "dual-illuminant table lost");
+        assert!(p.tone_curve.is_none(), "an identity curve would darken by a gamma");
+    }
+
+    /// Camera-matching profiles: the LookTable wins, as it always has.
+    #[test]
+    fn a_look_table_takes_the_slot_over_a_hue_sat_map() {
+        let path = synthetic_dcp(&[
+            (TAG_PROFILE_HUE_SAT_MAP_DIMS, 4, longs(&[1, 1, 1])),
+            (TAG_PROFILE_HUE_SAT_MAP_DATA_1, 11, floats(&[5.0, 1.0, 1.0])),
+            (TAG_PROFILE_LOOK_TABLE_DIMS, 4, longs(&[1, 1, 1])),
+            (TAG_PROFILE_LOOK_TABLE_DATA, 11, floats(&[7.0, 1.0, 1.0])),
+        ]);
+        let p = parse_dcp(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(p.hue_sat_data_1, Some(vec![[7.0, 1.0, 1.0]]));
+    }
+
+    /// A profile with no table at all still gives the GPU a valid texture:
+    /// one identity entry, never a zero-sized table.
+    #[test]
+    fn a_profile_without_a_table_interpolates_to_identity() {
+        let path = synthetic_dcp(&[(TAG_COLOR_MATRIX_1, 11, floats(&[1.0; 9]))]);
+        let p = parse_dcp(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let i = interpolate_at_temperature(&p, 5000.0, ToneSettings::from_params(&Default::default()));
+        assert_eq!(i.hue_sat_dims, (1, 1, 1));
+        assert_eq!(i.hue_sat_lut, vec![[0.0, 1.0, 1.0]]);
+    }
 
     /// Parse every DCP installed in the user profiles dir (skips when none).
     /// Guards against regressions like rejecting the 0x4352 "CR" magic that

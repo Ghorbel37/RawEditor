@@ -335,6 +335,23 @@ fn dispatch(editor: &mut RawEditor, message: Message) -> Task<Message> {
         Message::LensfunInstalled(r) => handlers::lensfun::handle_installed(editor, r),
         Message::LensfunRescan => handlers::lensfun::handle_rescan(editor),
         Message::LensDbLoaded(changed) => handlers::lensfun::handle_db_loaded(editor, changed),
+        Message::CameraProfileSelected(c) => handlers::camera_profiles::handle_selected(editor, c),
+        Message::SetCameraProfileDefault(camera, value) => {
+            handlers::camera_profiles::handle_set_default(editor, camera, value)
+        }
+        Message::DownloadCameraProfile => handlers::camera_profiles::handle_download(editor),
+        Message::CameraProfileDownloaded(r) => handlers::camera_profiles::handle_downloaded(editor, r),
+        Message::ImportCameraProfiles => handlers::camera_profiles::handle_import(editor),
+        Message::CameraProfilesPicked(files) => handlers::camera_profiles::handle_picked(editor, files),
+        Message::CameraProfilesImported(ok, failed) => {
+            handlers::camera_profiles::handle_imported(editor, ok, failed)
+        }
+        Message::UpdateCameraProfiles => handlers::camera_profiles::handle_update(editor),
+        Message::CameraProfilesUpdated(r) => handlers::camera_profiles::handle_updated(editor, r),
+        Message::RescanCameraProfiles => handlers::camera_profiles::handle_rescan(editor),
+        Message::CameraProfilesScanned(changed) => {
+            handlers::camera_profiles::handle_scanned(editor, changed)
+        }
         Message::OpenLink(url) => handlers::window::handle_open_link(editor, url),
         Message::SetPreferencesSection(section) => {
             handlers::window::handle_set_preferences_section(editor, section)

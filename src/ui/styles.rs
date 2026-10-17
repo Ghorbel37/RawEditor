@@ -321,3 +321,39 @@ pub fn button_style(theme: &Theme, status: iced::widget::button::Status) -> iced
 }
 
 
+
+/// Dropdown (`pick_list`) in the sidebar's vocabulary: the neutral button's
+/// charcoal, an orange caret, the accent border while hovered or open.
+pub fn pick_list_style(
+    _theme: &Theme,
+    status: iced::widget::pick_list::Status,
+) -> iced::widget::pick_list::Style {
+    use iced::widget::pick_list::Status;
+    let lit = matches!(status, Status::Hovered | Status::Opened);
+    iced::widget::pick_list::Style {
+        text_color: Color::from_rgb(0.88, 0.88, 0.88),
+        placeholder_color: Color::from_rgb(0.5, 0.5, 0.5),
+        handle_color: palette::accent_text(),
+        background: Background::Color(if lit {
+            Color::from_rgb(0.2, 0.2, 0.2)
+        } else {
+            Color::from_rgb(0.15, 0.15, 0.15)
+        }),
+        border: Border {
+            radius: 4.0.into(),
+            width: 1.0,
+            color: if lit { palette::accent_selection_border() } else { Color::from_rgb(0.25, 0.25, 0.25) },
+        },
+    }
+}
+
+/// The open dropdown's list, matching [`pick_list_style`].
+pub fn pick_list_menu_style(_theme: &Theme) -> iced::overlay::menu::Style {
+    iced::overlay::menu::Style {
+        background: Background::Color(Color::from_rgb(0.12, 0.12, 0.12)),
+        border: Border { radius: 4.0.into(), width: 1.0, color: Color::from_rgb(0.3, 0.3, 0.3) },
+        text_color: Color::from_rgb(0.85, 0.85, 0.85),
+        selected_text_color: Color::WHITE,
+        selected_background: Background::Color(palette::accent_selection_fill()),
+    }
+}

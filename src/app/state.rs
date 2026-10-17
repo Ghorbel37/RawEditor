@@ -160,6 +160,26 @@ pub struct LensfunState {
     pub installed: Option<Result<crate::core::lensfun::Installed, String>>,
 }
 
+/// A camera-profile job in progress (`handlers::camera_profiles`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileJob {
+    Downloading,
+    Importing,
+    Updating,
+    Rescanning,
+}
+
+/// Camera-profile downloads, imports and updates.
+#[derive(Debug, Default)]
+pub struct CameraProfileState {
+    pub busy: Option<ProfileJob>,
+    /// The last job's outcome, for the panels to report.
+    pub notice: Option<Result<String, String>>,
+    /// A camera RawTherapee was found to have no profile for — the Develop
+    /// prompt says so instead of offering the download again.
+    pub unavailable: Option<String>,
+}
+
 /// The pages of the Preferences side menu, in menu order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PreferencesSection {
@@ -167,16 +187,18 @@ pub enum PreferencesSection {
     General,
     Performance,
     Memory,
+    CameraProfiles,
     LensProfiles,
     Folders,
     Licenses,
 }
 
 impl PreferencesSection {
-    pub const ALL: [PreferencesSection; 6] = [
+    pub const ALL: [PreferencesSection; 7] = [
         PreferencesSection::General,
         PreferencesSection::Performance,
         PreferencesSection::Memory,
+        PreferencesSection::CameraProfiles,
         PreferencesSection::LensProfiles,
         PreferencesSection::Folders,
         PreferencesSection::Licenses,
@@ -369,6 +391,8 @@ pub struct RawEditor {
     /// Preferences › Reduce motion: every animation jumps to its end state.
     /// Mirrored into `ui::motion::set_reduced`, which the widgets read.
     pub reduce_motion: bool,
+    /// Per-camera default profile (`AppSettings::camera_profile_defaults`).
+    pub camera_profile_defaults: std::collections::HashMap<String, String>,
     /// The page Preferences shows. Kept while the app runs, so reopening the
     /// dialog lands where the user left it; not persisted.
     pub preferences_section: PreferencesSection,
@@ -660,6 +684,7 @@ pub struct RawEditor {
     pub noise_settle_token: u64,
     pub loupe: LoupeState,
     pub lensfun: LensfunState,
+    pub camera_profiles: CameraProfileState,
 
     // ── Scroll boost + filmstrip momentum ──────────────────────────────────
     /// True while the cursor is over the library grid, from the grid's own
@@ -875,6 +900,7 @@ impl RawEditor {
                 noise_settle_token: 0,
                 loupe: LoupeState::default(),
                 lensfun: LensfunState::default(),
+                camera_profiles: CameraProfileState::default(),
                 cursor_over_grid: false,
                 grid_scroll_y: 0.0,
                 grid_viewport: (0.0, 0.0),
@@ -886,6 +912,7 @@ impl RawEditor {
                 modal_exit: None,
                 modal_exit_seq: 0,
                 reduce_motion: settings.reduce_motion,
+                camera_profile_defaults: settings.camera_profile_defaults.clone(),
                 preferences_section: PreferencesSection::default(),
                 scroll_glide: None,
                 menu_generation: 0,
@@ -1415,6 +1442,7 @@ impl RawEditor {
             copy_categories: self.copy_categories,
             min_free_ram_mb: self.min_free_ram_mb,
             reduce_motion: self.reduce_motion,
+            camera_profile_defaults: self.camera_profile_defaults.clone(),
         };
 
         if let Err(e) = settings.save() {

@@ -544,7 +544,7 @@ pub fn view_copy_settings_modal(editor: &RawEditor) -> Element<'_, Message> {
         ("Noise Reduction", "Luminance, detail and color noise".into(), cats.noise, CopyCategory::Noise),
         ("Detail", "Sharpening and masking".into(), cats.detail, CopyCategory::Detail),
         ("Geometry & Crop", "Straighten angle and crop rectangle".into(), cats.geometry, CopyCategory::Geometry),
-        ("Profile & Tone Mapping", "Profile curve, tone mapper, GT shape".into(), cats.profile, CopyCategory::Profile),
+        ("Profile & Tone Mapping", "Camera profile, profile curve, tone mapper, GT shape".into(), cats.profile, CopyCategory::Profile),
         ("Lens Corrections", "Profile, distortion, vignetting, CA, defringe".into(), cats.lens, CopyCategory::Lens),
     ];
 

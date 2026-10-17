@@ -478,8 +478,18 @@ pub fn display_to_sensor_uv(u: f32, v: f32, orientation: u32) -> (f32, f32) {
 /// through the best available XYZ→camera matrix (DCP dual-illuminant when
 /// present, otherwise the raw file's single matrix).
 pub fn as_shot_kelvin_tint(raw: &crate::raw::loader::RawDataResult) -> (f32, f32) {
-    let matrices = match &raw.dcp_profile {
-        Some(p) => CameraMatrices::Dcp(p.as_ref()),
+    as_shot_kelvin_tint_for(raw, raw.dcp_profile.as_deref())
+}
+
+/// [`as_shot_kelvin_tint`] through a given profile — the one the image
+/// actually uses (`core::camera_profiles::ProfileUse`), which can differ from
+/// the automatic pick made at decode.
+pub fn as_shot_kelvin_tint_for(
+    raw: &crate::raw::loader::RawDataResult,
+    profile: Option<&crate::raw::dcp::DcpProfile>,
+) -> (f32, f32) {
+    let matrices = match profile {
+        Some(p) => CameraMatrices::Dcp(p),
         None => CameraMatrices::Single(raw.color_matrix),
     };
     wb_to_kelvin_tint(raw.wb_multipliers, &matrices)

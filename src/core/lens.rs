@@ -302,7 +302,7 @@ impl LensDb {
 
 /// Lower-cased alphanumeric runs, split at letter/digit boundaries, with
 /// decimals kept whole: "AF-S 18-55mm f/3.5-5.6G" → af s 18 55 mm f 3.5 5.6 g.
-fn tokens(s: &str) -> std::collections::BTreeSet<String> {
+pub(crate) fn tokens(s: &str) -> std::collections::BTreeSet<String> {
     let mut out = std::collections::BTreeSet::new();
     let mut cur = String::new();
     let mut cur_digit = false;

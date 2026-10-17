@@ -955,6 +955,11 @@ pub(crate) fn push_uniforms_and_render(
     if editor.image_resources.as_ref().map(|r| r.image_id) != editor.selected_image_id {
         return Task::none();
     }
+    // A different camera profile can't be pushed as uniforms (its LUT sizes
+    // a texture): undo, paste or reset changed it — rebuild instead.
+    if crate::app::handlers::camera_profiles::resources_stale(editor) {
+        return crate::app::handlers::camera_profiles::rebuild(editor);
+    }
     if let (Some(ctx), Some(resources)) = (&editor.gpu_context, &editor.image_resources) {
         // Phase 140: Interpolate DCP + resolve slider WB
         let (interpolated, wb_override) = resolve_wb_and_dcp(editor, params);

@@ -88,7 +88,7 @@ fn view_sidebar(editor: &RawEditor) -> iced::widget::Column<'_, Message> {
         None
     };
 
-    let mut sidebar = column![text("Edit Controls").size(16), histogram_toggle];
+    let mut sidebar = column![text("Edit Controls").size(16), camera_profile_block(editor), histogram_toggle];
     if let Some(hist) = histogram_section {
         sidebar = sidebar.push(hist);
     }
@@ -1175,6 +1175,126 @@ fn loupe_section(editor: &RawEditor) -> Element<'_, Message> {
     ]
     .spacing(6)
     .into()
+}
+
+/// One entry of the camera-profile dropdown.
+#[derive(Debug, Clone, PartialEq)]
+struct ProfileOption {
+    choice: crate::core::camera_profiles::ProfileChoice,
+    label: String,
+}
+
+impl std::fmt::Display for ProfileOption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.label)
+    }
+}
+
+/// Top of the sidebar: which camera profile (DCP) this image uses — a
+/// dropdown when the camera has any — or, when it has none, the offer to
+/// download an open-source one (`handlers::camera_profiles`).
+fn camera_profile_block(editor: &RawEditor) -> Element<'_, Message> {
+    use crate::core::camera_profiles::{camera_name, Catalog, ProfileChoice};
+    let Some(meta) = editor.current_metadata.as_ref() else { return column![].into() };
+    let Some(catalog) = Catalog::loaded() else {
+        return hint("Reading camera profiles…".to_string());
+    };
+    let camera = camera_name(&meta.make, &meta.model);
+    let installed = catalog.for_camera(&meta.make, &meta.model);
+    if installed.is_empty() {
+        return missing_profile_prompt(editor, camera);
+    }
+
+    // Two files that call themselves the same are told apart by file name.
+    let label = |p: &crate::core::camera_profiles::ProfileInfo| {
+        if installed.iter().filter(|q| q.name == p.name).count() > 1 {
+            p.file_name.trim_end_matches(".dcp").to_string()
+        } else {
+            p.name.clone()
+        }
+    };
+    // What "Default" means for this camera right now.
+    let default_label = match catalog.default_for(&editor.camera_profile_defaults, &meta.make, &meta.model).map(String::as_str) {
+        Some("builtin") => "Default (none)".to_string(),
+        Some(file) => match catalog.find(file) {
+            Some(p) => format!("Default ({})", label(p)),
+            None => format!("Default ({})", label(installed[0])),
+        },
+        None => format!("Default ({})", label(installed[0])),
+    };
+    let mut options = vec![ProfileOption { choice: ProfileChoice::AUTO, label: default_label }];
+    options.extend(installed.iter().filter_map(|p| {
+        ProfileChoice::named(&p.file_name).map(|choice| ProfileOption { choice, label: label(p) })
+    }));
+    options.push(ProfileOption { choice: ProfileChoice::BUILTIN, label: "None (built-in colour)".to_string() });
+    let current = editor.current_edit_params.camera_profile;
+    // A named profile that has since been removed resolves like Default.
+    let selected = options.iter().find(|o| o.choice == current).or(options.first()).cloned();
+
+    row![
+        text("Profile").size(13).width(Length::Fixed(60.0)),
+        iced::widget::pick_list(options, selected, |o: ProfileOption| Message::CameraProfileSelected(o.choice))
+            .text_size(12)
+            .padding([4, 8])
+            .width(Length::Fill)
+            .style(ui::styles::pick_list_style)
+            .menu_style(ui::styles::pick_list_menu_style),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+/// No camera profile for this camera: say what is being used instead, and
+/// offer RawTherapee's open-source profile or an import.
+fn missing_profile_prompt(editor: &RawEditor, camera: String) -> Element<'_, Message> {
+    use crate::app::state::ProfileJob;
+    let state = &editor.camera_profiles;
+    let unavailable = state.unavailable.as_deref() == Some(camera.as_str());
+    let warn = Color::from_rgb(0.9, 0.55, 0.3);
+
+    let download = button(
+        row![
+            text("\u{f019}").font(ICON_FONT).size(12), // download
+            text(if state.busy == Some(ProfileJob::Downloading) { "Downloading…" } else { "Download" }).size(12),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center),
+    )
+    .style(ui::styles::AccentButton::style)
+    .on_press_maybe((state.busy.is_none() && !unavailable).then_some(Message::DownloadCameraProfile))
+    .padding([5, 10]);
+    let import = button(text("Import…").size(12))
+        .style(ui::styles::NeutralButton::style)
+        .on_press_maybe(state.busy.is_none().then_some(Message::ImportCameraProfiles))
+        .padding([5, 10]);
+
+    let mut col = column![
+        text("No DCP profile found").size(13),
+        hint(format!(
+            "{camera} is using the default colour pipeline. Would you like to download an open-source profile for it?"
+        )),
+        row![download, import].spacing(6),
+    ]
+    .spacing(6);
+    if unavailable {
+        col = col.push(
+            text(format!("The RawTherapee project has no profile for {camera}. You can import one of your own instead."))
+                .size(10)
+                .style(move |_theme| text::Style { color: Some(warn) }),
+        );
+    } else if let Some(Err(e)) = &state.notice {
+        col = col.push(text(e.clone()).size(10).style(move |_theme| text::Style { color: Some(warn) }));
+    }
+    container(col)
+        .padding(10)
+        .width(Length::Fill)
+        .style(|_theme| container::Style {
+            background: Some(Background::Color(Color::from_rgb(0.12, 0.12, 0.12))),
+            border: Border { color: ui::palette::accent_selection_border(), width: 1.0, radius: 4.0.into() },
+            ..Default::default()
+        })
+        .into()
 }
 
 /// No lensfun database at all: offer the one-click download, and say how to

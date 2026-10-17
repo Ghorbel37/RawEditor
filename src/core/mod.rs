@@ -1,4 +1,5 @@
 pub mod brush;
+pub mod camera_profiles;
 pub mod curves;
 pub mod haze;
 pub mod highlights;

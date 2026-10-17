@@ -30,6 +30,11 @@ pub struct AppSettings {
     /// Preferences › Reduce motion. `#[serde(default)]`: see above.
     #[serde(default)]
     pub reduce_motion: bool,
+    /// Preferences › Camera Profiles: the profile an image uses unless it
+    /// picks its own. Camera (`camera_profiles::camera_name`) → profile file
+    /// name, or `"builtin"` for no profile. `#[serde(default)]`: see above.
+    #[serde(default)]
+    pub camera_profile_defaults: std::collections::HashMap<String, String>,
 }
 
 fn default_min_free_ram_mb() -> u32 {
@@ -51,6 +56,7 @@ impl Default for AppSettings {
             copy_categories: crate::core::types::CopyCategories::default(),
             min_free_ram_mb: default_min_free_ram_mb(),
             reduce_motion: false,
+            camera_profile_defaults: Default::default(),
         }
     }
 }

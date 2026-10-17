@@ -19,7 +19,7 @@ use crate::ui;
 use crate::ui::icons::ICON_FONT;
 use crate::ui::widgets::button;
 
-const MENU_WIDTH: f32 = 184.0;
+const MENU_WIDTH: f32 = 200.0;
 const MENU_ROW: f32 = 34.0;
 const BODY_HEIGHT: f32 = 460.0;
 const CARD_WIDTH: f32 = 700.0;
@@ -38,6 +38,7 @@ impl PreferencesSection {
             PreferencesSection::General => "General",
             PreferencesSection::Performance => "Performance",
             PreferencesSection::Memory => "Memory",
+            PreferencesSection::CameraProfiles => "Camera Profiles",
             PreferencesSection::LensProfiles => "Lens Profiles",
             PreferencesSection::Folders => "Folders",
             PreferencesSection::Licenses => "Licenses",
@@ -50,6 +51,7 @@ impl PreferencesSection {
             PreferencesSection::General => "\u{f013}",     // cog
             PreferencesSection::Performance => "\u{f0e4}", // tachometer
             PreferencesSection::Memory => "\u{f2db}",      // microchip
+            PreferencesSection::CameraProfiles => "\u{f042}", // adjust (colour)
             PreferencesSection::LensProfiles => "\u{f030}", // camera
             PreferencesSection::Folders => ui::icons::FOLDER,
             PreferencesSection::Licenses => "\u{f24e}",    // balance scale
@@ -64,6 +66,7 @@ pub fn view_preferences_modal(editor: &RawEditor) -> Element<'_, Message> {
         PreferencesSection::General => general(editor),
         PreferencesSection::Performance => performance(editor),
         PreferencesSection::Memory => memory(editor),
+        PreferencesSection::CameraProfiles => camera_profiles(editor),
         PreferencesSection::LensProfiles => lens_profiles(editor),
         PreferencesSection::Folders => folders(),
         PreferencesSection::Licenses => licenses(),
@@ -303,6 +306,194 @@ fn memory(editor: &RawEditor) -> Element<'_, Message> {
     .into()
 }
 
+// ── camera profiles ─────────────────────────────────────────────────────────
+
+/// One entry of a camera's "Default" dropdown: a profile file name,
+/// `"builtin"`, or `None` for automatic.
+#[derive(Debug, Clone, PartialEq)]
+struct DefaultOption {
+    value: Option<String>,
+    label: String,
+}
+
+impl std::fmt::Display for DefaultOption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.label)
+    }
+}
+
+/// Camera profiles (DCP): what is installed, each camera's default, getting
+/// RawTherapee's open-source ones and keeping them current, and importing
+/// the user's own (`handlers::camera_profiles`).
+fn camera_profiles(editor: &RawEditor) -> Element<'_, Message> {
+    use crate::app::state::ProfileJob;
+    use crate::core::camera_profiles::{camera_name, Catalog, Origin};
+
+    let catalog = Catalog::loaded();
+    let state = &editor.camera_profiles;
+    let idle = state.busy.is_none();
+
+    let installed: Element<'_, Message> = match &catalog {
+        None => hint("Reading the profile folders…"),
+        Some(c) if c.profiles.is_empty() => hint(
+            "No camera profiles are installed yet. When a camera has none, Develop offers RawTherapee's — or import your own below.",
+        ),
+        Some(c) => c.cameras().into_iter().fold(column![].spacing(14), |list, camera| {
+            let profiles: Vec<_> = c.profiles.iter().filter(|p| p.camera.eq_ignore_ascii_case(&camera)).collect();
+            let mut options = vec![DefaultOption { value: None, label: "Automatic".to_string() }];
+            options.extend(profiles.iter().map(|p| DefaultOption {
+                value: Some(p.file_name.clone()),
+                label: p.name.clone(),
+            }));
+            options.push(DefaultOption { value: Some("builtin".to_string()), label: "None (built-in colour)".to_string() });
+            let current = editor.camera_profile_defaults.get(&camera).cloned();
+            let selected = options.iter().find(|o| o.value == current).or(options.first()).cloned();
+            let key = camera.clone();
+            let default = iced::widget::pick_list(options, selected, move |o: DefaultOption| {
+                Message::SetCameraProfileDefault(key.clone(), o.value)
+            })
+            .text_size(12)
+            .padding([4, 8])
+            .width(Length::Fixed(210.0))
+            .style(ui::styles::pick_list_style)
+            .menu_style(ui::styles::pick_list_menu_style);
+
+            let rows = profiles.iter().fold(column![].spacing(3), |rows, p| {
+                let origin = match p.origin {
+                    Origin::Own => "Your file",
+                    Origin::Downloaded => "Downloaded",
+                };
+                rows.push(
+                    row![
+                        text(p.name.clone()).size(12).style(|_| text::Style {
+                            color: Some(Color::from_rgb(0.8, 0.8, 0.8))
+                        }),
+                        Space::with_width(Length::Fill),
+                        text(format!("{origin} · {}", p.file_name)).size(11).style(|_| text::Style {
+                            color: Some(Color::from_rgb(0.5, 0.5, 0.5))
+                        }),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                )
+            });
+            list.push(
+                column![
+                    row![
+                        card_title_owned(camera),
+                        Space::with_width(Length::Fill),
+                        text("Default").size(11).style(|_| text::Style {
+                            color: Some(Color::from_rgb(0.5, 0.5, 0.5))
+                        }),
+                        default,
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                    rows,
+                ]
+                .spacing(6),
+            )
+        })
+        .into(),
+    };
+
+    let warn = Color::from_rgb(0.9, 0.55, 0.3);
+    let ok = Color::from_rgb(0.55, 0.75, 0.55);
+    let status: Option<(String, Color)> = match state.busy {
+        Some(ProfileJob::Downloading) => Some(("Downloading…".into(), ok)),
+        Some(ProfileJob::Importing) => Some(("Importing…".into(), ok)),
+        Some(ProfileJob::Updating) => Some(("Checking RawTherapee for newer profiles…".into(), ok)),
+        Some(ProfileJob::Rescanning) => Some(("Reading the profile folders…".into(), ok)),
+        None => state.notice.as_ref().map(|n| match n {
+            Ok(m) => (m.clone(), ok),
+            Err(e) => (e.clone(), warn),
+        }),
+    };
+
+    // Download for the image open in Develop, when there is one.
+    let open_camera = editor.current_metadata.as_ref().map(|m| camera_name(&m.make, &m.model));
+    let mut actions = row![].spacing(8);
+    if let Some(camera) = &open_camera {
+        actions = actions.push(
+            button(
+                row![
+                    text("\u{f019}").font(ICON_FONT).size(13), // download
+                    text(format!("Download for {camera}")).size(13),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            )
+            .on_press_maybe(idle.then_some(Message::DownloadCameraProfile))
+            .padding([6, 12])
+            .style(ui::styles::AccentButton::style),
+        );
+    }
+    actions = actions.push(
+        button(text("Update Downloaded").size(13))
+            .on_press_maybe(idle.then_some(Message::UpdateCameraProfiles))
+            .padding([6, 12])
+            .style(ui::styles::NeutralButton::style),
+    );
+    let mut open_source = column![
+        card_title("Open-Source Profiles"),
+        hint("The RawTherapee project publishes free camera profiles for about 160 cameras. When an image's camera has no profile, Develop offers to download its one; RawEditor goes online only when you click."),
+        actions,
+    ]
+    .spacing(10);
+    if let Some((line, color)) = status {
+        open_source = open_source.push(text(line).size(12).style(move |_| text::Style { color: Some(color) }));
+    }
+
+    let own_dir = crate::core::paths::profiles_dir();
+    let own = column![
+        row![
+            card_title("Your Own Profiles"),
+            Space::with_width(Length::Fill),
+            button(text("Rescan").size(13))
+                .on_press_maybe(idle.then_some(Message::RescanCameraProfiles))
+                .padding([6, 12])
+                .style(ui::styles::NeutralButton::style),
+            button(text("Import…").size(13))
+                .on_press_maybe(idle.then_some(Message::ImportCameraProfiles))
+                .padding([6, 12])
+                .style(ui::styles::NeutralButton::style),
+            button(
+                row![text(ui::icons::FOLDER_OPEN).font(ICON_FONT).size(13), text("Open Folder").size(13)]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+            )
+            .on_press(Message::OpenAppFolder(AppFolder::Profiles))
+            .padding([6, 12])
+            .style(ui::styles::NeutralButton::style),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
+        text(own_dir.display().to_string()).size(12).style(|_| text::Style {
+            color: Some(ui::palette::accent_text())
+        }),
+        hint("Any DNG camera profile (.dcp) works. Your own profiles are offered before downloaded ones; Rescan after copying files in by hand."),
+    ]
+    .spacing(10);
+
+    column![
+        heading("Camera Profiles"),
+        hint("A camera profile (DCP) describes how a sensor records colour. Each image can pick its own in Develop; the default below is used otherwise."),
+        card(column![card_title("Installed"), installed].spacing(12)),
+        card(open_source),
+        card(own),
+    ]
+    .spacing(12)
+    .into()
+}
+
+fn card_title_owned(title: String) -> Element<'static, Message> {
+    text(title)
+        .size(14)
+        .font(bold())
+        .style(|_| text::Style { color: Some(Color::from_rgb(0.88, 0.88, 0.88)) })
+        .into()
+}
+
 // ── lens profiles ───────────────────────────────────────────────────────────
 
 /// The lensfun database: what is installed and where from, downloading and
@@ -473,7 +664,7 @@ fn folders() -> Element<'static, Message> {
             &[
                 ("raw_editor.db", "The catalogue: imported images, ratings, flags and edits"),
                 ("settings.json", "These preferences"),
-                ("profiles/", "DCP camera profiles — put Adobe .dcp files here"),
+                ("profiles/", "Camera profiles (.dcp): your own; downloaded ones are in profiles/downloaded/"),
                 ("lensfun/", "Your own lens profiles; the downloaded database is in lensfun/updates/"),
                 ("logs/", "Diagnostic logs"),
             ],
@@ -636,11 +827,18 @@ const EXTERNAL: &[Credit] = &[
         "Lens profiles — downloaded when you ask, or read from your system",
         "https://lensfun.github.io",
     ),
+    credit(
+        "RawTherapee camera profiles",
+        &[],
+        "GPL-3.0-or-later",
+        "Open-source DCP profiles — downloaded when you ask",
+        crate::core::camera_profiles::RT_PAGE,
+    ),
     Credit {
-        name: "Adobe DCP profiles",
+        name: "Camera profiles you add",
         crates: &[],
-        license: "Adobe's terms",
-        purpose: "Camera profiles you supply in the profiles folder",
+        license: "Their makers' terms",
+        purpose: "DCP files you import or copy into the profiles folder",
         url: None,
     },
 ];
@@ -675,7 +873,7 @@ fn licenses() -> Element<'static, Message> {
         hint("This software is based in part on the work of the Independent JPEG Group."),
         group_label("Used if installed"),
         list(EXTERNAL),
-        hint("Neither is bundled. Lens profiles are downloaded only when you ask (Lens Profiles page); DCP profiles are yours to add."),
+        hint("None of these is bundled. Lens and camera profiles are downloaded only when you ask; profiles you add stay yours."),
     ]
     .spacing(8)
     .into()

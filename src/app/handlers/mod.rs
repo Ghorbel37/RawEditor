@@ -11,3 +11,4 @@ pub mod delete;
 pub mod proxy;
 pub mod loupe;
 pub mod lensfun;
+pub mod camera_profiles;

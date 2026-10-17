@@ -58,6 +58,8 @@ pub enum AppFolder {
     Cache,
     /// [`lensfun_dir`]
     Lensfun,
+    /// [`profiles_dir`]
+    Profiles,
 }
 
 impl AppFolder {
@@ -66,6 +68,7 @@ impl AppFolder {
             AppFolder::Data => Some(data_dir()),
             AppFolder::Cache => cache_dir(),
             AppFolder::Lensfun => Some(lensfun_dir()),
+            AppFolder::Profiles => Some(profiles_dir()),
         }
     }
 }

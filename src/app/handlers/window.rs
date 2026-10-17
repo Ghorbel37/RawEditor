@@ -65,10 +65,12 @@ pub fn handle_set_preferences_section(
         return Task::none();
     }
     editor.preferences_section = section;
-    let status = if section == crate::app::state::PreferencesSection::LensProfiles {
-        crate::app::handlers::lensfun::ensure_loaded()
-    } else {
-        Task::none()
+    let status = match section {
+        crate::app::state::PreferencesSection::LensProfiles => crate::app::handlers::lensfun::ensure_loaded(),
+        crate::app::state::PreferencesSection::CameraProfiles => {
+            crate::app::handlers::camera_profiles::ensure_loaded()
+        }
+        _ => Task::none(),
     };
     Task::batch([
         status,
@@ -172,12 +174,14 @@ pub fn handle_open_modal(editor: &mut RawEditor, modal: Modal) -> Task<Message> 
     editor.active_modal = modal;
     // Preferences reopens on its last page; Lens Profiles shows what the
     // database holds, which may not have been read yet.
-    let status = if modal == Modal::Preferences
-        && editor.preferences_section == crate::app::state::PreferencesSection::LensProfiles
-    {
-        crate::app::handlers::lensfun::ensure_loaded()
-    } else {
-        Task::none()
+    let status = match (modal, editor.preferences_section) {
+        (Modal::Preferences, crate::app::state::PreferencesSection::LensProfiles) => {
+            crate::app::handlers::lensfun::ensure_loaded()
+        }
+        (Modal::Preferences, crate::app::state::PreferencesSection::CameraProfiles) => {
+            crate::app::handlers::camera_profiles::ensure_loaded()
+        }
+        _ => Task::none(),
     };
     // A modal takes the keyboard, so Space will never deliver its release
     // edge — leave the before/after peek before it can get stranded.

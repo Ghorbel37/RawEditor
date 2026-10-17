@@ -420,6 +420,27 @@ pub enum Message {
     /// The lens database was (re)loaded in the background. `true` when it
     /// may have changed, so the open image's profile lookup is stale.
     LensDbLoaded(bool),
+    /// Develop's profile dropdown: this image's camera profile.
+    CameraProfileSelected(crate::core::camera_profiles::ProfileChoice),
+    /// Preferences: a camera's default profile — a file name, `"builtin"`,
+    /// or `None` for automatic.
+    SetCameraProfileDefault(String, Option<String>),
+    /// Download RawTherapee's profile for the open image's camera.
+    DownloadCameraProfile,
+    CameraProfileDownloaded(Result<Option<String>, String>),
+    /// Pick `.dcp` files to import.
+    ImportCameraProfiles,
+    CameraProfilesPicked(Option<Vec<std::path::PathBuf>>),
+    /// Imported names, and the failures.
+    CameraProfilesImported(Vec<String>, Vec<String>),
+    /// Refresh every downloaded profile from RawTherapee.
+    UpdateCameraProfiles,
+    CameraProfilesUpdated(Result<crate::core::camera_profiles::UpdateReport, String>),
+    /// Re-read the profile folders — after adding files by hand.
+    RescanCameraProfiles,
+    /// The profile folders were (re)scanned; `true` when they may have
+    /// changed, so the open image's profile may resolve differently.
+    CameraProfilesScanned(bool),
     /// Open a URL in the default browser (Preferences › Licenses).
     OpenLink(&'static str),
     /// Preferences side menu: show this page.

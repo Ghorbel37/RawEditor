@@ -86,6 +86,7 @@ pub fn prepare_image_resources_from_raw(
     tracing::info!("As-shot WB: {:.0}K, tint {:+.1}", as_kelvin, as_tint);
 
     let params = editor.current_edit_params;
+    let profile_defaults = editor.camera_profile_defaults.clone();
     let context = editor.gpu_context.clone();
 
     Task::perform(
@@ -99,14 +100,23 @@ pub fn prepare_image_resources_from_raw(
                 }
             };
 
+            // The image's camera profile: its own choice, else its camera's
+            // default, else the best installed match. Resolved here, off the
+            // UI thread (it may scan and parse profile files).
+            let profile_use = crate::core::camera_profiles::ProfileUse::resolve(
+                &raw,
+                params.camera_profile,
+                &profile_defaults,
+            );
+
             // Anchored kelvin for the DCP interpolation. ImageResources::new
             // receives the AS-SHOT multipliers (the "None → as-shot" baseline
             // for update_uniforms); handle_image_resources_ready immediately
             // applies any saved Temp/Tint edits via the WB override.
-            let as_shot = crate::color::as_shot_kelvin_tint(&raw);
+            let as_shot = profile_use.as_shot;
             let kelvin = params.kelvin_from_anchor(as_shot.0);
 
-            let (forward_matrix, interpolated_dcp) = if let Some(dcp) = &raw.dcp_profile {
+            let (forward_matrix, interpolated_dcp) = if let Some(dcp) = &profile_use.profile {
                 let interpolated = crate::raw::dcp::interpolate_at_temperature(dcp, kelvin, crate::core::tonemap::ToneSettings::from_params(&params));
                 (interpolated.camera_to_prophoto, Some(interpolated))
             } else {
@@ -132,7 +142,10 @@ pub fn prepare_image_resources_from_raw(
                 raw.orientation,
                 raw.lens_context.clone(),
             ) {
-                Ok(resources) => Ok((ctx, std::sync::Arc::new(resources))),
+                Ok(mut resources) => {
+                    resources.profile_use = Some(profile_use);
+                    Ok((ctx, std::sync::Arc::new(resources)))
+                }
                 Err(e) => Err(e),
             }
         },
@@ -150,6 +163,20 @@ pub fn handle_image_resources_ready(editor: &mut RawEditor, image_id: i64, resul
         Ok((context, resources)) => {
             if editor.gpu_context.is_none() {
                 editor.gpu_context = Some(context.clone());
+            }
+            // The profile these resources were built with is the image's
+            // profile from here on — the WB solve below already reads it.
+            if let Some(used) = &resources.profile_use {
+                if editor.current_dcp_profile.as_ref().map(Arc::as_ptr)
+                    != used.profile.as_ref().map(Arc::as_ptr)
+                {
+                    editor.dcp_memo.replace(None);
+                }
+                editor.current_dcp_profile = used.profile.clone();
+                editor.as_shot_wb = Some(used.as_shot);
+                if let Some(meta) = editor.current_metadata.as_mut() {
+                    meta.dcp_profile = used.profile.clone();
+                }
             }
 
             editor.sync_tool_flags();
@@ -255,6 +282,8 @@ pub fn trigger_full_res_upgrade(editor: &mut RawEditor) -> Task<Message> {
 
     editor.full_res_upgrading = true;
     let params = editor.current_edit_params;
+    let profile_use = editor.image_resources.as_ref().and_then(|r| r.profile_use.clone());
+    let profile_defaults = editor.camera_profile_defaults.clone();
     let context = editor.gpu_context.clone();
 
     tracing::info!(
@@ -279,12 +308,18 @@ pub fn trigger_full_res_upgrade(editor: &mut RawEditor) -> Task<Message> {
                 }
             };
 
+            // The profile the image already uses (resolved for its preview),
+            // or — if the preview recorded none — resolved now.
+            let profile_use = profile_use.unwrap_or_else(|| {
+                crate::core::camera_profiles::ProfileUse::resolve(&raw, params.camera_profile, &profile_defaults)
+            });
+
             // Anchored kelvin; as-shot multipliers to ::new (same reasoning as
             // the preview path above).
-            let as_shot = crate::color::as_shot_kelvin_tint(&raw);
+            let as_shot = profile_use.as_shot;
             let kelvin = params.kelvin_from_anchor(as_shot.0);
 
-            let (forward_matrix, interpolated_dcp) = if let Some(dcp) = &raw.dcp_profile {
+            let (forward_matrix, interpolated_dcp) = if let Some(dcp) = &profile_use.profile {
                 let interpolated = crate::raw::dcp::interpolate_at_temperature(dcp, kelvin, crate::core::tonemap::ToneSettings::from_params(&params));
                 (interpolated.camera_to_prophoto, Some(interpolated))
             } else {
@@ -310,7 +345,10 @@ pub fn trigger_full_res_upgrade(editor: &mut RawEditor) -> Task<Message> {
                 raw.orientation,
                 raw.lens_context.clone(),
             ) {
-                Ok(resources) => Ok((ctx, Arc::new(resources))),
+                Ok(mut resources) => {
+                    resources.profile_use = Some(profile_use);
+                    Ok((ctx, Arc::new(resources)))
+                }
                 Err(e) => Err(e),
             }
         },
