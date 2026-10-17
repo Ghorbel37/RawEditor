@@ -203,7 +203,7 @@ pub fn analyse(
                         continue;
                     }
                     let mean: [f32; 3] = std::array::from_fn(|c| total[c] / count[c].max(1.0));
-                    if hi >= HL_CLIP_LO || hi < SAMPLE_LO || mean.iter().any(|&m| m < SAMPLE_FLOOR) {
+                    if !(SAMPLE_LO..HL_CLIP_LO).contains(&hi) || mean.iter().any(|&m| m < SAMPLE_FLOOR) {
                         continue;
                     }
                     let w = ((hi - SAMPLE_LO) / (HL_CLIP_LO - SAMPLE_LO)).powi(2);

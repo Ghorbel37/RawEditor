@@ -146,16 +146,19 @@ pub fn handle_dehaze_changed(editor: &mut RawEditor, v: f32) -> Task<Message> {
 
 pub fn handle_luma_noise_changed(editor: &mut RawEditor, v: f32) -> Task<Message> {
     editor.current_edit_params.luma_noise = v;
+    editor.stage_drag = true;
     update_pipeline(editor)
 }
 
 pub fn handle_luma_detail_changed(editor: &mut RawEditor, v: f32) -> Task<Message> {
     editor.current_edit_params.luma_detail = v;
+    editor.stage_drag = true;
     update_pipeline(editor)
 }
 
 pub fn handle_color_noise_changed(editor: &mut RawEditor, v: f32) -> Task<Message> {
     editor.current_edit_params.color_noise = v;
+    editor.stage_drag = true;
     update_pipeline(editor)
 }
 
@@ -225,7 +228,17 @@ pub fn handle_commit_edit(editor: &mut RawEditor) -> Task<Message> {
     // point now that update_pipeline only marks the state dirty.
     // commit_current_state flushes.
     editor.commit_current_state();
-    Task::none()
+    finish_stage_drag(editor)
+}
+
+/// A noise-reduction drag just ended: if it was shown from the subsampled
+/// preview (`RawEditor::stage_drag`), render the view at full resolution.
+pub fn finish_stage_drag(editor: &mut RawEditor) -> Task<Message> {
+    if editor.display_from_drag_preview {
+        crate::app::handlers::navigation::throttled_render(editor)
+    } else {
+        Task::none()
+    }
 }
 
 pub fn handle_undo(editor: &mut RawEditor) -> Task<Message> {
@@ -620,6 +633,36 @@ pub fn trigger_async_render(editor: &mut RawEditor) -> Task<Message> {
             Task::none()
         };
 
+        // After a full-resolution upgrade the subsampled preview is kept
+        // (`preview_resources`). Render from it whenever full resolution adds
+        // nothing: the overview always (384px), and the display while the
+        // view does not magnify the preview — or while a noise-reduction
+        // slider is dragged, whose stage re-runs over every SOURCE pixel per
+        // tick. The release re-renders at full resolution (`finish_stage_drag`).
+        let preview = editor
+            .preview_resources
+            .clone()
+            .filter(|p| p.image_id == resources.image_id);
+        let (display_res, overview_res) = match preview {
+            Some(preview) => {
+                // Same state as the full-resolution set: its uniforms are the
+                // ones every edit path pushes to.
+                let params = resources.pushed_params();
+                let (interpolated, wb_override) = resolve_wb_and_dcp(editor, &params);
+                preview.update_uniforms(&ctx, &params, interpolated.as_deref(), wb_override);
+                let preview_magnification =
+                    target.magnification * resources.width as f32 / preview.width.max(1) as f32;
+                let fits = preview_magnification <= crate::core::viewport::FULL_RES_MAGNIFICATION;
+                editor.display_from_drag_preview = !fits && editor.stage_drag;
+                let display = if fits || editor.stage_drag { preview.clone() } else { resources };
+                (display, preview)
+            }
+            None => {
+                editor.display_from_drag_preview = false;
+                (resources.clone(), resources)
+            }
+        };
+
         let render = Task::perform(
             async move {
                 // Display window and the whole-image overview share one GPU
@@ -627,7 +670,8 @@ pub fn trigger_async_render(editor: &mut RawEditor) -> Task<Message> {
                 // report it separately from the render.
                 crate::gpu::render_functions::render_display_and_overview(
                     &ctx,
-                    &resources,
+                    &display_res,
+                    &overview_res,
                     target_w,
                     target_h,
                     view_rect,

@@ -404,6 +404,14 @@ pub struct RawEditor {
     pub gpu_context: Option<Arc<gpu::shared::SharedContext>>,
     /// Current image resources (created per image, wrapped in Arc)
     pub image_resources: Option<Arc<gpu::shared::ImageResources>>,
+    /// The subsampled develop preview of the same image, kept once
+    /// `image_resources` has been upgraded to full resolution. Renders use it
+    /// whenever full resolution would add nothing — a view that does not
+    /// magnify it, the whole-image overview, a noise-reduction drag — because
+    /// the cached stages (denoise) cost per SOURCE pixel: at 24 MP every NR
+    /// tick re-ran them over the whole sensor, a few fps on an iGPU. Always
+    /// None or the same image as `image_resources`; cleared with it.
+    pub preview_resources: Option<Arc<gpu::shared::ImageResources>>,
     /// Editor readiness status
     pub editor_readiness: EditorReadiness,
 
@@ -557,6 +565,14 @@ pub struct RawEditor {
     /// The image whose full-resolution rebuild last failed (out of GPU
     /// memory, say): not retried on every render while it stays selected.
     pub full_res_failed: Option<i64>,
+    /// A noise-reduction slider is being dragged (set by its change handlers,
+    /// cleared by `commit_current_state` — the slider's release). While set,
+    /// a zoomed-in view renders from `preview_resources` so the drag stays
+    /// interactive; the release re-renders at full resolution.
+    pub stage_drag: bool,
+    /// The on-screen render came from `preview_resources` only because of a
+    /// `stage_drag`, so it is softer than the view calls for.
+    pub display_from_drag_preview: bool,
 
     // ── Scroll boost + filmstrip momentum ──────────────────────────────────
     /// True while the cursor is over the library grid, from the grid's own
@@ -703,6 +719,7 @@ impl RawEditor {
                 // Phase 95: Unified GPU Pipeline Architecture
                 gpu_context: None, // Will be initialized on first image load
                 image_resources: None,
+                preview_resources: None,
                 editor_readiness: EditorReadiness::NoSelection,
 
                 histogram_data: std::cell::RefCell::new([[0; 256]; 3]),
@@ -765,6 +782,8 @@ impl RawEditor {
                 pending_render: false,
                 full_res_upgrading: false,
                 full_res_failed: None,
+                stage_drag: false,
+                display_from_drag_preview: false,
                 cursor_over_grid: false,
                 grid_scroll_y: 0.0,
                 grid_viewport: (0.0, 0.0),
@@ -840,6 +859,7 @@ impl RawEditor {
     /// the two together means any future commit site gets persistence for free
     /// and the two can't drift apart.
     pub fn commit_current_state(&mut self) {
+        self.stage_drag = false;
         self.flush_edits();
         let params_to_push = self.current_edit_params;
         if let Some((stack, index)) = self.get_current_history() {

@@ -159,6 +159,13 @@ pub fn handle_image_resources_ready(editor: &mut RawEditor, image_id: i64, resul
                 resources.update_uniforms(ctx, &editor.current_edit_params, interpolated.as_deref(), wb_override);
             }
 
+            // A full-resolution upgrade keeps the preview it replaces: renders
+            // that full resolution would not sharpen use it instead
+            // (`RawEditor::preview_resources`). Anything else drops it.
+            let upgrade = resources.width == resources.original_width;
+            editor.preview_resources = editor.image_resources.take().filter(|old| {
+                upgrade && old.image_id == image_id && old.width < old.original_width
+            });
             editor.image_resources = Some(resources);
             editor.editor_readiness = EditorReadiness::Ready(image_id);
             editor.working_preview = None;
@@ -424,5 +431,39 @@ mod tests {
         e.is_rendering = false;
         let _ = crate::app::handlers::develop::trigger_async_render(&mut e);
         assert!(!e.full_res_upgrading, "retried a failed upgrade");
+        // A successful upgrade keeps the preview beside it: renders that full
+        // resolution would not sharpen — and a noise-reduction drag, whose
+        // stage costs per source pixel — come from the preview instead.
+        let full = rt.block_on(async {
+            let raw = raw::loader::load_raw_data(e.images[0].path.clone()).await.expect("decode");
+            let fm = crate::color::calculate_cam_to_srgb(raw.color_matrix, raw.wb_multipliers, raw.color_matrix_is_d65);
+            let res = gpu::shared::ImageResources::new(
+                &ctx, 1, &raw.data, raw.width, raw.height, &Default::default(), raw.wb_multipliers, fm,
+                raw.cfa_pattern, raw.black_levels, raw.white_level, None, None, raw.orientation,
+                raw.lens_context.clone(),
+            )
+            .expect("resources");
+            Arc::new(res)
+        });
+        e.full_res_upgrading = true;
+        e.is_rendering = false;
+        let _ = handle_full_res_ready(&mut e, 1, Ok((ctx.clone(), full.clone())));
+        assert!(e.image_resources.as_ref().is_some_and(|r| Arc::ptr_eq(r, &full)));
+        assert!(e.preview_resources.as_ref().is_some_and(|p| Arc::ptr_eq(p, &preview)), "preview dropped");
+
+        // Zoomed in, an NR drag renders from the preview; its release goes
+        // back to full resolution.
+        e.is_rendering = false;
+        let _ = crate::app::handlers::develop::handle_luma_noise_changed(&mut e, 0.5);
+        assert!(e.display_from_drag_preview, "the drag rendered at full resolution");
+        e.is_rendering = false;
+        let _ = crate::app::handlers::develop::handle_commit_edit(&mut e);
+        assert!(!e.stage_drag);
+        assert!(!e.display_from_drag_preview, "the release stayed on the preview");
+
+        // Any load that is not a full-resolution upgrade drops it.
+        e.is_rendering = true;
+        let _ = handle_image_resources_ready(&mut e, 1, Ok((ctx.clone(), preview.clone())));
+        assert!(e.preview_resources.is_none());
     }
 }

@@ -671,8 +671,13 @@ fn make_color_bind_group(
 #[derive(Debug)]
 struct StageState {
     /// Settings the denoise output was last produced with; `None` when it
-    /// has never run (or was last skipped as inactive).
+    /// has never run. Kept while NR is off (`denoise_on`), so turning it back
+    /// on with the same settings — releasing the before/after peek, which
+    /// renders with NR off — reuses the output instead of re-running it.
     denoise_key: Option<super::denoise::DenoiseSettings>,
+    /// Whether the colour pass reads the denoise output (NR active) or the
+    /// demosaic.
+    denoise_on: bool,
     /// Allocated on first use and kept: re-allocating ~2 full-size textures
     /// per slider tick would churn the allocator for nothing.
     denoise: Option<(super::denoise::DenoiseTargets, [Arc<wgpu::BindGroup>; 2])>,
@@ -764,6 +769,7 @@ impl StageState {
     fn new(base: Arc<wgpu::BindGroup>, masks: Arc<wgpu::BindGroup>, presence: Arc<wgpu::BindGroup>) -> Self {
         Self {
             denoise_key: None,
+            denoise_on: false,
             denoise: None,
             active: base,
             curves: None,
@@ -1177,19 +1183,19 @@ impl ImageResources {
         }
 
         // Brush layers: re-rasterise only when the strokes changed. No
-        // strokes → nothing to draw (the shader skips masks without any).
-        if st.brush_key != Some(params.brush) {
-            if !params.brush.is_empty() {
-                if st.brush.is_none() {
-                    let (dw, dh) = self.oriented_dims();
-                    let (lw, lh) = super::brush::layer_size(dw, dh);
-                    let layers = context.brush.layers(&context.device, lw, lh);
-                    st.masks = Arc::new(make_mask_bind_group(context, &layers.array_view, &self.mask_buffer));
-                    st.brush = Some(layers);
-                }
-                if let Some(layers) = &st.brush {
-                    context.brush.rasterize(&context.device, &context.queue, layers, &params.brush);
-                }
+        // strokes → nothing to draw (the shader skips masks without any), and
+        // the layers keep what `brush_key` describes: the before/after peek
+        // has no strokes, and releasing it must not re-rasterise them.
+        if !params.brush.is_empty() && st.brush_key != Some(params.brush) {
+            if st.brush.is_none() {
+                let (dw, dh) = self.oriented_dims();
+                let (lw, lh) = super::brush::layer_size(dw, dh);
+                let layers = context.brush.layers(&context.device, lw, lh);
+                st.masks = Arc::new(make_mask_bind_group(context, &layers.array_view, &self.mask_buffer));
+                st.brush = Some(layers);
+            }
+            if let Some(layers) = &st.brush {
+                context.brush.rasterize(&context.device, &context.queue, layers, &params.brush);
             }
             st.brush_key = Some(params.brush);
         }
@@ -1203,12 +1209,15 @@ impl ImageResources {
     /// colour pass at the result (or at the demosaic when it is off).
     fn prepare_denoise(&self, context: &SharedContext, st: &mut StageState, params: &EditParams) {
         let settings = super::denoise::DenoiseSettings::from_params(params);
-        if !settings.is_active() {
-            st.denoise_key = None;
+        st.denoise_on = settings.is_active();
+        if !st.denoise_on {
             st.active = self.base_bind_group.clone();
             return;
         }
         if st.denoise_key == Some(settings) {
+            if let Some((_, groups)) = &st.denoise {
+                st.active = groups[st.denoise_out].clone();
+            }
             return;
         }
 
@@ -1250,7 +1259,7 @@ impl ImageResources {
         if params.texture == 0.0 && params.clarity == 0.0 {
             return;
         }
-        let source_key = st.denoise_key;
+        let source_key = st.denoise_key.filter(|_| st.denoise_on);
         if st.local_key == Some(source_key) {
             return;
         }
@@ -1291,6 +1300,14 @@ impl ImageResources {
         let wb = self.analysis_wb;
         let read_var: f32 = (0..3).map(|c| k[c] * k[c] * self.noise_model.b[c]).sum();
         [k[0] * wb[0], k[1] * wb[1], k[2] * wb[2], (3.0 * read_var.sqrt()).max(1.0 / 4096.0)]
+    }
+
+    /// The params most recently pushed by `update_uniforms` — what this
+    /// image's uniforms and stages currently render. Lets a second resource
+    /// set for the same image (the develop preview kept beside a
+    /// full-resolution upgrade) be brought to exactly the same state.
+    pub fn pushed_params(&self) -> EditParams {
+        *self.stage_params.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Display-space dimensions of the working (possibly subsampled) texture:

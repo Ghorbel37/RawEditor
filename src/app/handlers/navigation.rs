@@ -790,6 +790,7 @@ fn trigger_image_load(editor: &mut RawEditor, image_id: i64) -> Task<Message> {
         // any slider touched mid-load from rendering the old image.
         editor.image_resources = None;
         editor.rendered_preview_bytes = None;
+        editor.preview_resources = None;
         editor.rendered_view_rect = crate::gpu::params::FULL_VIEW_RECT;
         editor.requested_view_rect = crate::gpu::params::FULL_VIEW_RECT;
         editor.current_metadata = None;

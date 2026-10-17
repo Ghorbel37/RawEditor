@@ -515,10 +515,19 @@ impl EditParams {
     /// judging an edit. Black levels are a sensor correction, not a look, for
     /// the same reason.
     ///
+    /// Noise reduction is kept too. Its stage caches one output, and the
+    /// default (Color 0.3) is itself a setting, so a reset NR meant a
+    /// different denoise on every press AND every release of the peek —
+    /// ~0.5 s each way at full resolution on an iGPU. NR is judged by
+    /// dragging its own sliders at 1:1 anyway.
+    ///
     /// Change the preserved list here (and nowhere else) if you would rather
     /// see the truly untouched frame.
     pub fn before_reference(&self) -> Self {
         Self {
+            luma_noise: self.luma_noise,
+            luma_detail: self.luma_detail,
+            color_noise: self.color_noise,
             crop: self.crop,
             rotation: self.rotation,
             // Lens corrections reframe the image (distortion, constrain zoom),
@@ -857,6 +866,21 @@ mod tests {
         assert_eq!(b.black_phase_y, p.black_phase_y);
     }
 
+    /// NR is kept: the denoise stage caches one output, so a reset NR re-ran
+    /// it on every press and release of the peek.
+    #[test]
+    fn before_reference_keeps_noise_reduction() {
+        let mut p = fully_edited();
+        p.luma_noise = 0.4;
+        p.luma_detail = 0.7;
+        p.color_noise = 0.6;
+        let b = p.before_reference();
+        assert_eq!(
+            (b.luma_noise, b.luma_detail, b.color_noise),
+            (p.luma_noise, p.luma_detail, p.color_noise)
+        );
+    }
+
     #[test]
     fn before_reference_resets_every_look_adjustment() {
         let d = EditParams::default();
@@ -874,15 +898,12 @@ mod tests {
         assert_eq!(b.dehaze, d.dehaze);
         assert_eq!(b.temperature, d.temperature);
         assert_eq!(b.tint, d.tint);
-        assert_eq!(b.luma_noise, d.luma_noise);
-        assert_eq!(b.color_noise, d.color_noise);
         assert_eq!(b.sharpening, d.sharpening);
         assert_eq!(b.profile_curve, d.profile_curve);
         assert_eq!(b.tone_mapper, d.tone_mapper);
         assert_eq!(b.mask_count, 0, "masks must not apply to the before view");
         assert_eq!(b.curves, d.curves);
         assert_eq!(b.defringe, d.defringe);
-        assert_eq!(b.luma_detail, d.luma_detail);
     }
 
     // ── copy categories ──────────────────────────────────────────────────────

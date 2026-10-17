@@ -11,9 +11,12 @@ pub fn update(editor: &mut RawEditor, message: Message) -> Task<Message> {
     let slider_reset = editor.last_modifiers.command() && is_slider_change(&message);
     let modal_before = editor.active_modal;
     let task = dispatch(editor, message);
-    if slider_reset {
+    let task = if slider_reset {
         editor.commit_current_state();
-    }
+        Task::batch([task, handlers::develop::finish_stage_drag(editor)])
+    } else {
+        task
+    };
     match track_modal_exit(editor, modal_before) {
         Some(exit) => Task::batch([task, exit]),
         None => task,
