@@ -194,8 +194,12 @@ fn load_raw_data_blocking(path: &str) -> Result<RawDataResult, String> {
         if raw_wb[0].is_finite() && raw_wb[0] > 0.0 { raw_wb[0] } else { 1.0 },
         if raw_wb[1].is_finite() && raw_wb[1] > 0.0 { raw_wb[1] } else { 1.0 },
         if raw_wb[2].is_finite() && raw_wb[2] > 0.0 { raw_wb[2] } else { 1.0 },
-        if raw_wb[3].is_finite() && raw_wb[3] > 0.0 { raw_wb[3] } else {
-            if raw_wb[1].is_finite() && raw_wb[1] > 0.0 { raw_wb[1] } else { 1.0 }
+        if raw_wb[3].is_finite() && raw_wb[3] > 0.0 {
+            raw_wb[3]
+        } else if raw_wb[1].is_finite() && raw_wb[1] > 0.0 {
+            raw_wb[1]
+        } else {
+            1.0
         },
     ];
 

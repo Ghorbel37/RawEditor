@@ -249,11 +249,17 @@ pub struct DisplayRender {
 /// of the current edit, its pixels are kept too (see `DisplayRender::overview`)
 /// rather than generating edited thumbnails with a pass of their own.
 ///
-/// Both passes read the same uniform buffer, so their differing `view_rect`
-/// values are sequenced by `queue.write_buffer`'s ordering against submits.
+/// The two passes may read different resource sets of the same image:
+/// `overview_resources` is the subsampled develop preview when one is kept
+/// beside a full-resolution upgrade — a 384px pass gains nothing from 24 MP,
+/// and its cached stages (denoise) would otherwise re-run at full resolution
+/// on every slider tick. When both are the same set they share one uniform
+/// buffer, so their differing `view_rect` values are sequenced by
+/// `queue.write_buffer`'s ordering against submits.
 pub async fn render_display_and_overview(
     context: &SharedContext,
     resources: &ImageResources,
+    overview_resources: &ImageResources,
     width: u32,
     height: u32,
     view_rect: [f32; 4],
@@ -266,9 +272,9 @@ pub async fn render_display_and_overview(
     // submit that follows it), so the submits can't simply be hoisted out of
     // the encode window — the elapsed time is accumulated instead.
     let t_encode = std::time::Instant::now();
-    write_view_rect(context, resources, super::params::FULL_VIEW_RECT);
+    write_view_rect(context, overview_resources, super::params::FULL_VIEW_RECT);
     let (overview_cb, overview_rb) =
-        encode_color_pass(context, resources, overview_dims.0, overview_dims.1);
+        encode_color_pass(context, overview_resources, overview_dims.0, overview_dims.1);
     let mut encode_ms = t_encode.elapsed().as_secs_f32() * 1000.0;
 
     // Counted as GPU time: `submit` can block on queue backpressure, and
@@ -940,7 +946,7 @@ mod tests {
             for exposure in [0.0, -2.0] {
                 let params = EditParams { exposure, ..base };
                 res.update_uniforms(&ctx, &params, dcp.as_ref(), None);
-                let out = render_display_and_overview(&ctx, &res, w, h, FULL_VIEW_RECT, dims).await;
+                let out = render_display_and_overview(&ctx, &res, &res, w, h, FULL_VIEW_RECT, dims).await;
                 assert_eq!(out.overview.len(), (dims.0 * dims.1 * 4) as usize, "overview size");
                 let (display, overview) = (mean(&out.display), mean(&out.overview));
                 eprintln!("exposure {exposure:+}: display mean {display:.1}, overview mean {overview:.1} ({}x{})", dims.0, dims.1);
