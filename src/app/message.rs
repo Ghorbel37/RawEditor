@@ -476,6 +476,20 @@ pub enum Message {
             String,
         >,
     ),
+    /// The full-resolution rebuild (`loading::trigger_full_res_upgrade`)
+    /// finished. Separate from `ImageResourcesReady` so only its own result
+    /// releases the one-at-a-time upgrade guard, and so a failed upgrade
+    /// keeps the working preview instead of failing the editor.
+    FullResReady(
+        i64,
+        Result<
+            (
+                std::sync::Arc<crate::gpu::shared::SharedContext>,
+                std::sync::Arc<crate::gpu::shared::ImageResources>,
+            ),
+            String,
+        >,
+    ),
 
     // ========== Export Messages (Phase 19) ==========
     // Legacy export messages removed

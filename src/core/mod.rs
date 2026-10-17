@@ -1,6 +1,7 @@
 pub mod brush;
 pub mod curves;
 pub mod haze;
+pub mod highlights;
 pub mod histogram;
 pub mod lens;
 pub mod logging;

@@ -533,6 +533,25 @@ pub fn handle_render_finished(
     save
 }
 
+/// What a develop render of the current view needs: window, target size,
+/// and how far the screen magnifies the texture's source pixels. The source
+/// is the develop texture itself (`image_display_dims`), so a subsampled
+/// preview reports the magnification the full-resolution rebuild would fix.
+pub fn render_target(editor: &RawEditor) -> crate::core::viewport::RenderTarget {
+    let (disp_w, disp_h) = editor.image_display_dims();
+    let (vw, vh) = editor.viewport_size;
+    crate::core::viewport::render_target(
+        disp_w,
+        disp_h,
+        vw,
+        vh,
+        editor.zoom,
+        editor.pan_offset,
+        editor.scale_factor,
+        editor.is_cropping,
+    )
+}
+
 pub fn trigger_async_render(editor: &mut RawEditor) -> Task<Message> {
     let t_update_start = std::time::Instant::now();
 
@@ -546,48 +565,15 @@ pub fn trigger_async_render(editor: &mut RawEditor) -> Task<Message> {
         let ctx = ctx.clone();
         let resources = resources.clone();
 
-        let (vw, vh) = editor.viewport_size;
-
-        // Render only the slice of the image that is actually on screen.
-        // Sizing the target to the whole image at zoom-scaled resolution made
-        // its area grow as zoom^2 — at 100% on a 24MP file that meant
-        // rendering, reading back and re-uploading ~24M pixels to display ~2M.
-        //
-        // In crop mode the shader deliberately reveals the full sensor so the
-        // handles can be dragged over it, and zoom/pan are both disabled
-        // there, so windowing neither applies nor helps.
-        let view_rect = if editor.is_cropping {
-            crate::gpu::params::FULL_VIEW_RECT
-        } else {
-            crate::core::viewport::visible_view_rect(
-                disp_w,
-                disp_h,
-                vw,
-                vh,
-                editor.zoom,
-                editor.pan_offset,
-                crate::core::viewport::RENDER_OVERSCAN,
-            )
-        };
-
-        let ib = crate::core::viewport::image_rect(
-            disp_w, disp_h, vw, vh, editor.zoom, editor.pan_offset,
-        );
-        // On-screen size of the windowed region, in physical pixels — this is
-        // the resolution at which it will actually be displayed.
-        let win_px_w = (view_rect[2] * ib.width * editor.scale_factor).round();
-        let win_px_h = (view_rect[3] * ib.height * editor.scale_factor).round();
-
-        // Never exceed 1:1 with the source: past that there is no more detail
-        // to resolve, only wasted pixels. `disp_w`/`disp_h` already account for
-        // the crop, so the window simply spans `view_rect` of them — applying
-        // the crop factor again here would under-size the target and softening
-        // the preview.
-        let src_avail_w = view_rect[2] * disp_w as f32;
-        let src_avail_h = view_rect[3] * disp_h as f32;
-
-        let target_w = (win_px_w.min(src_avail_w).round() as u32).clamp(16, 16384);
-        let target_h = (win_px_h.min(src_avail_h).round() as u32).clamp(16, 16384);
+        // Render only the slice of the image that is actually on screen, at
+        // the resolution it is displayed at. Sizing the target to the whole
+        // image at zoom-scaled resolution made its area grow as zoom^2 — at
+        // 100% on a 24MP file that meant rendering, reading back and
+        // re-uploading ~24M pixels to display ~2M. (Crop mode reveals the
+        // full sensor and disables zoom/pan, so it renders the whole image.)
+        let target = render_target(editor);
+        let view_rect = target.view_rect;
+        let (target_w, target_h) = (target.width, target.height);
 
         // Only the REQUESTED window moves here. `rendered_view_rect` — what the
         // viewport actually draws against — is published in
@@ -621,7 +607,20 @@ pub fn trigger_async_render(editor: &mut RawEditor) -> Task<Message> {
             && editor.current_edit_params.mask_overlay == 0)
             .then_some(editor.current_edit_params);
 
-        return Task::perform(
+        // A subsampled texture shown larger than its own pixels is soft
+        // however it is rendered: fetch full resolution. Asked here, by the
+        // render itself, rather than by the zoom handler, so it also covers
+        // a view that is already zoomed in when an image loads (zoom is kept
+        // across images and tabs), a window resize, and HiDPI screens.
+        let upgrade = if target.magnification > crate::core::viewport::FULL_RES_MAGNIFICATION
+            && editor.current_tab == crate::app::message::AppTab::Develop
+        {
+            crate::app::handlers::loading::trigger_full_res_upgrade(editor)
+        } else {
+            Task::none()
+        };
+
+        let render = Task::perform(
             async move {
                 // Display window and the whole-image overview share one GPU
                 // wait; the overview is ~100k pixels, so there is no reason to
@@ -652,6 +651,7 @@ pub fn trigger_async_render(editor: &mut RawEditor) -> Task<Message> {
                 }))
             },
         );
+        return Task::batch([render, upgrade]);
     }
     // GPU context not ready — release the lock so the next slider event can retry.
     editor.is_rendering = false;

@@ -19,7 +19,9 @@ jobs:
 
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        # macos-14 is an Apple Silicon (M1) runner, so the arm64 build is
+        # native rather than cross-compiled.
+        os: [ubuntu-latest, windows-latest, macos-14]
 
     steps:
       - uses: actions/checkout@v4
@@ -33,7 +35,19 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build release
+        if: matrix.os != 'macos-14'
         run: cargo build --release
+
+      # Apple Silicon only ships arm64 Macs, so the build can assume more than
+      # the generic aarch64 baseline: `apple-m1` turns on the M1's ISA
+      # extensions (and its scheduling model) while still running on every
+      # M-series chip. `fast-jpeg` adds zune-jpeg's NEON decoder.
+      - name: Build release (Apple Silicon)
+        if: matrix.os == 'macos-14'
+        env:
+          RUSTFLAGS: -C target-cpu=apple-m1
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: cargo build --release --target aarch64-apple-darwin --features fast-jpeg
 
       - name: Prepare release directory (Linux)
         if: matrix.os == 'ubuntu-latest'
@@ -68,6 +82,48 @@ jobs:
           Copy-Item "LICENSE" $OUT -ErrorAction SilentlyContinue
 
           Compress-Archive -Path $OUT -DestinationPath "dist\$APP-windows-$VERSION.zip"
+
+      - name: Prepare app bundle (Apple Silicon)
+        if: matrix.os == 'macos-14'
+        shell: bash
+        run: |
+          APP=raw-editor
+          VERSION=${GITHUB_REF_NAME}
+          BUNDLE="dist/RawEditor.app"
+
+          mkdir -p "$BUNDLE/Contents/MacOS" "$BUNDLE/Contents/Resources"
+          cp target/aarch64-apple-darwin/release/$APP "$BUNDLE/Contents/MacOS/"
+          cp -r assets "$BUNDLE/Contents/Resources/"
+          cp README.md LICENSE "$BUNDLE/Contents/Resources/" 2>/dev/null || true
+
+          cat > "$BUNDLE/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>RawEditor</string>
+            <key>CFBundleDisplayName</key><string>RawEditor</string>
+            <key>CFBundleIdentifier</key><string>io.github.happyslappyface.raweditor</string>
+            <key>CFBundleExecutable</key><string>$APP</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>${VERSION#v}</string>
+            <key>CFBundleVersion</key><string>${VERSION#v}</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>LSArchitecturePriority</key><array><string>arm64</string></array>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          EOF
+
+          # Ad-hoc signature. Not notarised, but without any signature a
+          # downloaded arm64 app is reported as "damaged" rather than offering
+          # the right-click › Open override.
+          codesign --force --deep --sign - "$BUNDLE"
+
+          # ditto keeps the bundle's metadata and signature intact; plain zip
+          # does not.
+          cd dist
+          ditto -c -k --keepParent RawEditor.app "$APP-macos-arm64-$VERSION.zip"
 
 
       - name: Upload artifact (CI)

@@ -568,3 +568,64 @@ fn lens_constrain_leaves_no_black_border() {
         }
     });
 }
+
+/// Highlight reconstruction against ground truth: a light-blue sky that
+/// brightens past green's and then blue's clip point — red never clips, the
+/// case that rendered purple — with the clipped photosites reading ABOVE
+/// white, as a Nikon D3300's do. Pulled down 1.5 EV, it must match the same
+/// sky captured with headroom to spare. The old rule (rebuild from the mean
+/// of the unclipped channels) gave green = red under a higher blue there:
+/// lavender.
+#[test]
+#[ignore]
+fn clipped_sky_matches_the_unclipped_truth() {
+    // Camera-native sky; white-balanced by WB it is (0.84, 1, 1.2).
+    const SKY: [f32; 3] = [0.42, 1.0, 0.8];
+    const HEADROOM: f32 = 4.0;
+    let (w, h) = (512usize, 384usize);
+    let gain = |y: usize| 2.0 - 1.5 * y as f32 / h as f32;
+    let capture = |scale: f32| -> Vec<u16> {
+        let range = WHITE - BLACK;
+        (0..w * h)
+            .map(|i| {
+                let (x, y) = (i % w, i / w);
+                let c = match (y & 1, x & 1) {
+                    (0, 0) => 0,
+                    (1, 1) => 2,
+                    _ => 1,
+                };
+                let v = SKY[c] * gain(y) * scale;
+                if v >= 1.0 { (WHITE + 0.05 * range) as u16 } else { (BLACK + v * range).round() as u16 }
+            })
+            .collect()
+    };
+    // Rows where green and blue clip and red is still well short of it
+    // (gain 1.3–1.6), away from where rebuilt colour starts going white.
+    let rows = (h * 28 / 100, h * 45 / 100);
+    let mean = |img: &[u8], iw: u32| {
+        let mut m = [0.0f64; 3];
+        let mut n = 0.0;
+        for y in rows.0..rows.1 {
+            for x in 16..iw as usize - 16 {
+                let i = (y * iw as usize + x) * 4;
+                for c in 0..3 {
+                    m[c] += img[i + c] as f64;
+                }
+                n += 1.0;
+            }
+        }
+        m.map(|v| v / n)
+    };
+    runtime().block_on(async {
+        let ctx = SharedContext::new().await.expect("gpu");
+        let pulled = |exposure| EditParams { exposure, ..EditParams::default() };
+        let (clipped, cw, _) = render(&ctx, &capture(1.0), w, h, &pulled(-1.5), None).await;
+        let (truth, _, _) = render(&ctx, &capture(1.0 / HEADROOM), w, h, &pulled(-1.5 + HEADROOM.log2()), None).await;
+        let (got, want) = (mean(&clipped, cw), mean(&truth, cw));
+        eprintln!("clipped sky {got:.1?}, truth {want:.1?}");
+        for c in 0..3 {
+            assert!((got[c] - want[c]).abs() < 4.0, "channel {c}: {got:.1?} vs truth {want:.1?}");
+        }
+        assert!(got[1] > got[0] + 2.0, "green not above red — the purple cast: {got:.1?}");
+    });
+}

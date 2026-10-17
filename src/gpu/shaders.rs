@@ -135,10 +135,11 @@ struct EditParams {
 
     white_level: u32,
 
-    // Padding to reach 176 bytes
-    pad_end_1: f32,
-    pad_end_2: f32,
-    pad_end_3: f32,
+    // Highlight-reconstruction correction, camera-native (core::highlights).
+    // Three former pad slots: no offset moved.
+    highlight_k_r: f32,
+    highlight_k_g: f32,
+    highlight_k_b: f32,
 
     // Phase 38: Manual Black Level Offsets
     black_offsets: vec4<f32>,
@@ -272,6 +273,35 @@ fn haze_coeffs(uv: vec2<f32>) -> vec2<f32> {
     let c01 = textureLoad(haze_tex, clamp(i0 + vec2<i32>(0, 1), vec2<i32>(0), hi), 0).xy;
     let c11 = textureLoad(haze_tex, clamp(i0 + vec2<i32>(1, 1), vec2<i32>(0), hi), 0).xy;
     return mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
+}
+
+// Highlight reconstruction (Step 3). MIRRORED from core::highlights —
+// `shader_highlight_constants_match_rust` checks. A channel starts being
+// rebuilt at HL_CLIP_LO of its ceiling; rebuilt channels go white as the
+// least-clipped channel climbs from HL_FADE_LO of its ceiling to clipping;
+// HL_ITERATIONS rounds let channels clipped together lift each other.
+const HL_CLIP_LO: f32 = 0.9;
+const HL_FADE_LO: f32 = 0.7;
+const HL_ITERATIONS: i32 = 4;
+
+// Rebuild clipped channels (core::highlights, whose `reconstruct` is the CPU
+// mirror of this). In white-balanced space, each clipped channel is
+// estimated as the geometric mean of the other two — their current
+// estimates, clipped or not, since a clipped value is a close lower bound —
+// times `k`, the learned correction; it only ever raises a channel, blended
+// in by `clip_w`. Log space throughout: the mean is a sum there.
+fn reconstruct_highlight(measured: vec3<f32>, ceiling: vec3<f32>, clip_w: vec3<f32>, k: vec3<f32>) -> vec3<f32> {
+    let lm = log(max(measured, vec3<f32>(1e-6)));
+    var l = lm;
+    for (var i = 0; i < HL_ITERATIONS; i++) {
+        l.g = mix(lm.g, max(lm.g, 0.5 * (l.b + l.r) + k.g), clip_w.g);
+        l.b = mix(lm.b, max(lm.b, 0.5 * (l.r + l.g) + k.b), clip_w.b);
+        l.r = mix(lm.r, max(lm.r, 0.5 * (l.g + l.b) + k.r), clip_w.r);
+    }
+    let ratio = measured / ceiling;
+    let white = smoothstep(HL_FADE_LO, 1.0, min(ratio.r, min(ratio.g, ratio.b)));
+    let top = max(l.r, max(l.g, l.b));
+    return exp(l + (vec3<f32>(top) - l) * white * clip_w);
 }
 
 // Log-chromaticity epsilon for colour-range masks. MIRRORED from
@@ -720,51 +750,27 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // cached denoise pre-pass — gpu/denoise.rs — and this pass samples its
     // output. luma_noise / color_noise are vestigial in this struct.)
 
-    // ── Step 3: Highlight neutralisation (camera space, per-channel) ──────────
-    // When a raw sensor channel clips (hits digital saturation at raw = 1.0), its
-    // WB-amplified value reaches wb_multipliers.channel × 1.0 = wb_multipliers.channel.
-    // Adjacent Bayer-opposite pixels (e.g. a G site next to a clipped B sky pixel) have
-    // the clipped channel interpolated from their neighbours by the debayer pass, so
-    // color.b at the G site also approaches wb_multipliers.b.  Comparing each channel's
-    // debayered value against its own WB multiplier therefore produces a spatially-smooth
-    // blend weight — free of the 2-pixel Bayer-period checkerboard that appeared when
-    // the old code used the per-Bayer-site raw alpha instead.
+    // ── Step 3: Highlight reconstruction (white-balanced camera space) ───────
+    // A channel that saturates reads its ceiling instead of its true value.
+    // Green clips first, so a bright sky reads magenta once WB lifts red and
+    // blue past it — and exposure pulled down showed that as purple. Each
+    // clipped channel is rebuilt from the others (reconstruct_highlight;
+    // core::highlights explains the estimate), with a per-image correction
+    // learned from the unclipped rims of clipped areas, so a sky is rebuilt
+    // in the colour it has just before it clips.
     //
-    // This runs before the exposure step so the correction is visible when exposure is
-    // pulled down (which brings clipped areas into the visible range as magenta).
-    // ── Step 3: Highlight RECONSTRUCTION (camera space, per-channel) ─────────
-    // A channel that hits sensor saturation reads its clip ceiling instead of
-    // its true (higher) value; passed downstream unchanged that false ratio
-    // shows as a colour cast (magenta sky = green clipped below red/blue's
-    // true balance).  Instead of desaturating, ESTIMATE the clipped channel
-    // from the unclipped ones: highlights are overwhelmingly near-neutral
-    // after WB, so the clip-weighted average of the surviving channels is a
-    // sound floor for the true value.  max() guarantees we only ever RAISE a
-    // clipped channel — a bright red shirt (only red clipped, green/blue low)
-    // keeps its measured red and stays red, while an overexposed sky (green
-    // and blue clipped) is lifted to the unclipped channel's level, recovering
-    // both hue and up to a stop of brightness that the ProPhoto shoulder then
-    // rolls into visible gradation.
-    //
-    // Per-channel clip weights compare each DEBAYERED value against that
-    // channel's own WB-amplified ceiling — spatially smooth, no Bayer-period
-    // checkerboard (unlike raw per-site detection).
+    // Clip weights compare each DEBAYERED value against its own WB-scaled
+    // ceiling (the demosaic caps every sample there): spatially smooth, no
+    // Bayer-period checkerboard. Before exposure, so pulling exposure down
+    // reveals the rebuilt values. The correction is stored camera-native and
+    // converted to this white balance here: k_c − (−1.5·ln w_c + ½Σ ln w).
     let wb3 = params.wb_multipliers.rgb;
-    let hl_clip_w = vec3<f32>(
-        smoothstep(wb3.r * 0.90, wb3.r, color.r),
-        smoothstep(wb3.g * 0.90, wb3.g, color.g),
-        smoothstep(wb3.b * 0.90, wb3.b, color.b)
-    );
-    let hl_unclip = vec3<f32>(1.0) - hl_clip_w;
-    let hl_den = hl_unclip.r + hl_unclip.g + hl_unclip.b;
-    if (hl_den > 0.05) {
-        let hl_est = dot(color * hl_unclip, vec3<f32>(1.0)) / hl_den;
-        color = mix(color, max(color, vec3<f32>(hl_est)), hl_clip_w);
-    } else {
-        // All three channels clipped: hue unrecoverable — go neutral at the
-        // brightest ceiling so the shoulder renders clean white.
-        let hl_max = max(color.r, max(color.g, color.b));
-        color = vec3<f32>(hl_max);
+    let hl_clip_w = smoothstep(wb3 * HL_CLIP_LO, wb3, color);
+    if (max(hl_clip_w.r, max(hl_clip_w.g, hl_clip_w.b)) > 0.0) {
+        let k_native = vec3<f32>(params.highlight_k_r, params.highlight_k_g, params.highlight_k_b);
+        let lw = log(wb3);
+        let k = k_native + 1.5 * lw - vec3<f32>(0.5 * (lw.r + lw.g + lw.b));
+        color = reconstruct_highlight(color, wb3, hl_clip_w, k);
     }
 
     // ── Step 3b: Dehaze ───────────────────────────────────────────────────────
@@ -1422,4 +1428,18 @@ mod tests {
         );
     }
 
+    /// Highlight analysis samples only what Step 3 trusts (below its clip
+    /// band), and `core::highlights::reconstruct` — what the unit tests
+    /// check — mirrors Step 3. Both only hold while the constants agree.
+    #[test]
+    fn shader_highlight_constants_match_rust() {
+        use crate::core::highlights::{HL_CLIP_LO, HL_FADE_LO, HL_ITERATIONS};
+        for expected in [
+            format!("const HL_CLIP_LO: f32 = {HL_CLIP_LO};"),
+            format!("const HL_FADE_LO: f32 = {HL_FADE_LO};"),
+            format!("const HL_ITERATIONS: i32 = {HL_ITERATIONS};"),
+        ] {
+            assert!(PASSTHROUGH_SHADER.contains(&expected), "missing `{expected}`");
+        }
+    }
 }

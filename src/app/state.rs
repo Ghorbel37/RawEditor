@@ -521,8 +521,14 @@ pub struct RawEditor {
     /// Phase 106: Render Throttling
     pub is_rendering: bool,
     pub pending_render: bool,
-    /// True while a full-resolution resource rebuild is in flight (zoom-in upgrade).
+    /// True while a full-resolution resource rebuild is in flight. One at a
+    /// time, across images: each holds a full-size working set on the GPU,
+    /// and navigating quickly must not stack them. Cleared only by that
+    /// rebuild's own result (`Message::FullResReady`).
     pub full_res_upgrading: bool,
+    /// The image whose full-resolution rebuild last failed (out of GPU
+    /// memory, say): not retried on every render while it stays selected.
+    pub full_res_failed: Option<i64>,
 
     // ── Scroll boost + filmstrip momentum ──────────────────────────────────
     /// True while the cursor is over the library grid, from the grid's own
@@ -730,6 +736,7 @@ impl RawEditor {
                 is_rendering: false,
                 pending_render: false,
                 full_res_upgrading: false,
+                full_res_failed: None,
                 cursor_over_grid: false,
                 grid_scroll_y: 0.0,
                 grid_viewport: (0.0, 0.0),

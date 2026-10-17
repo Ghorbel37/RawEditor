@@ -141,8 +141,6 @@ pub fn prepare_image_resources_from_raw(
 }
 
 pub fn handle_image_resources_ready(editor: &mut RawEditor, image_id: i64, result: Result<(Arc<gpu::shared::SharedContext>, Arc<gpu::shared::ImageResources>), String>) -> Task<Message> {
-    editor.full_res_upgrading = false;
-
     // Ignore stale results from a previous image selection
     if editor.selected_image_id != Some(image_id) {
         return Task::none();
@@ -181,33 +179,89 @@ pub fn handle_image_resources_ready(editor: &mut RawEditor, image_id: i64, resul
     }
 }
 
-/// Rebuild full-resolution ImageResources from cached RAW data.
-/// Called when the user zooms in past the point where the subsampled
-/// preview becomes limiting. Uses the raw_cache (no disk I/O needed).
+/// The full-resolution rebuild finished: release the one-at-a-time guard,
+/// then install it — or, if the user has moved on, see whether the image
+/// they are on now wants one (its own render may have asked while this was
+/// building and been turned away by the guard).
+pub fn handle_full_res_ready(
+    editor: &mut RawEditor,
+    image_id: i64,
+    result: Result<(Arc<gpu::shared::SharedContext>, Arc<gpu::shared::ImageResources>), String>,
+) -> Task<Message> {
+    editor.full_res_upgrading = false;
+    if editor.selected_image_id != Some(image_id) {
+        return upgrade_if_soft(editor);
+    }
+    match result {
+        Ok(_) => handle_image_resources_ready(editor, image_id, result),
+        Err(e) => {
+            // The preview resources still work: keep editing on them.
+            tracing::warn!("Full-resolution rebuild of image {image_id} failed, keeping the preview: {e}");
+            editor.full_res_failed = Some(image_id);
+            Task::none()
+        }
+    }
+}
+
+/// Start the full-resolution rebuild if the current view shows the
+/// subsampled develop texture magnified (`develop::render_target`).
+fn upgrade_if_soft(editor: &mut RawEditor) -> Task<Message> {
+    if editor.current_tab != crate::app::message::AppTab::Develop
+        || !matches!(editor.editor_readiness, EditorReadiness::Ready(_))
+        || crate::app::handlers::develop::render_target(editor).magnification
+            <= crate::core::viewport::FULL_RES_MAGNIFICATION
+    {
+        return Task::none();
+    }
+    trigger_full_res_upgrade(editor)
+}
+
+/// Rebuild the current image's ImageResources at full resolution, replacing
+/// the subsampled develop preview. Requested by any render whose view shows
+/// the preview magnified (`develop::trigger_async_render`). The RAW comes from
+/// `raw_cache`, or from disk if the cache no longer holds it — skipping the
+/// upgrade there left a zoomed-in view soft with no way to sharpen it.
 pub fn trigger_full_res_upgrade(editor: &mut RawEditor) -> Task<Message> {
     let Some(image_id) = editor.selected_image_id else { return Task::none(); };
 
     // Only upgrade if currently subsampled
     if let Some(res) = &editor.image_resources {
         if res.width == res.original_width { return Task::none(); } // already full-res
+        if res.image_id != image_id { return Task::none(); } // still loading this one
     } else {
         return Task::none();
     }
 
-    if editor.full_res_upgrading { return Task::none(); }
+    if editor.full_res_upgrading || editor.full_res_failed == Some(image_id) {
+        return Task::none();
+    }
 
-    let Some(raw) = editor.raw_cache.get(&image_id).cloned() else {
-        return Task::none(); // not in cache, skip (avoid extra disk I/O while editing)
+    let cached = editor.raw_cache.get(&image_id).cloned();
+    let path = match &cached {
+        Some(_) => None,
+        None => match editor.images.iter().find(|i| i.id == image_id) {
+            Some(img) => Some(img.path.clone()),
+            None => return Task::none(),
+        },
     };
 
     editor.full_res_upgrading = true;
     let params = editor.current_edit_params;
     let context = editor.gpu_context.clone();
 
-    tracing::info!("Upgrading to full-res resources for image {} (zoom-in)", image_id);
+    tracing::info!(
+        "Upgrading to full-res resources for image {} ({})",
+        image_id,
+        if cached.is_some() { "cached RAW" } else { "re-reading RAW" }
+    );
 
     Task::perform(
         async move {
+            let raw = match (cached, path) {
+                (Some(raw), _) => raw,
+                (None, Some(path)) => Arc::new(raw::loader::load_raw_data(path).await?),
+                (None, None) => return Err("no RAW to upgrade from".to_string()),
+            };
             let ctx = if let Some(c) = context {
                 c
             } else {
@@ -252,7 +306,7 @@ pub fn trigger_full_res_upgrade(editor: &mut RawEditor) -> Task<Message> {
                 Err(e) => Err(e),
             }
         },
-        move |res| Message::ImageResourcesReady(image_id, res),
+        move |res| Message::FullResReady(image_id, res),
     )
 }
 
@@ -284,5 +338,91 @@ fn metadata_snapshot(raw: &raw::loader::RawDataResult) -> raw::loader::RawDataRe
         lens: raw.lens.clone(),
         lens_context: raw.lens_context.clone(),
         orientation: raw.orientation,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::message::AppTab;
+
+    /// Zoom is kept across images and tabs, so a photo can load straight
+    /// into a zoomed-in view. Only the zoom handler used to request full
+    /// resolution, so such a view stayed on the subsampled preview — soft —
+    /// until the user zoomed again; and a RAW gone from the cache skipped
+    /// the upgrade outright. The render now asks.
+    ///
+    /// Needs a GPU (lavapipe is enough) and a RAW:
+    /// `RAWEDITOR_TEST_RAW=x.NEF cargo test --release loads_into_a_zoomed -- --ignored`.
+    #[test]
+    #[ignore]
+    fn loads_into_a_zoomed_in_view_at_full_resolution() {
+        let Ok(path) = std::env::var("RAWEDITOR_TEST_RAW") else {
+            eprintln!("RAWEDITOR_TEST_RAW not set, skipping");
+            return;
+        };
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).build().expect("runtime");
+        let (ctx, preview) = rt.block_on(async {
+            let ctx = Arc::new(gpu::shared::SharedContext::new().await.expect("gpu"));
+            let raw = raw::loader::load_raw_data(path.clone()).await.expect("decode");
+            let fm = crate::color::calculate_cam_to_srgb(raw.color_matrix, raw.wb_multipliers, raw.color_matrix_is_d65);
+            let res = gpu::shared::ImageResources::new(
+                &ctx, 1, &raw.data, raw.width, raw.height, &Default::default(), raw.wb_multipliers, fm,
+                raw.cfa_pattern, raw.black_levels, raw.white_level, None, Some(1280), raw.orientation,
+                raw.lens_context.clone(),
+            )
+            .expect("resources");
+            (ctx, Arc::new(res))
+        });
+        assert!(preview.width < preview.original_width, "the develop preview is subsampled");
+
+        let mut e = RawEditor::new().0;
+        e.current_tab = AppTab::Develop;
+        e.images = vec![crate::database::models::Image {
+            id: 1,
+            filename: "x.NEF".into(),
+            path,
+            cache_path_thumb: None,
+            cache_path_instant: None,
+            cache_path_working: None,
+            cache_path_edited: None,
+            file_status: "exists".into(),
+            rating: 0,
+            flag: 0,
+        }];
+        e.selected_image_id = Some(1);
+        e.gpu_context = Some(ctx.clone());
+        e.viewport_size = (1500.0, 1000.0);
+        e.scale_factor = 1.0;
+        e.editor_readiness = EditorReadiness::Loading(1);
+
+        // At fit on a standard display the preview is sharp: no upgrade.
+        e.zoom = 1.0;
+        let _ = handle_image_resources_ready(&mut e, 1, Ok((ctx.clone(), preview.clone())));
+        assert!(!e.full_res_upgrading, "upgraded at fit");
+
+        // The same image arriving in a view zoomed in on the previous one —
+        // with its RAW not cached: the render requests the upgrade, from disk.
+        e.is_rendering = false;
+        e.zoom = 3.0;
+        e.editor_readiness = EditorReadiness::Loading(1);
+        assert!(e.raw_cache.get(&1).is_none());
+        let _ = handle_image_resources_ready(&mut e, 1, Ok((ctx.clone(), preview.clone())));
+        assert!(e.full_res_upgrading, "a zoomed-in view stayed on the subsampled preview");
+
+        // One upgrade at a time: a second request waits for the first.
+        assert!(e.full_res_upgrading);
+        let _ = trigger_full_res_upgrade(&mut e);
+        assert!(e.full_res_upgrading);
+
+        // A failed upgrade keeps the preview to edit on, and is not retried
+        // on every render.
+        let _ = handle_full_res_ready(&mut e, 1, Err("out of memory".into()));
+        assert!(!e.full_res_upgrading);
+        assert!(matches!(e.editor_readiness, EditorReadiness::Ready(1)), "editor failed");
+        assert!(e.image_resources.is_some());
+        e.is_rendering = false;
+        let _ = crate::app::handlers::develop::trigger_async_render(&mut e);
+        assert!(!e.full_res_upgrading, "retried a failed upgrade");
     }
 }
