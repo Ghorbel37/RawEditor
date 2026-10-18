@@ -28,7 +28,17 @@ fn main() {
         }
     }
 
-    // Re-run only if the feature set or target changes, not on every source edit.
+    #[cfg(windows)]
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        let mut res = winresource::WindowsResource::new();
+        res.set_icon("assets/icon.ico");
+        if let Err(e) = res.compile() {
+            println!("cargo:warning=app icon not embedded: {e}");
+        }
+    }
+
+    // Re-run only if the feature set, target or icon changes, not on every source edit.
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_FAST_JPEG");
     println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_ARCH");
+    println!("cargo:rerun-if-changed=assets/icon.ico");
 }
