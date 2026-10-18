@@ -18,6 +18,16 @@ fn main() {
         println!("cargo:warning=fast-jpeg enabled ({simd})");
     }
 
+    // Windows' 1 MB main-thread stack (Linux/macOS: 8 MB) overflows in debug and release builds.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        const STACK_BYTES: u32 = 8 * 1024 * 1024;
+        match std::env::var("CARGO_CFG_TARGET_ENV").as_deref() {
+            Ok("msvc") => println!("cargo:rustc-link-arg-bins=/STACK:{STACK_BYTES}"),
+            Ok("gnu") => println!("cargo:rustc-link-arg-bins=-Wl,--stack,{STACK_BYTES}"),
+            _ => {}
+        }
+    }
+
     // Re-run only if the feature set or target changes, not on every source edit.
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_FAST_JPEG");
     println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_ARCH");
